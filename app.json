@@ -1,0 +1,63 @@
+{
+  "expo": {
+    "name": "SafeZone",
+    "slug": "famf",
+    "version": "1.0.0",
+    "sdkVersion": "54.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.safezone.app",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "SafeZone needs your location to share it with family members and show nearby safety incidents.",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "SafeZone needs your location to share it with family members even when the app is in the background.",
+        "NSLocationAlwaysUsageDescription": "SafeZone needs your location to share it with family members and keep them updated about your safety."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#ffffff"
+      },
+      "package": "com.safezone.app",
+      "permissions": [
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION"
+      ]
+    },
+    "web": {},
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "SafeZone needs your location to share it with family members and show nearby safety incidents.",
+          "locationWhenInUsePermission": "SafeZone needs your location to share it with family members and show nearby safety incidents."
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "color": "#007AFF",
+          "mode": "production"
+        }
+      ]
+    ],
+    "extra": {
+      "supabaseUrl": "${EXPO_PUBLIC_SUPABASE_URL}",
+      "supabaseAnonKey": "${EXPO_PUBLIC_SUPABASE_ANON_KEY}",
+      "eas": {
+        "projectId": "e14fdb5e-325b-4fa9-9b7c-93dd34ecc94e"
+      }
+    },
+    "owner": "acehubtechnology"
+  }
+}
