@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "541350773134",
+    "project_id": "famguard-e065d",
+    "storage_bucket": "famguard-e065d.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:541350773134:android:842c1a3784240bedfce4df",
+        "android_client_info": {
+          "package_name": "com.famguardacehubtech"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAPzo-G077SEOVMs-s7JyEsRDfQK_Sli-8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
