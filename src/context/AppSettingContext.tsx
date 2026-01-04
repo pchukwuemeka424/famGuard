@@ -1,5 +1,6 @@
 import React, { createContext, useState, useContext, useEffect, ReactNode } from 'react';
-import { supabase } from '../lib/supabase';
+import { supabase, hasValidSupabaseConfig } from '../lib/supabase';
+import { logger } from '../utils/logger';
 import type { AppSetting } from '../types';
 
 interface AppSettingContextType {
@@ -32,6 +33,21 @@ export const AppSettingProvider: React.FC<AppSettingProviderProps> = ({ children
   const fetchAppSettings = async (): Promise<void> => {
     try {
       setLoading(true);
+      
+      // Check if Supabase is configured
+      if (!hasValidSupabaseConfig) {
+        // Silently use defaults - warning already shown in supabase.ts
+        setAppSetting({
+          id: '00000000-0000-0000-0000-000000000000',
+          hide_report_incident: false,
+          hide_incident: false,
+          sos_lock: false,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        });
+        return;
+      }
+
       // Explicitly select the status fields from app_setting table
       const { data, error } = await supabase
         .from('app_setting')
@@ -40,7 +56,7 @@ export const AppSettingProvider: React.FC<AppSettingProviderProps> = ({ children
         .single();
 
       if (error) {
-        console.error('Error fetching app settings:', error);
+        logger.error('Error fetching app settings:', error?.message || error?.code || String(error));
         // Set defaults if fetch fails
         setAppSetting({
           id: '00000000-0000-0000-0000-000000000000',
@@ -51,15 +67,10 @@ export const AppSettingProvider: React.FC<AppSettingProviderProps> = ({ children
           updated_at: new Date().toISOString(),
         });
       } else if (data) {
-        console.log('App settings fetched from database:', {
-          hide_report_incident: data.hide_report_incident,
-          hide_incident: data.hide_incident,
-          sos_lock: data.sos_lock,
-          fullData: data,
-        });
+        logger.log('App settings fetched from database');
         setAppSetting(data as AppSetting);
       } else {
-        console.warn('No app settings data returned from database');
+        logger.warn('No app settings data returned from database');
         // Set defaults if no data
         setAppSetting({
           id: '00000000-0000-0000-0000-000000000000',
@@ -70,8 +81,8 @@ export const AppSettingProvider: React.FC<AppSettingProviderProps> = ({ children
           updated_at: new Date().toISOString(),
         });
       }
-    } catch (error) {
-      console.error('Error fetching app settings:', error);
+    } catch (error: any) {
+      logger.error('Error fetching app settings:', error?.message || String(error));
       // Set defaults on error
       setAppSetting({
         id: '00000000-0000-0000-0000-000000000000',
@@ -93,7 +104,11 @@ export const AppSettingProvider: React.FC<AppSettingProviderProps> = ({ children
   useEffect(() => {
     fetchAppSettings();
 
-    // Set up real-time subscription for app settings changes
+    // Set up real-time subscription for app settings changes (only if Supabase is configured)
+    if (!hasValidSupabaseConfig) {
+      return;
+    }
+
     const channel = supabase
       .channel('app_setting_changes')
       .on(
@@ -105,14 +120,9 @@ export const AppSettingProvider: React.FC<AppSettingProviderProps> = ({ children
           filter: 'id=eq.00000000-0000-0000-0000-000000000000',
         },
         (payload) => {
-          console.log('App setting changed via real-time:', payload);
+          logger.log('App setting changed via real-time');
           if (payload.new) {
             const newSettings = payload.new as AppSetting;
-            console.log('Updated app settings:', {
-              hide_report_incident: newSettings.hide_report_incident,
-              hide_incident: newSettings.hide_incident,
-              sos_lock: newSettings.sos_lock,
-            });
             setAppSetting(newSettings);
           }
         }
@@ -120,7 +130,11 @@ export const AppSettingProvider: React.FC<AppSettingProviderProps> = ({ children
       .subscribe();
 
     return () => {
-      supabase.removeChannel(channel);
+      try {
+        supabase.removeChannel(channel);
+      } catch (error) {
+        // Silently handle cleanup errors
+      }
     };
   }, []);
 
@@ -129,22 +143,18 @@ export const AppSettingProvider: React.FC<AppSettingProviderProps> = ({ children
   const hideIncident = appSetting?.hide_incident === true;
   const sosLock = appSetting?.sos_lock === true;
 
-  // Debug logging - show current status values
-  useEffect(() => {
-    if (!loading) {
-      console.log('App Setting Status (Current Values):', {
-        hideReportIncident,
-        hideIncident,
-        sosLock,
-        rawValues: {
-          hide_report_incident: appSetting?.hide_report_incident,
-          hide_incident: appSetting?.hide_incident,
-          sos_lock: appSetting?.sos_lock,
-        },
-        appSettingExists: !!appSetting,
-      });
-    }
-  }, [loading, appSetting, hideReportIncident, hideIncident, sosLock]);
+  // Debug logging removed to reduce console noise
+  // Uncomment if needed for debugging:
+  // useEffect(() => {
+  //   if (!loading && __DEV__) {
+  //     logger.log('App Setting Status:', {
+  //       hideReportIncident,
+  //       hideIncident,
+  //       sosLock,
+  //       appSettingExists: !!appSetting,
+  //     });
+  //   }
+  // }, [loading, appSetting, hideReportIncident, hideIncident, sosLock]);
 
   return (
     <AppSettingContext.Provider

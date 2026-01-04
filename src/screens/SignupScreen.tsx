@@ -31,9 +31,33 @@ export default function SignupScreen({ navigation }: SignupScreenProps) {
   const [error, setError] = useState<string>('');
   const { signup } = useAuth();
 
+  // Format phone number to only allow digits and limit to 11 digits
+  const formatPhoneNumber = (text: string): string => {
+    // Remove all non-digit characters
+    const digitsOnly = text.replace(/\D/g, '');
+    // Limit to 11 digits
+    return digitsOnly.slice(0, 11);
+  };
+
+  const handlePhoneChange = (text: string): void => {
+    const formatted = formatPhoneNumber(text);
+    setPhone(formatted);
+    // Clear error when user starts typing
+    if (error && error.includes('phone')) {
+      setError('');
+    }
+  };
+
   const handleSignup = async (): Promise<void> => {
     if (!name || !email || !phone || !password) {
       setError('Please fill in all fields');
+      return;
+    }
+
+    // Validate phone number is exactly 11 digits
+    const phoneDigits = phone.replace(/\D/g, '');
+    if (phoneDigits.length !== 11) {
+      setError('Phone number must be exactly 11 digits');
       return;
     }
 
@@ -66,16 +90,23 @@ export default function SignupScreen({ navigation }: SignupScreenProps) {
           keyboardShouldPersistTaps="handled"
         >
           <View style={styles.content}>
+            {/* Background Blob Shapes */}
+            <View style={styles.blobContainer}>
+              <View style={[styles.blob, styles.blob1]} />
+              <View style={[styles.blob, styles.blob2]} />
+              <View style={[styles.blob, styles.blob3]} />
+            </View>
+
             <View style={styles.header}>
               <TouchableOpacity
                 onPress={() => navigation.goBack()}
                 style={styles.backButton}
                 activeOpacity={0.7}
               >
-                <Ionicons name="arrow-back" size={24} color="#111827" />
+                <Ionicons name="arrow-back" size={24} color="#FFFFFF" />
               </TouchableOpacity>
               <Text style={styles.title}>Create Account</Text>
-              <Text style={styles.subtitle}>Sign up to get started with SafeZone</Text>
+              <Text style={styles.subtitle}>Sign up to get started with FamGuard</Text>
             </View>
 
             <View style={styles.form}>
@@ -119,15 +150,21 @@ export default function SignupScreen({ navigation }: SignupScreenProps) {
                   <Ionicons name="call-outline" size={22} color="#6B7280" style={styles.inputIcon} />
                   <TextInput
                     style={styles.input}
-                    placeholder="Enter your phone number"
+                    placeholder="Enter 11-digit phone number"
                     placeholderTextColor="#9CA3AF"
                     value={phone}
-                    onChangeText={setPhone}
+                    onChangeText={handlePhoneChange}
                     keyboardType="phone-pad"
                     autoComplete="tel"
                     autoCorrect={false}
+                    maxLength={11}
                   />
                 </View>
+                {phone.length > 0 && phone.length !== 11 && (
+                  <Text style={styles.helperText}>
+                    {phone.length}/11 digits
+                  </Text>
+                )}
               </View>
 
               <View style={styles.inputWrapper}>
@@ -191,6 +228,10 @@ export default function SignupScreen({ navigation }: SignupScreenProps) {
                   <Text style={styles.loginLink}>Sign In</Text>
                 </TouchableOpacity>
               </View>
+
+              <Text style={styles.companyText}>
+                Acehub Technologies Ltd
+              </Text>
             </View>
           </View>
         </ScrollView>
@@ -202,7 +243,7 @@ export default function SignupScreen({ navigation }: SignupScreenProps) {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#F9FAFB',
+    backgroundColor: '#DC2626',
   },
   keyboardView: {
     flex: 1,
@@ -212,6 +253,7 @@ const styles = StyleSheet.create({
   },
   content: {
     flex: 1,
+    position: 'relative',
     paddingHorizontal: 24,
     paddingTop: Platform.OS === 'ios' ? 20 : 40,
     paddingBottom: 32,
@@ -229,13 +271,16 @@ const styles = StyleSheet.create({
   title: {
     fontSize: 36,
     fontWeight: '700',
-    color: '#111827',
+    color: '#FFFFFF',
     marginBottom: 12,
     letterSpacing: -0.5,
+    textShadowColor: 'rgba(0, 0, 0, 0.2)',
+    textShadowOffset: { width: 0, height: 2 },
+    textShadowRadius: 4,
   },
   subtitle: {
     fontSize: 16,
-    color: '#6B7280',
+    color: 'rgba(255, 255, 255, 0.9)',
     lineHeight: 24,
   },
   form: {
@@ -247,7 +292,7 @@ const styles = StyleSheet.create({
   label: {
     fontSize: 14,
     fontWeight: '600',
-    color: '#374151',
+    color: '#FFFFFF',
     marginBottom: 8,
     letterSpacing: 0.2,
   },
@@ -257,18 +302,18 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFFFFF',
     borderRadius: 16,
     borderWidth: 1.5,
-    borderColor: '#E5E7EB',
+    borderColor: 'rgba(255, 255, 255, 0.3)',
     paddingHorizontal: 18,
     height: 58,
     ...Platform.select({
       ios: {
         shadowColor: '#000',
-        shadowOffset: { width: 0, height: 1 },
-        shadowOpacity: 0.05,
-        shadowRadius: 2,
+        shadowOffset: { width: 0, height: 2 },
+        shadowOpacity: 0.1,
+        shadowRadius: 4,
       },
       android: {
-        elevation: 1,
+        elevation: 2,
       },
     }),
   },
@@ -288,7 +333,7 @@ const styles = StyleSheet.create({
   errorContainer: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#FEF2F2',
+    backgroundColor: '#FFFFFF',
     borderRadius: 12,
     padding: 14,
     marginBottom: 24,
@@ -303,7 +348,7 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   button: {
-    backgroundColor: '#007AFF',
+    backgroundColor: '#FFFFFF',
     borderRadius: 16,
     paddingVertical: 18,
     paddingHorizontal: 24,
@@ -312,7 +357,7 @@ const styles = StyleSheet.create({
     marginBottom: 32,
     ...Platform.select({
       ios: {
-        shadowColor: '#007AFF',
+        shadowColor: '#000',
         shadowOffset: { width: 0, height: 4 },
         shadowOpacity: 0.3,
         shadowRadius: 8,
@@ -323,7 +368,7 @@ const styles = StyleSheet.create({
     }),
   },
   buttonText: {
-    color: '#FFFFFF',
+    color: '#DC2626',
     fontSize: 17,
     fontWeight: '600',
     letterSpacing: 0.3,
@@ -347,12 +392,12 @@ const styles = StyleSheet.create({
   dividerLine: {
     flex: 1,
     height: 1,
-    backgroundColor: '#E5E7EB',
+    backgroundColor: 'rgba(255, 255, 255, 0.3)',
   },
   dividerText: {
     marginHorizontal: 16,
     fontSize: 13,
-    color: '#9CA3AF',
+    color: 'rgba(255, 255, 255, 0.8)',
     fontWeight: '500',
   },
   loginContainer: {
@@ -361,13 +406,61 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   loginText: {
-    color: '#6B7280',
+    color: 'rgba(255, 255, 255, 0.9)',
     fontSize: 15,
   },
   loginLink: {
-    color: '#007AFF',
+    color: '#FFFFFF',
     fontSize: 15,
     fontWeight: '600',
+    textDecorationLine: 'underline',
+  },
+  blobContainer: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    overflow: 'hidden',
+  },
+  blob: {
+    position: 'absolute',
+    borderRadius: 50,
+    opacity: 0.2,
+  },
+  blob1: {
+    width: 200,
+    height: 200,
+    backgroundColor: '#F87171',
+    top: 50,
+    right: -30,
+  },
+  blob2: {
+    width: 180,
+    height: 180,
+    backgroundColor: '#EF4444',
+    bottom: 100,
+    left: -20,
+  },
+  blob3: {
+    width: 160,
+    height: 160,
+    backgroundColor: '#FCA5A5',
+    top: '40%',
+    right: 40,
+  },
+  companyText: {
+    fontSize: 10,
+    color: 'rgba(255, 255, 255, 0.6)',
+    textAlign: 'center',
+    marginTop: 24,
+    letterSpacing: 0.5,
+  },
+  helperText: {
+    fontSize: 12,
+    color: 'rgba(255, 255, 255, 0.7)',
+    marginTop: 6,
+    marginLeft: 4,
   },
 });
 

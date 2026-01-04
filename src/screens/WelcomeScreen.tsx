@@ -6,14 +6,12 @@ import {
   TouchableOpacity,
   Animated,
   Platform,
-  Dimensions,
+  Image,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import type { StackNavigationProp } from '@react-navigation/stack';
 import type { RootStackParamList } from '../types';
-
-const { width, height } = Dimensions.get('window');
 
 type WelcomeScreenNavigationProp = StackNavigationProp<RootStackParamList, 'Welcome'>;
 
@@ -59,9 +57,12 @@ export default function WelcomeScreen({ navigation }: WelcomeScreenProps) {
   return (
     <SafeAreaView style={styles.container} edges={['top', 'bottom']}>
       <View style={styles.content}>
-        {/* Background Gradient Circles */}
-        <View style={styles.backgroundCircle1} />
-        <View style={styles.backgroundCircle2} />
+        {/* Background Blob Shapes */}
+        <View style={styles.blobContainer}>
+          <View style={[styles.blob, styles.blob1]} />
+          <View style={[styles.blob, styles.blob2]} />
+          <View style={[styles.blob, styles.blob3]} />
+        </View>
 
         {/* Main Content */}
         <Animated.View
@@ -76,38 +77,26 @@ export default function WelcomeScreen({ navigation }: WelcomeScreenProps) {
             },
           ]}
         >
-          {/* Logo/Icon */}
+          {/* App Logo */}
           <View style={styles.logoContainer}>
             <View style={styles.iconCircle}>
-              <Ionicons name="shield-checkmark" size={80} color="#007AFF" />
+              <Image 
+                source={require('../../assets/icon.png')} 
+                style={styles.logoImage}
+                resizeMode="contain"
+              />
             </View>
           </View>
 
           {/* App Name */}
-          <Text style={styles.appName}>SafeZone</Text>
+          <Text style={styles.appName}>FamGuard</Text>
           <Text style={styles.tagline}>Your Family's Safety Network</Text>
 
-          {/* Description */}
+          {/* Simple Description */}
           <View style={styles.descriptionContainer}>
             <Text style={styles.description}>
-              Connect with your loved ones, share your location in real-time, and stay informed about safety in your community.
+              Stay connected with your loved ones and keep them safe with real-time location sharing and community safety alerts.
             </Text>
-          </View>
-
-          {/* Key Benefits */}
-          <View style={styles.benefitsContainer}>
-            <View style={styles.benefitItem}>
-              <Ionicons name="checkmark-circle" size={24} color="#34C759" />
-              <Text style={styles.benefitText}>Real-time location sharing</Text>
-            </View>
-            <View style={styles.benefitItem}>
-              <Ionicons name="checkmark-circle" size={24} color="#34C759" />
-              <Text style={styles.benefitText}>Community safety alerts</Text>
-            </View>
-            <View style={styles.benefitItem}>
-              <Ionicons name="checkmark-circle" size={24} color="#34C759" />
-              <Text style={styles.benefitText}>Secure & private</Text>
-            </View>
           </View>
         </Animated.View>
 
@@ -126,7 +115,7 @@ export default function WelcomeScreen({ navigation }: WelcomeScreenProps) {
             activeOpacity={0.8}
           >
             <Text style={styles.primaryButtonText}>Get Started</Text>
-            <Ionicons name="arrow-forward" size={20} color="#FFFFFF" />
+            <Ionicons name="arrow-forward" size={20} color="#DC2626" />
           </TouchableOpacity>
 
           <TouchableOpacity
@@ -137,8 +126,21 @@ export default function WelcomeScreen({ navigation }: WelcomeScreenProps) {
             <Text style={styles.secondaryButtonText}>Already have an account? Login</Text>
           </TouchableOpacity>
 
+          <TouchableOpacity
+            style={styles.manualButton}
+            onPress={() => navigation.navigate('UserManual')}
+            activeOpacity={0.8}
+          >
+            <Ionicons name="book-outline" size={18} color="#FFFFFF" />
+            <Text style={styles.manualButtonText}>User Manual</Text>
+          </TouchableOpacity>
+
           <Text style={styles.footerText}>
             By continuing, you agree to our Terms of Service and Privacy Policy
+          </Text>
+          
+          <Text style={styles.companyText}>
+            Acehub Technologies Ltd
           </Text>
         </Animated.View>
       </View>
@@ -149,31 +151,11 @@ export default function WelcomeScreen({ navigation }: WelcomeScreenProps) {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#FFFFFF',
+    backgroundColor: '#DC2626',
   },
   content: {
     flex: 1,
     position: 'relative',
-  },
-  backgroundCircle1: {
-    position: 'absolute',
-    width: width * 1.2,
-    height: width * 1.2,
-    borderRadius: (width * 1.2) / 2,
-    backgroundColor: '#E3F2FD',
-    top: -width * 0.3,
-    left: -width * 0.1,
-    opacity: 0.5,
-  },
-  backgroundCircle2: {
-    position: 'absolute',
-    width: width * 0.8,
-    height: width * 0.8,
-    borderRadius: (width * 0.8) / 2,
-    backgroundColor: '#F0F8FF',
-    bottom: height * 0.2,
-    right: -width * 0.2,
-    opacity: 0.4,
   },
   mainContent: {
     flex: 1,
@@ -189,14 +171,16 @@ const styles = StyleSheet.create({
     width: 140,
     height: 140,
     borderRadius: 70,
-    backgroundColor: '#F0F8FF',
+    backgroundColor: '#FFFFFF',
     justifyContent: 'center',
     alignItems: 'center',
+    borderWidth: 0,
+    overflow: 'hidden',
     ...Platform.select({
       ios: {
-        shadowColor: '#007AFF',
+        shadowColor: '#000000',
         shadowOffset: { width: 0, height: 8 },
-        shadowOpacity: 0.2,
+        shadowOpacity: 0.3,
         shadowRadius: 16,
       },
       android: {
@@ -204,16 +188,23 @@ const styles = StyleSheet.create({
       },
     }),
   },
+  logoImage: {
+    width: 120,
+    height: 120,
+  },
   appName: {
     fontSize: 42,
     fontWeight: '700',
-    color: '#1C1C1E',
+    color: '#FFFFFF',
     marginBottom: 8,
     letterSpacing: 0.5,
+    textShadowColor: 'rgba(0, 0, 0, 0.2)',
+    textShadowOffset: { width: 0, height: 2 },
+    textShadowRadius: 4,
   },
   tagline: {
     fontSize: 18,
-    color: '#8E8E93',
+    color: 'rgba(255, 255, 255, 0.9)',
     marginBottom: 32,
     fontWeight: '500',
   },
@@ -223,25 +214,9 @@ const styles = StyleSheet.create({
   },
   description: {
     fontSize: 16,
-    color: '#3A3A3C',
+    color: 'rgba(255, 255, 255, 0.95)',
     textAlign: 'center',
     lineHeight: 24,
-  },
-  benefitsContainer: {
-    width: '100%',
-    paddingHorizontal: 20,
-  },
-  benefitItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginBottom: 16,
-    paddingHorizontal: 8,
-  },
-  benefitText: {
-    fontSize: 16,
-    color: '#1C1C1E',
-    marginLeft: 12,
-    fontWeight: '500',
   },
   buttonContainer: {
     paddingHorizontal: 32,
@@ -249,7 +224,7 @@ const styles = StyleSheet.create({
     paddingTop: 20,
   },
   primaryButton: {
-    backgroundColor: '#007AFF',
+    backgroundColor: '#FFFFFF',
     borderRadius: 16,
     paddingVertical: 18,
     paddingHorizontal: 32,
@@ -259,7 +234,7 @@ const styles = StyleSheet.create({
     marginBottom: 16,
     ...Platform.select({
       ios: {
-        shadowColor: '#007AFF',
+        shadowColor: '#000000',
         shadowOffset: { width: 0, height: 4 },
         shadowOpacity: 0.3,
         shadowRadius: 8,
@@ -270,7 +245,7 @@ const styles = StyleSheet.create({
     }),
   },
   primaryButtonText: {
-    color: '#FFFFFF',
+    color: '#DC2626',
     fontSize: 18,
     fontWeight: '600',
     marginRight: 8,
@@ -282,17 +257,78 @@ const styles = StyleSheet.create({
     marginBottom: 16,
   },
   secondaryButtonText: {
-    color: '#007AFF',
+    color: '#FFFFFF',
     fontSize: 16,
     fontWeight: '600',
     textAlign: 'center',
+    textDecorationLine: 'underline',
+  },
+  manualButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 12,
+    paddingHorizontal: 24,
+    marginBottom: 16,
+    borderRadius: 12,
+    backgroundColor: 'rgba(255, 255, 255, 0.2)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.3)',
+  },
+  manualButtonText: {
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: '600',
+    marginLeft: 8,
   },
   footerText: {
     fontSize: 12,
-    color: '#8E8E93',
+    color: 'rgba(255, 255, 255, 0.8)',
     textAlign: 'center',
     lineHeight: 18,
     paddingHorizontal: 20,
+    marginBottom: 8,
+  },
+  companyText: {
+    fontSize: 10,
+    color: 'rgba(255, 255, 255, 0.6)',
+    textAlign: 'center',
+    marginTop: 8,
+    letterSpacing: 0.5,
+  },
+  blobContainer: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    overflow: 'hidden',
+  },
+  blob: {
+    position: 'absolute',
+    borderRadius: 50,
+    opacity: 0.2,
+  },
+  blob1: {
+    width: 200,
+    height: 200,
+    backgroundColor: '#F87171',
+    top: 50,
+    right: -30,
+  },
+  blob2: {
+    width: 180,
+    height: 180,
+    backgroundColor: '#EF4444',
+    bottom: 100,
+    left: -20,
+  },
+  blob3: {
+    width: 160,
+    height: 160,
+    backgroundColor: '#FCA5A5',
+    top: '40%',
+    right: 40,
   },
 });
 

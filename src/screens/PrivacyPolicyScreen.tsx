@@ -74,7 +74,7 @@ export default function PrivacyPolicyScreen({ navigation }: PrivacyPolicyScreenP
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>6. Contact Us</Text>
           <Text style={styles.text}>
-            If you have questions about this Privacy Policy, please contact us at privacy@safezone.app
+            If you have questions about this Privacy Policy, please contact us at privacy@famguard.app
           </Text>
         </View>
       </ScrollView>

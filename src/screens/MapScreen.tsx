@@ -6,7 +6,6 @@ import {
   TouchableOpacity,
   ActivityIndicator,
   ScrollView,
-  Animated,
   Dimensions,
   Platform,
 } from 'react-native';
@@ -16,9 +15,11 @@ import { Ionicons } from '@expo/vector-icons';
 import type { RouteProp } from '@react-navigation/native';
 import type { StackNavigationProp } from '@react-navigation/stack';
 import { useFocusEffect } from '@react-navigation/native';
+import * as ExpoLocation from 'expo-location';
 import { useIncidents } from '../context/IncidentContext';
 import { useAuth } from '../context/AuthContext';
 import { locationService } from '../services/locationService';
+import { offlineMapsService } from '../services/offlineMapsService';
 import { supabase } from '../lib/supabase';
 import type { RootStackParamList, Location } from '../types';
 
@@ -30,9 +31,7 @@ interface MapScreenProps {
   navigation: MapScreenNavigationProp;
 }
 
-const { height: SCREEN_HEIGHT, width: SCREEN_WIDTH } = Dimensions.get('window');
-const HISTORY_SHEET_MAX_HEIGHT = SCREEN_HEIGHT * 0.75;
-const HISTORY_SHEET_MIN_HEIGHT = 100;
+const { height: SCREEN_HEIGHT } = Dimensions.get('window');
 
 export default function MapScreen({ route, navigation }: MapScreenProps) {
   const { location, title, showUserLocation = true, userId } = route.params;
@@ -40,7 +39,6 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
   const { user } = useAuth();
   const mapRef = useRef<MapView>(null);
   
-  // Use passed userId if provided, otherwise use current user's id
   const targetUserId = userId || user?.id;
   
   const [userLocation, setUserLocation] = useState<Location | null>(null);
@@ -49,26 +47,147 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
   const [historyLoading, setHistoryLoading] = useState<boolean>(false);
   const [selectedDate, setSelectedDate] = useState<Date>(new Date());
   const [selectedHistoryItem, setSelectedHistoryItem] = useState<number | null>(null);
+  const [hasOfflineMap, setHasOfflineMap] = useState<boolean>(false);
+  const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
+  const [autoRefreshEnabled, setAutoRefreshEnabled] = useState<boolean>(false);
+  const [pendingUpdatesCount, setPendingUpdatesCount] = useState<number>(0);
+  const [mapError, setMapError] = useState<string | null>(null);
+  const [tracksViewChanges, setTracksViewChanges] = useState<boolean>(true);
   const realtimeChannelRef = useRef<any>(null);
+  const pendingUpdatesRef = useRef<Array<Location & { timestamp: string }>>([]);
+  const locationWatchSubscriptionRef = useRef<ExpoLocation.LocationSubscription | null>(null);
   
   const [mapRegion, setMapRegion] = useState<Region>({
     latitude: location.latitude,
     longitude: location.longitude,
-    latitudeDelta: 0.01,
-    longitudeDelta: 0.01,
+    latitudeDelta: 0.002,
+    longitudeDelta: 0.002,
   });
 
+  useEffect(() => {
+    const checkOfflineMap = async () => {
+      if (location && location.latitude && location.longitude) {
+        const isCovered = await offlineMapsService.isLocationCovered(
+          location.latitude,
+          location.longitude
+        );
+        setHasOfflineMap(isCovered);
+      }
+    };
+    checkOfflineMap();
+  }, [location]);
 
   useEffect(() => {
     if (showUserLocation) {
       const fetchUserLocation = async () => {
         try {
-          const currentLocation = await locationService.getCurrentLocation();
+          // Check if location services are enabled (especially important on iOS)
+          const servicesEnabled = await ExpoLocation.hasServicesEnabledAsync();
+          if (!servicesEnabled) {
+            console.warn('Location services are disabled. Please enable them in Settings.');
+            setLoading(false);
+            return;
+          }
+
+          // Request permissions first
+          const permissionResult = await locationService.requestPermissions();
+          if (!permissionResult.granted) {
+            console.warn('Location permission not granted:', permissionResult.message);
+            setLoading(false);
+            return;
+          }
+
+          if (location && location.latitude && location.longitude) {
+            setUserLocation(location);
+            const initialRegion = {
+              latitude: location.latitude,
+              longitude: location.longitude,
+              latitudeDelta: Platform.OS === 'ios' ? 0.0005 : 0.001,
+              longitudeDelta: Platform.OS === 'ios' ? 0.0005 : 0.001,
+            };
+            setMapRegion(initialRegion);
+            setTimeout(() => {
+              if (mapRef.current) {
+                mapRef.current.animateToRegion(initialRegion, 1000);
+              }
+            }, 500);
+          }
+          
+          // Use high accuracy location for exact positioning
+          // On iOS, request location with best accuracy
+          const currentLocation = await locationService.getHighAccuracyLocation(true);
           if (currentLocation) {
             setUserLocation(currentLocation);
-          } else if (incidentUserLocation) {
+            
+            // Log location accuracy for debugging
+            if (__DEV__) {
+              console.log('Initial location fetched:', {
+                lat: currentLocation.latitude.toFixed(6),
+                lng: currentLocation.longitude.toFixed(6),
+                platform: Platform.OS,
+              });
+            }
+            
+            if (!location || (!location.latitude && !location.longitude)) {
+              const currentRegion = {
+                latitude: currentLocation.latitude,
+                longitude: currentLocation.longitude,
+                latitudeDelta: Platform.OS === 'ios' ? 0.002 : 0.005, // Tighter zoom on iOS
+                longitudeDelta: Platform.OS === 'ios' ? 0.002 : 0.005,
+              };
+              setMapRegion(currentRegion);
+              setTimeout(() => {
+                if (mapRef.current) {
+                  mapRef.current.animateToRegion(currentRegion, 1000);
+                }
+              }, 500);
+            }
+          } else if (incidentUserLocation && (!location || (!location.latitude && !location.longitude))) {
             setUserLocation(incidentUserLocation);
           }
+
+          // Start watching location changes for real-time updates
+          // Use iOS-specific settings for better accuracy
+          if (locationWatchSubscriptionRef.current) {
+            locationWatchSubscriptionRef.current.remove();
+          }
+
+          // iOS needs more frequent updates and better accuracy settings
+          // Use maximumAge: 0 to prevent cached location data on iOS
+          const watchOptions = Platform.OS === 'ios' 
+            ? {
+                accuracy: ExpoLocation.Accuracy.BestForNavigation, // Best accuracy for iOS
+                timeInterval: 2000, // Update every 2 seconds on iOS for real-time tracking
+                distanceInterval: 1, // Update every 1 meter on iOS for precise tracking
+                mayShowUserSettings: false, // Don't show settings dialog
+              }
+            : {
+                accuracy: ExpoLocation.Accuracy.Highest,
+                timeInterval: 5000, // Update every 5 seconds on Android
+                distanceInterval: 5, // Update every 5 meters on Android
+              };
+
+          locationWatchSubscriptionRef.current = await ExpoLocation.watchPositionAsync(
+            watchOptions,
+            (newLocation) => {
+              const updatedLocation: Location = {
+                latitude: newLocation.coords.latitude,
+                longitude: newLocation.coords.longitude,
+                address: userLocation?.address, // Preserve address
+              };
+              setUserLocation(updatedLocation);
+              
+              // Log accuracy for debugging
+              if (__DEV__) {
+                console.log('Location updated:', {
+                  lat: updatedLocation.latitude.toFixed(6),
+                  lng: updatedLocation.longitude.toFixed(6),
+                  accuracy: newLocation.coords.accuracy,
+                  platform: Platform.OS,
+                });
+              }
+            }
+          );
         } catch (error) {
           console.error('Error fetching user location:', error);
         } finally {
@@ -76,50 +195,44 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
         }
       };
       fetchUserLocation();
+
+      // Cleanup location watch on unmount
+      return () => {
+        if (locationWatchSubscriptionRef.current) {
+          locationWatchSubscriptionRef.current.remove();
+          locationWatchSubscriptionRef.current = null;
+        }
+      };
     } else {
       setLoading(false);
     }
-  }, [showUserLocation, incidentUserLocation]);
+  }, [showUserLocation, incidentUserLocation, location]);
 
-  // Fetch location history for selected date
   const fetchLocationHistory = async (date: Date) => {
-    if (!targetUserId) {
-      return;
-    }
+    if (!targetUserId) return;
 
     setHistoryLoading(true);
     try {
-      // Get start and end of selected date
       const startOfDay = new Date(date);
       startOfDay.setHours(0, 0, 0, 0);
-      
       const endOfDay = new Date(date);
       endOfDay.setHours(23, 59, 59, 999);
-
-      // Calculate hours from now to start of day (to fetch enough data)
       const now = new Date();
       const hoursSinceStartOfDay = Math.ceil((now.getTime() - startOfDay.getTime()) / (1000 * 60 * 60));
-      // Add some buffer (fetch 7 days worth to ensure we get all data for the selected date)
-      const hoursToFetch = Math.max(hoursSinceStartOfDay, 168); // 168 hours = 7 days
+      const hoursToFetch = Math.max(hoursSinceStartOfDay, 168);
 
-      // Fetch history
       const allHistory = await locationService.getLocationHistory(targetUserId, hoursToFetch);
-      
-      // Filter by selected date
       let filteredHistory = allHistory.filter(item => {
         const itemDate = new Date(item.timestamp);
         return itemDate >= startOfDay && itemDate <= endOfDay;
       });
 
-      // Sort by timestamp descending (most recent first)
       filteredHistory.sort((a, b) => 
         new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
       );
 
-      // Try to fetch addresses for entries without addresses (in background, don't block)
       const entriesWithoutAddress = filteredHistory.filter(item => !item.address);
       if (entriesWithoutAddress.length > 0) {
-        // Fetch addresses for entries without addresses (limit to first 10 to avoid too many requests)
         Promise.all(
           entriesWithoutAddress.slice(0, 10).map(async (item) => {
             try {
@@ -128,7 +241,6 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
                 item.longitude
               );
               if (address) {
-                // Update the address in the history array
                 const index = filteredHistory.findIndex(
                   h => h.latitude === item.latitude && 
                        h.longitude === item.longitude && 
@@ -136,17 +248,14 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
                 );
                 if (index !== -1) {
                   filteredHistory[index].address = address;
-                  // Update state
                   setLocationHistory([...filteredHistory]);
                 }
               }
             } catch (error) {
-              // Silently fail - address fetching is optional
+              // Silently fail
             }
           })
-        ).catch(() => {
-          // Silently fail
-        });
+        ).catch(() => {});
       }
 
       setLocationHistory(filteredHistory);
@@ -160,21 +269,18 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
 
   useEffect(() => {
     fetchLocationHistory(selectedDate);
+    pendingUpdatesRef.current = [];
+    setPendingUpdatesCount(0);
   }, [targetUserId, selectedDate]);
 
-  // Set up real-time subscription for location history
   useEffect(() => {
-    if (!targetUserId) {
-      return;
-    }
+    if (!targetUserId) return;
 
-    // Clean up existing subscription
     if (realtimeChannelRef.current) {
       supabase.removeChannel(realtimeChannelRef.current);
       realtimeChannelRef.current = null;
     }
 
-    // Subscribe to location_history table changes
     const channel = supabase
       .channel(`location_history_${targetUserId}`)
       .on(
@@ -186,19 +292,14 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
           filter: `user_id=eq.${targetUserId}`,
         },
         (payload) => {
-          console.log('New location history entry received:', payload);
-          
-          // Check if the new entry is for the selected date
           const newEntry = payload.new;
           if (newEntry && newEntry.created_at) {
             const entryDate = new Date(newEntry.created_at);
             const startOfDay = new Date(selectedDate);
             startOfDay.setHours(0, 0, 0, 0);
-            
             const endOfDay = new Date(selectedDate);
             endOfDay.setHours(23, 59, 59, 999);
 
-            // Only add if it's for the selected date
             if (entryDate >= startOfDay && entryDate <= endOfDay) {
               const newLocation: Location & { timestamp: string } = {
                 latitude: newEntry.latitude,
@@ -207,8 +308,12 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
                 timestamp: newEntry.created_at,
               };
 
-              // Add to the beginning of the array (most recent first)
-              setLocationHistory((prev) => [newLocation, ...prev]);
+              if (autoRefreshEnabled) {
+                setLocationHistory((prev) => [newLocation, ...prev]);
+              } else {
+                pendingUpdatesRef.current.push(newLocation);
+                setPendingUpdatesCount(pendingUpdatesRef.current.length);
+              }
             }
           }
         }
@@ -222,12 +327,9 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
           filter: `user_id=eq.${targetUserId}`,
         },
         (payload) => {
-          console.log('Location history entry deleted:', payload);
-          // Remove from local state if it exists
-          if (payload.old && payload.old.id) {
+          if (autoRefreshEnabled && payload.old && payload.old.id) {
             setLocationHistory((prev) => 
               prev.filter((item) => {
-                // Since we don't have id in our Location type, we'll match by timestamp and coordinates
                 const oldEntry = payload.old;
                 return !(
                   item.latitude === oldEntry.latitude &&
@@ -239,32 +341,49 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
           }
         }
       )
-      .subscribe((status) => {
-        if (status === 'SUBSCRIBED') {
-          console.log('✅ Subscribed to location_history real-time updates');
-        } else if (status === 'CHANNEL_ERROR') {
-          console.error('❌ Error subscribing to location_history real-time updates');
-        }
-      });
+      .subscribe();
 
     realtimeChannelRef.current = channel;
-
-    // Cleanup on unmount
     return () => {
       if (realtimeChannelRef.current) {
         supabase.removeChannel(realtimeChannelRef.current);
         realtimeChannelRef.current = null;
       }
     };
+  }, [targetUserId, selectedDate, autoRefreshEnabled]);
+
+  const handleManualRefresh = React.useCallback(async () => {
+    if (!targetUserId) return;
+
+    setIsRefreshing(true);
+    try {
+      const pending = [...pendingUpdatesRef.current];
+      pendingUpdatesRef.current = [];
+      setPendingUpdatesCount(0);
+      await fetchLocationHistory(selectedDate);
+
+      if (pending.length > 0) {
+        setLocationHistory((prev) => {
+          const existingTimestamps = new Set(prev.map(item => item.timestamp));
+          const newItems = pending.filter(item => !existingTimestamps.has(item.timestamp));
+          return [...newItems, ...prev].sort((a, b) => 
+            new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+          );
+        });
+      }
+    } catch (error) {
+      console.error('Error refreshing location history:', error);
+    } finally {
+      setIsRefreshing(false);
+    }
   }, [targetUserId, selectedDate]);
 
-  // Refresh location history when screen is focused
   useFocusEffect(
     React.useCallback(() => {
-      if (targetUserId) {
+      if (targetUserId && autoRefreshEnabled) {
         fetchLocationHistory(selectedDate);
       }
-    }, [targetUserId, selectedDate])
+    }, [targetUserId, selectedDate, autoRefreshEnabled])
   );
 
   useEffect(() => {
@@ -273,21 +392,18 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
       const maxLat = Math.max(location.latitude, userLocation.latitude);
       const minLng = Math.min(location.longitude, userLocation.longitude);
       const maxLng = Math.max(location.longitude, userLocation.longitude);
-
       const latDelta = (maxLat - minLat) * 1.5;
       const lngDelta = (maxLng - minLng) * 1.5;
-
       setMapRegion({
         latitude: (minLat + maxLat) / 2,
         longitude: (minLng + maxLng) / 2,
-        latitudeDelta: Math.max(latDelta, 0.01),
-        longitudeDelta: Math.max(lngDelta, 0.01),
+        latitudeDelta: Math.max(latDelta, Platform.OS === 'ios' ? 0.0005 : 0.001),
+        longitudeDelta: Math.max(lngDelta, Platform.OS === 'ios' ? 0.0005 : 0.001),
       });
     }
   }, [userLocation, location, showUserLocation]);
 
   const polylineCoordinates = useMemo(() => {
-    // Always show location history polyline, regardless of showUserLocation
     const coordinates = locationHistory.length > 0
       ? [...locationHistory].reverse().map((loc) => ({
           latitude: loc.latitude,
@@ -295,7 +411,6 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
         }))
       : [];
     
-    // Only add current user location if showUserLocation is true
     if (showUserLocation && userLocation) {
       if (coordinates.length > 0) {
         const lastPoint = coordinates[coordinates.length - 1];
@@ -316,10 +431,40 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
         });
       }
     }
-    
     return coordinates;
   }, [locationHistory, userLocation, showUserLocation]);
 
+  const historyMarkers = useMemo(() => {
+    return locationHistory.map((item, index) => {
+      const isSelected = selectedHistoryItem === index;
+      const markerKey = `${item.latitude.toFixed(6)}-${item.longitude.toFixed(6)}-${item.timestamp}`;
+      
+      return (
+        <Marker
+          key={markerKey}
+          coordinate={{ latitude: item.latitude, longitude: item.longitude }}
+          anchor={{ x: 0.5, y: 0.5 }}
+          tracksViewChanges={false}
+          flat={false}
+          zIndex={isSelected ? 100 : 50}
+          onPress={() => {
+            setSelectedHistoryItem(index);
+            focusOnLocation(item.latitude, item.longitude);
+          }}
+        >
+          <View 
+            style={[
+              styles.historyMarkerContainer,
+              isSelected && styles.historyMarkerSelected
+            ]}
+            pointerEvents="none"
+          >
+            <View style={styles.historyMarkerDot} />
+          </View>
+        </Marker>
+      );
+    });
+  }, [locationHistory, selectedHistoryItem, focusOnLocation]);
 
   const formatTime = (timestamp: string) => {
     const date = new Date(timestamp);
@@ -341,31 +486,8 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
     });
   };
 
-  const formatFullTime = (timestamp: string) => {
-    const date = new Date(timestamp);
-    return date.toLocaleString([], {
-      month: 'short',
-      day: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-    });
-  };
-
-  const formatDateTime = (timestamp: string) => {
-    const date = new Date(timestamp);
-    return date.toLocaleString([], {
-      month: 'short',
-      day: 'numeric',
-      year: date.getFullYear() !== new Date().getFullYear() ? 'numeric' : undefined,
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-    });
-  };
-
-  // Calculate distance between two coordinates (Haversine formula)
   const calculateDistance = (lat1: number, lon1: number, lat2: number, lon2: number): number => {
-    const R = 6371; // Earth's radius in km
+    const R = 6371;
     const dLat = (lat2 - lat1) * Math.PI / 180;
     const dLon = (lon2 - lon1) * Math.PI / 180;
     const a =
@@ -377,14 +499,12 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
     return R * c;
   };
 
-  // Calculate time difference in seconds
   const calculateTimeDiff = (timestamp1: string, timestamp2: string): number => {
     const date1 = new Date(timestamp1);
     const date2 = new Date(timestamp2);
-    return Math.abs(date2.getTime() - date1.getTime()) / 1000; // in seconds
+    return Math.abs(date2.getTime() - date1.getTime()) / 1000;
   };
 
-  // Format date for display
   const formatDateDisplay = (date: Date): string => {
     const today = new Date();
     const yesterday = new Date(today);
@@ -403,57 +523,15 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
     }
   };
 
-  // Navigate to previous/next day
   const navigateDate = (direction: 'prev' | 'next') => {
     const newDate = new Date(selectedDate);
     newDate.setDate(newDate.getDate() + (direction === 'next' ? 1 : -1));
     setSelectedDate(newDate);
   };
 
-  // Calculate summary statistics
-  const calculateSummary = () => {
-    if (locationHistory.length === 0) {
-      return { totalDistance: 0, totalTime: 0, visits: 0 };
-    }
-
-    let totalDistance = 0;
-    let totalTime = 0;
-    const visits = new Set<string>();
-
-    for (let i = 1; i < locationHistory.length; i++) {
-      const prev = locationHistory[i - 1];
-      const curr = locationHistory[i];
-      
-      const distance = calculateDistance(
-        prev.latitude,
-        prev.longitude,
-        curr.latitude,
-        curr.longitude
-      );
-      totalDistance += distance;
-
-      const timeDiff = calculateTimeDiff(prev.timestamp, curr.timestamp);
-      totalTime += timeDiff;
-
-      // Count unique locations (visits)
-      const locationKey = `${curr.latitude.toFixed(4)},${curr.longitude.toFixed(4)}`;
-      visits.add(locationKey);
-    }
-
-    return {
-      totalDistance,
-      totalTime,
-      visits: visits.size + 1, // +1 for first location
-    };
-  };
-
-  const summary = calculateSummary();
-
-  // Format time for activity entries
   const formatTimeRange = (startTime: string, endTime: string): string => {
     const start = new Date(startTime);
     const end = new Date(endTime);
-    
     const formatTime = (date: Date) => {
       return date.toLocaleTimeString([], {
         hour: 'numeric',
@@ -461,27 +539,82 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
         hour12: true,
       }).toLowerCase();
     };
-
     return `${formatTime(start)} – ${formatTime(end)}`;
   };
 
-  // Format activity duration
   const formatDuration = (seconds: number): string => {
     if (seconds < 60) return `${Math.round(seconds)}s`;
     if (seconds < 3600) return `${Math.round(seconds / 60)} min`;
     return `${(seconds / 3600).toFixed(1)}h`;
   };
 
-  const focusOnLocation = (lat: number, lng: number) => {
+  const focusOnLocation = React.useCallback((lat: number, lng: number) => {
     const newRegion: Region = {
       latitude: lat,
       longitude: lng,
-      latitudeDelta: 0.01,
-      longitudeDelta: 0.01,
+      latitudeDelta: Platform.OS === 'ios' ? 0.0003 : 0.0005,
+      longitudeDelta: Platform.OS === 'ios' ? 0.0003 : 0.0005,
     };
-    
     mapRef.current?.animateToRegion(newRegion, 500);
     setMapRegion(newRegion);
+  }, []);
+
+  const handleRefreshLocation = async (): Promise<void> => {
+    try {
+      setLoading(true);
+      // Request permission if needed
+      const permissionResult = await locationService.requestPermissions();
+      if (!permissionResult.granted) {
+        console.warn('Location permission not granted:', permissionResult.message);
+        setLoading(false);
+        return;
+      }
+      
+      // Get the actual current location with high accuracy
+      const exactLocation = await locationService.getHighAccuracyLocation(true);
+      
+      if (exactLocation) {
+        // On Android, temporarily enable tracksViewChanges to ensure marker renders
+        if (Platform.OS === 'android') {
+          setTracksViewChanges(true);
+        }
+        
+        // Always set user location to show the pin
+        setUserLocation(exactLocation);
+        
+        // Zoom to the exact location
+        const exactRegion: Region = {
+          latitude: exactLocation.latitude,
+          longitude: exactLocation.longitude,
+          latitudeDelta: Platform.OS === 'ios' ? 0.0003 : 0.0005, // Very tight zoom for exact location
+          longitudeDelta: Platform.OS === 'ios' ? 0.0003 : 0.0005,
+        };
+        setMapRegion(exactRegion);
+        if (mapRef.current) {
+          mapRef.current.animateToRegion(exactRegion, 1000);
+        }
+        
+        // On Android, disable tracksViewChanges after a delay for performance
+        if (Platform.OS === 'android') {
+          setTimeout(() => {
+            setTracksViewChanges(false);
+          }, 1500);
+        }
+        
+        // Log for debugging
+        if (__DEV__) {
+          console.log('Location updated via button:', {
+            lat: exactLocation.latitude.toFixed(6),
+            lng: exactLocation.longitude.toFixed(6),
+            platform: Platform.OS,
+          });
+        }
+      }
+    } catch (error) {
+      console.error('Error getting location:', error);
+    } finally {
+      setLoading(false);
+    }
   };
 
   if (loading) {
@@ -492,7 +625,7 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
             style={styles.headerButton}
             onPress={() => navigation.goBack()}
           >
-            <Ionicons name="arrow-back" size={24} color="#1C1C1E" />
+            <Ionicons name="arrow-back" size={22} color="#000" />
           </TouchableOpacity>
           <Text style={styles.headerTitle}>{title || 'Map View'}</Text>
           <View style={styles.headerButton} />
@@ -506,19 +639,47 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
 
   return (
     <SafeAreaView style={styles.container} edges={['top']}>
-      {/* Header */}
+      {/* Modern Header */}
       <View style={styles.header}>
         <TouchableOpacity
           style={styles.headerButton}
           onPress={() => navigation.goBack()}
+          activeOpacity={0.7}
         >
-          <Ionicons name="arrow-back" size={24} color="#1C1C1E" />
+          <View style={styles.iconButton}>
+            <Ionicons name="arrow-back" size={22} color="#000" />
+          </View>
         </TouchableOpacity>
-        <Text style={styles.headerTitle}>{title || 'Location Timeline'}</Text>
-        <View style={styles.headerButton} />
+        <View style={styles.headerTitleContainer}>
+          <Text style={styles.headerTitle}>{title || 'Location Timeline'}</Text>
+          {targetUserId && locationHistory.length > 0 && (
+            <Text style={styles.headerSubtitle}>{locationHistory.length} locations</Text>
+          )}
+        </View>
+        <View style={styles.headerRightButtons}>
+          {pendingUpdatesCount > 0 && !autoRefreshEnabled && (
+            <View style={styles.pendingBadge}>
+              <Text style={styles.pendingBadgeText}>{pendingUpdatesCount}</Text>
+            </View>
+          )}
+          <TouchableOpacity
+            style={styles.headerButton}
+            onPress={handleManualRefresh}
+            disabled={isRefreshing || loading}
+            activeOpacity={0.7}
+          >
+            <View style={styles.iconButton}>
+              {isRefreshing || loading ? (
+                <ActivityIndicator size="small" color="#007AFF" />
+              ) : (
+                <Ionicons name="refresh" size={22} color="#007AFF" />
+              )}
+            </View>
+          </TouchableOpacity>
+        </View>
       </View>
 
-      {/* Map View - Top Section */}
+      {/* Map Section */}
       <View style={styles.mapSection}>
         <MapView
           ref={mapRef}
@@ -529,81 +690,159 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
           showsMyLocationButton={false}
           showsCompass={true}
           showsScale={true}
-          mapType="standard"
+          mapType="hybrid"
           zoomEnabled={true}
           scrollEnabled={true}
           rotateEnabled={true}
-          onRegionChangeComplete={(region) => {
-            if (region) {
-              setMapRegion(region);
+          onMapReady={() => {
+            console.log('✅ Map is ready');
+            if (Platform.OS === 'android') {
+              console.log('Android Map Ready - Markers should be visible');
+              console.log('Marker count:', {
+                historyMarkers: locationHistory.length,
+                userLocation: userLocation ? 1 : 0,
+                destination: 1,
+              });
+              // Disable tracksViewChanges after map is ready on Android for better performance
+              setTimeout(() => {
+                setTracksViewChanges(false);
+              }, 1000);
+            } else {
+              setTracksViewChanges(false);
+            }
+            setMapError(null);
+          }}
+          onError={(error) => {
+            console.error('❌ Map error:', error);
+            const errorMessage = error?.nativeEvent?.message || 'Map failed to load';
+            setMapError(errorMessage);
+            // On Android, common issues:
+            // - Missing Google Play Services
+            // - Invalid API key
+            // - Network issues
+            if (Platform.OS === 'android') {
+              console.error('Android Map Error Details:', {
+                error: errorMessage,
+                hasGooglePlayServices: 'Check device settings',
+                apiKeySet: 'Check AndroidManifest.xml',
+              });
             }
           }}
+          onRegionChangeComplete={(region) => {
+            if (region) setMapRegion(region);
+          }}
         >
-          {/* Location History Polyline */}
           {polylineCoordinates.length > 1 && (
             <Polyline
               coordinates={polylineCoordinates}
               strokeColor="#007AFF"
-              strokeWidth={4}
+              strokeWidth={5}
               lineCap="round"
               lineJoin="round"
             />
           )}
-
-          {/* History Location Markers */}
-          {locationHistory.length > 0 && 
-            locationHistory.map((item, index) => (
-              <Marker
-                key={index}
-                coordinate={{ latitude: item.latitude, longitude: item.longitude }}
-                anchor={{ x: 0.5, y: 0.5 }}
-                onPress={() => {
-                  setSelectedHistoryItem(index);
-                  focusOnLocation(item.latitude, item.longitude);
-                }}
-              >
-                <View style={[
-                  styles.timelineMarker,
-                  selectedHistoryItem === index && styles.timelineMarkerSelected
-                ]}>
-                  <View style={styles.timelineMarkerDot} />
+          {historyMarkers}
+          {userLocation && (
+            <Marker
+              key={`user-location-${userLocation.latitude}-${userLocation.longitude}`}
+              coordinate={{
+                latitude: userLocation.latitude,
+                longitude: userLocation.longitude,
+              }}
+              title="Your Location"
+              description={userLocation.address || `Your exact location: ${userLocation.latitude.toFixed(6)}, ${userLocation.longitude.toFixed(6)}`}
+              anchor={{ x: 0.5, y: 0.5 }}
+              tracksViewChanges={tracksViewChanges}
+              flat={false}
+              zIndex={1000}
+              onPress={() => {
+                focusOnLocation(userLocation.latitude, userLocation.longitude);
+              }}
+            >
+              <View style={styles.userLocationPin} pointerEvents="none" collapsable={false}>
+                <View style={styles.userLocationPinHead} collapsable={false}>
+                  <Ionicons name="location" size={20} color="#FFFFFF" />
                 </View>
-              </Marker>
-            ))
-          }
-
-          {/* Destination Marker */}
+              </View>
+            </Marker>
+          )}
           <Marker
+            key={`destination-${location.latitude}-${location.longitude}`}
             coordinate={location}
             title={title || 'Location'}
             description={location.address || `${location.latitude.toFixed(6)}, ${location.longitude.toFixed(6)}`}
             anchor={{ x: 0.5, y: 0.5 }}
+            tracksViewChanges={tracksViewChanges}
+            flat={false}
+            zIndex={999}
+            onPress={() => {
+              focusOnLocation(location.latitude, location.longitude);
+            }}
           >
-            <View style={styles.destinationMarker}>
-              <View style={styles.destinationMarkerInner}>
-                <Ionicons name="location" size={28} color="#FF3B30" />
+            <View style={styles.destinationPin} pointerEvents="none" collapsable={false}>
+              <View style={styles.destinationPinHead} collapsable={false}>
+                <Ionicons name="location" size={20} color="#FFFFFF" />
               </View>
             </View>
           </Marker>
         </MapView>
+        
+        <TouchableOpacity
+          style={styles.locateButton}
+          onPress={handleRefreshLocation}
+          disabled={loading}
+          activeOpacity={0.8}
+        >
+          <View style={styles.locateButtonInner}>
+            {loading ? (
+              <ActivityIndicator size="small" color="#FFFFFF" />
+            ) : (
+              <Ionicons name="locate" size={22} color="#FFFFFF" />
+            )}
+          </View>
+        </TouchableOpacity>
+
+        {hasOfflineMap && (
+          <View style={styles.offlineBadge}>
+            <Ionicons name="download" size={14} color="#10B981" />
+            <Text style={styles.offlineBadgeText}>Offline</Text>
+          </View>
+        )}
+        
+        {mapError && (
+          <View style={styles.mapErrorContainer}>
+            <Ionicons name="alert-circle" size={24} color="#FF3B30" />
+            <Text style={styles.mapErrorText}>Map failed to load</Text>
+            <Text style={styles.mapErrorSubtext}>
+              {Platform.OS === 'android' 
+                ? 'Please check Google Play Services and internet connection'
+                : 'Please check your internet connection'}
+            </Text>
+          </View>
+        )}
       </View>
 
-      {/* Date Selector */}
+      {/* Date Selector Card */}
       {targetUserId && (
-        <View style={styles.dateSelector}>
+        <View style={styles.dateCard}>
           <TouchableOpacity
             style={styles.dateNavButton}
             onPress={() => navigateDate('prev')}
+            activeOpacity={0.7}
           >
             <Ionicons name="chevron-back" size={20} color="#007AFF" />
           </TouchableOpacity>
-          <TouchableOpacity style={styles.dateDisplay}>
-            <Text style={styles.dateDisplayText}>{formatDateDisplay(selectedDate)}</Text>
-          </TouchableOpacity>
+          <View style={styles.dateDisplay}>
+            <Text style={styles.dateText}>{formatDateDisplay(selectedDate)}</Text>
+            <Text style={styles.dateSubtext}>
+              {selectedDate.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' })}
+            </Text>
+          </View>
           <TouchableOpacity
             style={styles.dateNavButton}
             onPress={() => navigateDate('next')}
             disabled={selectedDate.toDateString() === new Date().toDateString()}
+            activeOpacity={0.7}
           >
             <Ionicons 
               name="chevron-forward" 
@@ -611,33 +850,6 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
               color={selectedDate.toDateString() === new Date().toDateString() ? "#C7C7CC" : "#007AFF"} 
             />
           </TouchableOpacity>
-        </View>
-      )}
-
-      {/* Summary Statistics */}
-      {targetUserId && locationHistory.length > 0 && (
-        <View style={styles.summaryBar}>
-          <View style={styles.summaryItem}>
-            <Ionicons name="walk" size={18} color="#8E8E93" />
-            <Text style={styles.summaryText}>
-              {summary.totalDistance < 0.001 
-                ? '< 1 m' 
-                : summary.totalDistance < 1 
-                  ? `${(summary.totalDistance * 1000).toFixed(0)} m`
-                  : `${summary.totalDistance.toFixed(2)} km`}
-            </Text>
-            {summary.totalTime > 0 && (
-              <Text style={styles.summarySubtext}>
-                {formatDuration(summary.totalTime)}
-              </Text>
-            )}
-          </View>
-          <View style={styles.summaryItem}>
-            <Ionicons name="location" size={18} color="#8E8E93" />
-            <Text style={styles.summaryText}>
-              {summary.visits} {summary.visits === 1 ? 'visit' : 'visits'}
-            </Text>
-          </View>
         </View>
       )}
 
@@ -655,7 +867,9 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
             </View>
           ) : locationHistory.length === 0 ? (
             <View style={styles.timelineEmpty}>
-              <Ionicons name="location-outline" size={48} color="#C7C7CC" />
+              <View style={styles.emptyIconContainer}>
+                <Ionicons name="location-outline" size={48} color="#C7C7CC" />
+              </View>
               <Text style={styles.timelineEmptyTitle}>No Location History</Text>
               <Text style={styles.timelineEmptyText}>
                 No location data for {formatDateDisplay(selectedDate).toLowerCase()}
@@ -668,7 +882,6 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
                 const isLast = index === locationHistory.length - 1;
                 const prevItem = index > 0 ? locationHistory[index - 1] : null;
                 
-                // Calculate activity info
                 const distance = prevItem 
                   ? calculateDistance(
                       prevItem.latitude,
@@ -682,93 +895,105 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
                   ? calculateTimeDiff(prevItem.timestamp, item.timestamp)
                   : 0;
 
-                // Determine if this is a location entry or activity entry
-                const isActivity = prevItem && distance > 0.01; // More than 10m movement
+                const isActivity = prevItem && distance > 0.01;
+                const isSelected = selectedHistoryItem === index;
                 
                 return (
-                  <View key={index} style={styles.timelineItem}>
-                    {/* Timeline Line and Dot */}
-                    <View style={styles.timelineIndicator}>
-                      {!isLast && <View style={styles.timelineLine} />}
-                      <View style={[
-                        styles.timelineDot,
-                        isActivity && styles.timelineDotActivity
-                      ]}>
-                        {isActivity ? (
-                          <Ionicons name="walk" size={12} color="#FFFFFF" />
+                  <TouchableOpacity
+                    key={index}
+                    style={[
+                      styles.timelineCard,
+                      isSelected && styles.timelineCardSelected
+                    ]}
+                    onPress={() => {
+                      setSelectedHistoryItem(index);
+                      focusOnLocation(item.latitude, item.longitude);
+                    }}
+                    activeOpacity={0.7}
+                  >
+                    <View style={styles.timelineCardContent}>
+                      <View style={styles.timelineLeft}>
+                        <View style={[
+                          styles.timelineDot,
+                          isActivity && styles.timelineDotActivity,
+                          isSelected && styles.timelineDotSelected
+                        ]}>
+                          {isActivity ? (
+                            <Ionicons name="walk" size={12} color="#FFFFFF" />
+                          ) : (
+                            <View style={styles.timelineDotInner} />
+                          )}
+                        </View>
+                        {!isLast && <View style={styles.timelineLine} />}
+                      </View>
+
+                      <View style={styles.timelineRight}>
+                        {isActivity && prevItem ? (
+                          <>
+                            <View style={styles.timelineHeader}>
+                              <View style={styles.activityBadge}>
+                                <Ionicons name="walk" size={14} color="#34C759" />
+                                <Text style={styles.activityBadgeText}>Movement</Text>
+                              </View>
+                              <Text style={styles.timelineTime}>
+                                {formatTimeRange(prevItem.timestamp, item.timestamp)}
+                              </Text>
+                            </View>
+                            <View style={styles.activityStats}>
+                              <View style={styles.statItem}>
+                                <Ionicons name="resize" size={14} color="#8E8E93" />
+                                <Text style={styles.statText}>
+                                  {distance < 0.001 
+                                    ? '< 1 m' 
+                                    : distance < 1 
+                                      ? `${(distance * 1000).toFixed(0)} m`
+                                      : `${distance.toFixed(2)} km`}
+                                </Text>
+                              </View>
+                              <View style={styles.statItem}>
+                                <Ionicons name="time-outline" size={14} color="#8E8E93" />
+                                <Text style={styles.statText}>{formatDuration(timeDiff)}</Text>
+                              </View>
+                            </View>
+                            <Text style={styles.timelineCoordinates}>
+                              {item.latitude.toFixed(6)}, {item.longitude.toFixed(6)}
+                            </Text>
+                          </>
                         ) : (
-                          <View style={styles.timelineDotInner} />
+                          <>
+                            <View style={styles.timelineHeader}>
+                              <Text style={styles.timelineTitle}>
+                                {item.address ? item.address.split(',')[0] : 'Unknown Location'}
+                              </Text>
+                              <Text style={styles.timelineTime}>
+                                {new Date(item.timestamp).toLocaleTimeString([], {
+                                  hour: 'numeric',
+                                  minute: '2-digit',
+                                  hour12: true,
+                                }).toLowerCase()}
+                              </Text>
+                            </View>
+                            {item.address && (
+                              <Text style={styles.timelineAddress} numberOfLines={2}>
+                                {item.address}
+                              </Text>
+                            )}
+                            <Text style={styles.timelineCoordinates}>
+                              {item.latitude.toFixed(6)}, {item.longitude.toFixed(6)}
+                            </Text>
+                            <View style={styles.timelineFooter}>
+                              <Text style={styles.timelineStatus}>
+                                {isFirst ? '📍 Arrived' : '🚶 Left'}
+                              </Text>
+                              <Text style={styles.timelineDate}>
+                                {formatTime(item.timestamp)}
+                              </Text>
+                            </View>
+                          </>
                         )}
                       </View>
                     </View>
-
-                    {/* Timeline Content */}
-                    <View style={styles.timelineItemContent}>
-                      {isActivity && prevItem ? (
-                        // Activity Entry (Walking/Moving)
-                        <TouchableOpacity
-                          style={styles.timelineActivityEntry}
-                          onPress={() => {
-                            setSelectedHistoryItem(index);
-                            focusOnLocation(item.latitude, item.longitude);
-                          }}
-                          activeOpacity={0.7}
-                        >
-                          <View style={styles.timelineActivityHeader}>
-                            <Ionicons name="walk" size={16} color="#34C759" />
-                            <Text style={styles.timelineActivityType}>Walking</Text>
-                          </View>
-                          <View style={styles.timelineActivityDetails}>
-                            <Text style={styles.timelineActivityDistance}>
-                              {distance < 0.001 
-                                ? '< 1 m' 
-                                : distance < 1 
-                                  ? `${(distance * 1000).toFixed(0)} m`
-                                  : `${distance.toFixed(2)} km`}
-                            </Text>
-                            <Text style={styles.timelineActivityDuration}>
-                              {formatDuration(timeDiff)}
-                            </Text>
-                          </View>
-                          <Text style={styles.timelineActivityCoordinates}>
-                            {item.latitude.toFixed(6)}, {item.longitude.toFixed(6)}
-                          </Text>
-                          <Text style={styles.timelineActivityTime}>
-                            {formatTimeRange(prevItem.timestamp, item.timestamp)}
-                          </Text>
-                        </TouchableOpacity>
-                      ) : (
-                        // Location Entry
-                        <TouchableOpacity
-                          style={styles.timelineLocationEntry}
-                          onPress={() => {
-                            setSelectedHistoryItem(index);
-                            focusOnLocation(item.latitude, item.longitude);
-                          }}
-                          activeOpacity={0.7}
-                        >
-                          <Text style={styles.timelineLocationTitle}>
-                            {item.address ? item.address.split(',')[0] : 'Unknown Location'}
-                          </Text>
-                          {item.address && (
-                            <Text style={styles.timelineLocationAddress} numberOfLines={2}>
-                              {item.address}
-                            </Text>
-                          )}
-                          <Text style={styles.timelineLocationCoordinates}>
-                            {item.latitude.toFixed(6)}, {item.longitude.toFixed(6)}
-                          </Text>
-                          <Text style={styles.timelineLocationTime}>
-                            {isFirst ? 'Arrived' : 'Left'} at {new Date(item.timestamp).toLocaleTimeString([], {
-                              hour: 'numeric',
-                              minute: '2-digit',
-                              hour12: true,
-                            }).toLowerCase()}
-                          </Text>
-                        </TouchableOpacity>
-                      )}
-                    </View>
-                  </View>
+                  </TouchableOpacity>
                 );
               })}
             </View>
@@ -782,650 +1007,313 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#FFFFFF',
+    backgroundColor: '#F5F5F7',
   },
   header: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 16,
-    paddingVertical: 12,
+    paddingHorizontal: 20,
+    paddingVertical: 16,
     backgroundColor: '#FFFFFF',
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: '#E5E5EA',
     ...Platform.select({
       ios: {
         shadowColor: '#000',
-        shadowOffset: { width: 0, height: 1 },
+        shadowOffset: { width: 0, height: 2 },
         shadowOpacity: 0.05,
-        shadowRadius: 2,
+        shadowRadius: 4,
       },
       android: {
-        elevation: 2,
+        elevation: 3,
       },
     }),
   },
   headerButton: {
-    width: 40,
-    height: 40,
+    width: 44,
+    height: 44,
     justifyContent: 'center',
+    alignItems: 'center',
+  },
+  iconButton: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: '#F5F5F7',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  headerTitleContainer: {
+    flex: 1,
     alignItems: 'center',
   },
   headerTitle: {
-    fontSize: 17,
-    fontWeight: '600',
-    color: '#1C1C1E',
-    flex: 1,
-    textAlign: 'center',
+    fontSize: 18,
+    fontWeight: '700',
+    color: '#000',
+    letterSpacing: -0.5,
   },
-  historyHeaderButton: {
-    width: 40,
-    height: 40,
-    justifyContent: 'center',
+  headerSubtitle: {
+    fontSize: 13,
+    color: '#8E8E93',
+    marginTop: 2,
+  },
+  headerRightButtons: {
+    flexDirection: 'row',
     alignItems: 'center',
     position: 'relative',
   },
-  historyBadge: {
+  pendingBadge: {
     position: 'absolute',
-    top: 6,
-    right: 6,
+    top: -2,
+    right: -2,
     backgroundColor: '#FF3B30',
     borderRadius: 10,
-    minWidth: 20,
-    height: 20,
+    minWidth: 18,
+    height: 18,
     justifyContent: 'center',
     alignItems: 'center',
-    paddingHorizontal: 6,
+    paddingHorizontal: 5,
+    zIndex: 1,
     borderWidth: 2,
     borderColor: '#FFFFFF',
   },
-  historyBadgeText: {
+  pendingBadgeText: {
     color: '#FFFFFF',
-    fontSize: 10,
+    fontSize: 9,
     fontWeight: '700',
   },
   mapSection: {
-    height: SCREEN_HEIGHT * 0.4, // 40% of screen height
+    height: SCREEN_HEIGHT * 0.45,
     width: '100%',
+    backgroundColor: '#E5E5EA',
   },
   map: {
     flex: 1,
   },
-  mapInfoCard: {
+  destinationPin: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    width: 40,
+    height: 40,
+    backgroundColor: 'transparent',
+  },
+  destinationPinHead: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: '#FF3B30',
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 3,
+    borderColor: '#FFFFFF',
+    overflow: 'hidden',
+    ...Platform.select({
+      ios: {
+        shadowColor: '#FF3B30',
+        shadowOffset: { width: 0, height: 3 },
+        shadowOpacity: 0.5,
+        shadowRadius: 6,
+      },
+      android: {
+        elevation: 8,
+      },
+    }),
+  },
+  userLocationPin: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    width: 40,
+    height: 40,
+    backgroundColor: 'transparent',
+  },
+  userLocationPinHead: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: '#007AFF',
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 3,
+    borderColor: '#FFFFFF',
+    overflow: 'hidden',
+    ...Platform.select({
+      ios: {
+        shadowColor: '#007AFF',
+        shadowOffset: { width: 0, height: 3 },
+        shadowOpacity: 0.5,
+        shadowRadius: 6,
+      },
+      android: {
+        elevation: 8,
+      },
+    }),
+  },
+  historyMarkerContainer: {
+    width: 20,
+    height: 20,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'transparent',
+  },
+  historyMarkerSelected: {
+    width: 28,
+    height: 28,
+  },
+  historyMarkerDot: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    backgroundColor: '#007AFF',
+    borderWidth: 2,
+    borderColor: '#FFFFFF',
+    ...Platform.select({
+      ios: {
+        shadowColor: '#007AFF',
+        shadowOffset: { width: 0, height: 1 },
+        shadowOpacity: 0.25,
+        shadowRadius: 3,
+      },
+      android: {
+        elevation: 3,
+      },
+    }),
+  },
+  locateButton: {
+    position: 'absolute',
+    bottom: 20,
+    right: 20,
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    ...Platform.select({
+      ios: {
+        shadowColor: '#007AFF',
+        shadowOffset: { width: 0, height: 4 },
+        shadowOpacity: 0.3,
+        shadowRadius: 8,
+      },
+      android: {
+        elevation: 8,
+      },
+    }),
+  },
+  locateButtonInner: {
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    backgroundColor: '#007AFF',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  offlineBadge: {
     position: 'absolute',
     top: 16,
     left: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
     backgroundColor: '#FFFFFF',
-    borderRadius: 12,
-    padding: 12,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 20,
+    gap: 6,
     ...Platform.select({
       ios: {
         shadowColor: '#000',
         shadowOffset: { width: 0, height: 2 },
         shadowOpacity: 0.1,
-        shadowRadius: 8,
+        shadowRadius: 4,
       },
       android: {
         elevation: 4,
       },
     }),
-    minWidth: 140,
-  },
-  mapInfoRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-  },
-  mapInfoText: {
-    fontSize: 13,
-    fontWeight: '500',
-    color: '#1C1C1E',
-  },
-  mapInfoDivider: {
-    height: 1,
-    backgroundColor: '#E5E5EA',
-    marginVertical: 8,
-  },
-  destinationMarker: {
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  destinationMarkerInner: {
-    backgroundColor: '#FFFFFF',
-    borderRadius: 20,
-    padding: 4,
-    ...Platform.select({
-      ios: {
-        shadowColor: '#000',
-        shadowOffset: { width: 0, height: 2 },
-        shadowOpacity: 0.3,
-        shadowRadius: 4,
-      },
-      android: {
-        elevation: 6,
-      },
-    }),
-    borderWidth: 3,
-    borderColor: '#FF3B30',
-  },
-  userMarker: {
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  userMarkerInner: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    backgroundColor: '#007AFF',
-    justifyContent: 'center',
-    alignItems: 'center',
-    borderWidth: 3,
-    borderColor: '#FFFFFF',
-    ...Platform.select({
-      ios: {
-        shadowColor: '#000',
-        shadowOffset: { width: 0, height: 2 },
-        shadowOpacity: 0.3,
-        shadowRadius: 4,
-      },
-      android: {
-        elevation: 6,
-      },
-    }),
-  },
-  historyMapMarker: {
-    width: 20,
-    height: 20,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  historyMapMarkerSelected: {
-    width: 28,
-    height: 28,
-  },
-  historyMapMarkerDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    backgroundColor: '#007AFF',
-    borderWidth: 2,
-    borderColor: '#FFFFFF',
-  },
-  overlay: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    backgroundColor: '#000000',
-  },
-  overlayTouchable: {
-    flex: 1,
-  },
-  historySheet: {
-    position: 'absolute',
-    bottom: 0,
-    left: 0,
-    right: 0,
-    height: HISTORY_SHEET_MAX_HEIGHT,
-    backgroundColor: '#FFFFFF',
-    borderTopLeftRadius: 20,
-    borderTopRightRadius: 20,
-    ...Platform.select({
-      ios: {
-        shadowColor: '#000',
-        shadowOffset: { width: 0, height: -2 },
-        shadowOpacity: 0.1,
-        shadowRadius: 10,
-      },
-      android: {
-        elevation: 10,
-      },
-    }),
-  },
-  sheetHandleContainer: {
-    paddingTop: 12,
-    paddingBottom: 8,
-    alignItems: 'center',
-  },
-  sheetHandle: {
-    width: 36,
-    height: 4,
-    backgroundColor: '#C7C7CC',
-    borderRadius: 2,
-  },
-  sheetHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'flex-start',
-    paddingHorizontal: 20,
-    paddingBottom: 16,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: '#E5E5EA',
-  },
-  sheetHeaderContent: {
-    flex: 1,
-  },
-  sheetTitle: {
-    fontSize: 28,
-    fontWeight: '700',
-    color: '#1C1C1E',
-    marginBottom: 4,
-  },
-  sheetSubtitle: {
-    fontSize: 15,
-    color: '#8E8E93',
-    fontWeight: '400',
-  },
-  sheetCloseButton: {
-    width: 32,
-    height: 32,
-    justifyContent: 'center',
-    alignItems: 'center',
-    borderRadius: 16,
-    backgroundColor: '#F2F2F7',
-  },
-  timeFilterContainer: {
-    paddingVertical: 16,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: '#E5E5EA',
-  },
-  timeFilterScroll: {
-    paddingHorizontal: 20,
-    gap: 8,
-  },
-  timeFilterButton: {
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    borderRadius: 20,
-    backgroundColor: '#F2F2F7',
     borderWidth: 1,
-    borderColor: 'transparent',
+    borderColor: '#D1FAE5',
   },
-  timeFilterButtonActive: {
-    backgroundColor: '#007AFF',
-    borderColor: '#007AFF',
-  },
-  timeFilterText: {
-    fontSize: 14,
-    fontWeight: '500',
-    color: '#1C1C1E',
-  },
-  timeFilterTextActive: {
-    color: '#FFFFFF',
-  },
-  historyList: {
-    flex: 1,
-  },
-  historyListContent: {
-    paddingBottom: 20,
-  },
-  historyLoadingContainer: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    paddingVertical: 60,
-  },
-  historyLoadingText: {
-    marginTop: 12,
-    fontSize: 15,
-    color: '#8E8E93',
-  },
-  emptyHistoryContainer: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    paddingVertical: 60,
-    paddingHorizontal: 40,
-  },
-  emptyHistoryIcon: {
-    width: 80,
-    height: 80,
-    borderRadius: 40,
-    backgroundColor: '#F2F2F7',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginBottom: 20,
-  },
-  emptyHistoryTitle: {
-    fontSize: 22,
+  offlineBadgeText: {
+    fontSize: 12,
     fontWeight: '600',
-    color: '#1C1C1E',
-    marginBottom: 8,
+    color: '#10B981',
   },
-  emptyHistoryText: {
-    fontSize: 15,
-    color: '#8E8E93',
+  mapErrorContainer: {
+    position: 'absolute',
+    top: '40%',
+    left: '10%',
+    right: '10%',
+    backgroundColor: '#FFFFFF',
+    borderRadius: 12,
+    padding: 20,
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#000000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 8,
+    elevation: 5,
+    zIndex: 1000,
+  },
+  mapErrorText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#000000',
+    marginTop: 8,
     textAlign: 'center',
-    lineHeight: 22,
   },
-  historyItem: {
+  mapErrorSubtext: {
+    fontSize: 13,
+    color: '#8E8E93',
+    marginTop: 4,
+    textAlign: 'center',
+  },
+  dateCard: {
     flexDirection: 'row',
-    alignItems: 'flex-start',
+    alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 20,
-    paddingVertical: 18,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: '#E5E5EA',
-    backgroundColor: '#FFFFFF',
-  },
-  historyItemSelected: {
-    backgroundColor: '#F0F9FF',
-  },
-  historyItemLeft: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    flex: 1,
-  },
-  historyItemTimeline: {
-    alignItems: 'center',
-    marginRight: 16,
-    position: 'relative',
-  },
-  historyItemBadge: {
-    position: 'absolute',
-    top: -10,
-    left: -24,
-    backgroundColor: '#007AFF',
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderRadius: 6,
-    zIndex: 1,
-  },
-  historyItemBadgeText: {
-    color: '#FFFFFF',
-    fontSize: 9,
-    fontWeight: '700',
-    letterSpacing: 0.5,
-  },
-  historyItemIcon: {
-    width: 28,
-    height: 28,
-    borderRadius: 14,
-    backgroundColor: '#F0F9FF',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  historyItemIconActive: {
-    backgroundColor: '#007AFF',
-  },
-  historyItemLine: {
-    width: 2,
-    flex: 1,
-    backgroundColor: '#E5E5EA',
-    marginTop: 4,
-    minHeight: 40,
-  },
-  historyItemContent: {
-    flex: 1,
-    gap: 12,
-  },
-  historyItemTimeContainer: {
-    marginBottom: 4,
-  },
-  historyItemTimeMain: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: '#1C1C1E',
-    marginBottom: 4,
-  },
-  historyItemDateTime: {
-    fontSize: 12,
-    color: '#8E8E93',
-    fontWeight: '400',
-  },
-  historyItemAddressContainer: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    gap: 8,
-    marginBottom: 4,
-  },
-  historyItemAddress: {
-    flex: 1,
-    fontSize: 15,
-    fontWeight: '500',
-    color: '#1C1C1E',
-    lineHeight: 20,
-  },
-  historyItemCoordinatesContainer: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    marginBottom: 4,
-  },
-  historyItemCoordinatesText: {
-    fontSize: 11,
-    color: '#8E8E93',
-    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
-  },
-  historyItemMovementContainer: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 12,
-    marginTop: 4,
-    paddingTop: 12,
-    borderTopWidth: 1,
-    borderTopColor: '#F2F2F7',
-  },
-  historyItemMovementRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-  },
-  historyItemMovementText: {
-    fontSize: 12,
-    color: '#8E8E93',
-    fontWeight: '500',
-  },
-  historyItemAction: {
-    width: 32,
-    height: 32,
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginLeft: 12,
-    marginTop: 4,
-  },
-  loadingContainer: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  historySection: {
-    flex: 1,
-    backgroundColor: '#FFFFFF',
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: '#E5E5EA',
-  },
-  historySectionHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: '#E5E5EA',
-  },
-  historySectionHeaderLeft: {
-    flex: 1,
-  },
-  historySectionTitle: {
-    fontSize: 18,
-    fontWeight: '600',
-    color: '#1C1C1E',
-    marginBottom: 2,
-  },
-  historySectionSubtitle: {
-    fontSize: 13,
-    color: '#8E8E93',
-  },
-  historySectionExpandButton: {
-    width: 32,
-    height: 32,
-    justifyContent: 'center',
-    alignItems: 'center',
-    borderRadius: 16,
-    backgroundColor: '#F0F9FF',
-  },
-  historySectionTimeFilters: {
-    paddingVertical: 12,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: '#E5E5EA',
-  },
-  historySectionTimeFilterScroll: {
-    paddingHorizontal: 16,
-    gap: 8,
-  },
-  historySectionTimeFilterButton: {
-    paddingHorizontal: 14,
-    paddingVertical: 6,
-    borderRadius: 16,
-    backgroundColor: '#F2F2F7',
-    borderWidth: 1,
-    borderColor: 'transparent',
-  },
-  historySectionTimeFilterButtonActive: {
-    backgroundColor: '#007AFF',
-    borderColor: '#007AFF',
-  },
-  historySectionTimeFilterText: {
-    fontSize: 13,
-    fontWeight: '500',
-    color: '#1C1C1E',
-  },
-  historySectionTimeFilterTextActive: {
-    color: '#FFFFFF',
-  },
-  historySectionLoading: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    paddingVertical: 40,
-    gap: 8,
-  },
-  historySectionLoadingText: {
-    fontSize: 13,
-    color: '#8E8E93',
-  },
-  historySectionEmpty: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    paddingVertical: 40,
-    gap: 8,
-  },
-  historySectionEmptyText: {
-    fontSize: 14,
-    color: '#8E8E93',
-  },
-  historySectionList: {
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    gap: 12,
-  },
-  historySectionItem: {
-    width: 140,
-    padding: 12,
-    backgroundColor: '#F9F9F9',
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: '#E5E5EA',
-  },
-  historySectionItemIcon: {
-    width: 24,
-    height: 24,
-    borderRadius: 12,
-    backgroundColor: '#F0F9FF',
-    justifyContent: 'center',
-    alignItems: 'center',
+    marginHorizontal: 16,
+    marginTop: 12,
     marginBottom: 8,
-  },
-  historySectionItemIconActive: {
-    backgroundColor: '#007AFF',
-  },
-  historySectionItemTime: {
-    fontSize: 12,
-    fontWeight: '600',
-    color: '#1C1C1E',
-    marginBottom: 4,
-  },
-  historySectionItemAddress: {
-    fontSize: 11,
-    color: '#8E8E93',
-    lineHeight: 16,
-  },
-  historySectionViewAll: {
-    width: 140,
-    padding: 12,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  historySectionViewAllContent: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-  },
-  historySectionViewAllText: {
-    fontSize: 13,
-    fontWeight: '500',
-    color: '#007AFF',
-  },
-  // New Timeline Styles
-  map: {
-    flex: 1,
-  },
-  dateSelector: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
+    paddingVertical: 14,
     paddingHorizontal: 16,
-    paddingVertical: 12,
     backgroundColor: '#FFFFFF',
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: '#E5E5EA',
+    borderRadius: 16,
+    ...Platform.select({
+      ios: {
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 2 },
+        shadowOpacity: 0.08,
+        shadowRadius: 8,
+      },
+      android: {
+        elevation: 3,
+      },
+    }),
   },
   dateNavButton: {
-    width: 40,
-    height: 40,
+    width: 36,
+    height: 36,
     justifyContent: 'center',
     alignItems: 'center',
+    borderRadius: 18,
+    backgroundColor: '#F5F5F7',
   },
   dateDisplay: {
     flex: 1,
     alignItems: 'center',
   },
-  dateDisplayText: {
+  dateText: {
     fontSize: 16,
-    fontWeight: '600',
-    color: '#1C1C1E',
+    fontWeight: '700',
+    color: '#000',
+    letterSpacing: -0.3,
   },
-  summaryBar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-around',
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    backgroundColor: '#F9F9F9',
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: '#E5E5EA',
-  },
-  summaryItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-  },
-  summaryText: {
-    fontSize: 14,
-    fontWeight: '500',
-    color: '#1C1C1E',
-  },
-  summarySubtext: {
+  dateSubtext: {
     fontSize: 12,
     color: '#8E8E93',
-    marginLeft: 4,
+    marginTop: 2,
   },
   timelineContainer: {
     flex: 1,
-    backgroundColor: '#FFFFFF',
+    backgroundColor: '#F5F5F7',
   },
   timelineContent: {
     paddingBottom: 20,
@@ -1448,39 +1336,68 @@ const styles = StyleSheet.create({
     paddingVertical: 60,
     paddingHorizontal: 40,
   },
+  emptyIconContainer: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    backgroundColor: '#FFFFFF',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 20,
+  },
   timelineEmptyTitle: {
-    fontSize: 18,
-    fontWeight: '600',
-    color: '#1C1C1E',
-    marginTop: 16,
+    fontSize: 20,
+    fontWeight: '700',
+    color: '#000',
+    letterSpacing: -0.3,
     marginBottom: 8,
   },
   timelineEmptyText: {
-    fontSize: 14,
+    fontSize: 15,
     color: '#8E8E93',
     textAlign: 'center',
+    lineHeight: 22,
   },
   timelineList: {
     paddingHorizontal: 16,
+    paddingTop: 8,
   },
-  timelineItem: {
+  timelineCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 16,
+    marginBottom: 12,
+    overflow: 'hidden',
+    ...Platform.select({
+      ios: {
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 2 },
+        shadowOpacity: 0.08,
+        shadowRadius: 8,
+      },
+      android: {
+        elevation: 3,
+      },
+    }),
+  },
+  timelineCardSelected: {
+    borderWidth: 2,
+    borderColor: '#007AFF',
+    ...Platform.select({
+      ios: {
+        shadowColor: '#007AFF',
+        shadowOpacity: 0.2,
+      },
+    }),
+  },
+  timelineCardContent: {
     flexDirection: 'row',
-    marginBottom: 8,
+    padding: 16,
   },
-  timelineIndicator: {
+  timelineLeft: {
     width: 24,
     alignItems: 'center',
     marginRight: 16,
     position: 'relative',
-  },
-  timelineLine: {
-    position: 'absolute',
-    left: 11,
-    top: 24,
-    width: 2,
-    backgroundColor: '#007AFF',
-    flex: 1,
-    minHeight: 40,
   },
   timelineDot: {
     width: 24,
@@ -1490,9 +1407,17 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
     zIndex: 1,
+    borderWidth: 3,
+    borderColor: '#FFFFFF',
   },
   timelineDotActivity: {
     backgroundColor: '#34C759',
+  },
+  timelineDotSelected: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    borderWidth: 4,
   },
   timelineDotInner: {
     width: 8,
@@ -1500,85 +1425,95 @@ const styles = StyleSheet.create({
     borderRadius: 4,
     backgroundColor: '#FFFFFF',
   },
-  timelineItemContent: {
+  timelineLine: {
+    position: 'absolute',
+    left: 11,
+    top: 24,
+    width: 2,
+    backgroundColor: '#E5E5EA',
     flex: 1,
-    paddingBottom: 16,
+    minHeight: 40,
   },
-  timelineLocationEntry: {
-    paddingVertical: 8,
+  timelineRight: {
+    flex: 1,
   },
-  timelineLocationTitle: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#1C1C1E',
-    marginBottom: 4,
+  timelineHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    marginBottom: 8,
   },
-  timelineLocationAddress: {
+  timelineTitle: {
+    fontSize: 17,
+    fontWeight: '700',
+    color: '#000',
+    flex: 1,
+    letterSpacing: -0.3,
+  },
+  timelineTime: {
+    fontSize: 13,
+    color: '#8E8E93',
+    fontWeight: '500',
+  },
+  timelineAddress: {
     fontSize: 14,
     color: '#8E8E93',
     lineHeight: 20,
-    marginBottom: 4,
+    marginBottom: 8,
   },
-  timelineLocationTime: {
-    fontSize: 13,
-    color: '#8E8E93',
-  },
-  timelineLocationCoordinates: {
-    fontSize: 12,
+  timelineCoordinates: {
+    fontSize: 11,
     color: '#8E8E93',
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
-    marginTop: 2,
-    marginBottom: 4,
+    marginBottom: 8,
   },
-  timelineActivityEntry: {
-    paddingVertical: 8,
-  },
-  timelineActivityHeader: {
+  timelineFooter: {
     flexDirection: 'row',
+    justifyContent: 'space-between',
     alignItems: 'center',
-    gap: 8,
-    marginBottom: 6,
+    marginTop: 4,
   },
-  timelineActivityType: {
-    fontSize: 15,
+  timelineStatus: {
+    fontSize: 13,
+    color: '#007AFF',
     fontWeight: '600',
-    color: '#1C1C1E',
   },
-  timelineActivityDetails: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    marginBottom: 4,
-  },
-  timelineActivityDistance: {
-    fontSize: 14,
-    fontWeight: '500',
-    color: '#1C1C1E',
-  },
-  timelineActivityDuration: {
-    fontSize: 14,
-    color: '#8E8E93',
-  },
-  timelineActivityCoordinates: {
+  timelineDate: {
     fontSize: 12,
     color: '#8E8E93',
-    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
-    marginTop: 2,
-    marginBottom: 4,
   },
-  timelineActivityTime: {
+  activityBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#F0FDF4',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 8,
+    gap: 4,
+  },
+  activityBadgeText: {
+    fontSize: 12,
+    color: '#34C759',
+    fontWeight: '600',
+  },
+  activityStats: {
+    flexDirection: 'row',
+    gap: 16,
+    marginBottom: 8,
+  },
+  statItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+  },
+  statText: {
     fontSize: 13,
     color: '#8E8E93',
+    fontWeight: '500',
   },
-  timelineMarker: {
-    width: 16,
-    height: 16,
+  loadingContainer: {
+    flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
   },
-  timelineMarkerSelected: {
-    width: 24,
-    height: 24,
-  },
 });
-

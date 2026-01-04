@@ -1,15 +1,23 @@
+// IMPORTANT: Import warning suppression FIRST before any other imports
+// This ensures warnings are filtered before modules that might log them
+import './src/utils/warningSuppression';
+
+// Import background task to register it
+import './src/tasks/locationBackgroundTask';
+
 import React, { useEffect, useRef, useState } from 'react';
-import { View, Text, ActivityIndicator } from 'react-native';
+import { View, Text, ActivityIndicator, LogBox } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
 import { createStackNavigator } from '@react-navigation/stack';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
-import * as Notifications from 'expo-notifications';
 import { Ionicons } from '@expo/vector-icons';
 import type { RouteProp } from '@react-navigation/native';
 import type { BottomTabNavigationProp } from '@react-navigation/bottom-tabs';
-import { notificationService } from './src/services/notificationService';
+import { ErrorBoundary } from './src/components/ErrorBoundary';
+import { logger } from './src/utils/logger';
+
 
 // Screens
 import SplashScreen from './src/screens/SplashScreen';
@@ -23,26 +31,32 @@ import ProfileScreen from './src/screens/ProfileScreen';
 import IncidentDetailScreen from './src/screens/IncidentDetailScreen';
 import ConnectionScreen from './src/screens/ConnectionScreen';
 import MapScreen from './src/screens/MapScreen';
-import NotificationScreen from './src/screens/NotificationScreen';
 import EditProfileScreen from './src/screens/EditProfileScreen';
 import EmergencyNotesScreen from './src/screens/EmergencyNotesScreen';
 import LocationAccuracyScreen from './src/screens/LocationAccuracyScreen';
 import LocationUpdateFrequencyScreen from './src/screens/LocationUpdateFrequencyScreen';
 import SleepModeScreen from './src/screens/SleepModeScreen';
-import NotificationFiltersScreen from './src/screens/NotificationFiltersScreen';
 import LanguageRegionScreen from './src/screens/LanguageRegionScreen';
 import UnitsScreen from './src/screens/UnitsScreen';
 import BatterySavingScreen from './src/screens/BatterySavingScreen';
 import HelpSupportScreen from './src/screens/HelpSupportScreen';
+import UserManualScreen from './src/screens/UserManualScreen';
 import PrivacyPolicyScreen from './src/screens/PrivacyPolicyScreen';
 import TermsOfServiceScreen from './src/screens/TermsOfServiceScreen';
 import LockedScreen from './src/screens/LockedScreen';
+import TravelAdvisoryScreen from './src/screens/TravelAdvisoryScreen';
+import CheckInScreen from './src/screens/CheckInScreen';
+import CheckInSettingsScreen from './src/screens/CheckInSettingsScreen';
+import OfflineMapsScreen from './src/screens/OfflineMapsScreen';
+import NotificationsScreen from './src/screens/NotificationsScreen';
 
 // Context
 import { AuthProvider, useAuth } from './src/context/AuthContext';
 import { ConnectionProvider } from './src/context/ConnectionContext';
 import { IncidentProvider } from './src/context/IncidentContext';
 import { AppSettingProvider, useAppSetting } from './src/context/AppSettingContext';
+import { TravelAdvisoryProvider } from './src/context/TravelAdvisoryContext';
+import { CheckInProvider } from './src/context/CheckInContext';
 
 // Types
 import type { RootStackParamList, MainTabParamList } from './src/types';
@@ -109,6 +123,7 @@ function AppNavigator() {
         {!isAuthenticated ? (
           <>
             <Stack.Screen name="Welcome" component={WelcomeScreen} />
+            <Stack.Screen name="UserManual" component={UserManualScreen} />
             <Stack.Screen name="Login" component={LoginScreen} />
             <Stack.Screen name="Signup" component={SignupScreen} />
           </>
@@ -124,19 +139,23 @@ function AppNavigator() {
             {!hideIncident && <Stack.Screen name="IncidentDetail" component={IncidentDetailScreen} />}
             <Stack.Screen name="Connections" component={ConnectionScreen} />
             <Stack.Screen name="MapView" component={MapScreen} />
-            <Stack.Screen name="Notifications" component={NotificationScreen} />
             <Stack.Screen name="EditProfile" component={EditProfileScreen} />
             <Stack.Screen name="EmergencyNotes" component={EmergencyNotesScreen} />
             <Stack.Screen name="LocationAccuracy" component={LocationAccuracyScreen} />
             <Stack.Screen name="LocationUpdateFrequency" component={LocationUpdateFrequencyScreen} />
             <Stack.Screen name="SleepMode" component={SleepModeScreen} />
-            <Stack.Screen name="NotificationFilters" component={NotificationFiltersScreen} />
             <Stack.Screen name="LanguageRegion" component={LanguageRegionScreen} />
             <Stack.Screen name="Units" component={UnitsScreen} />
             <Stack.Screen name="BatterySaving" component={BatterySavingScreen} />
             <Stack.Screen name="HelpSupport" component={HelpSupportScreen} />
+            <Stack.Screen name="UserManual" component={UserManualScreen} />
             <Stack.Screen name="PrivacyPolicy" component={PrivacyPolicyScreen} />
             <Stack.Screen name="TermsOfService" component={TermsOfServiceScreen} />
+            <Stack.Screen name="TravelAdvisory" component={TravelAdvisoryScreen} />
+            <Stack.Screen name="CheckIn" component={CheckInScreen} />
+            <Stack.Screen name="CheckInSettings" component={CheckInSettingsScreen} />
+            <Stack.Screen name="OfflineMaps" component={OfflineMapsScreen} />
+            <Stack.Screen name="Notifications" component={NotificationsScreen} />
           </>
         )}
       </Stack.Navigator>
@@ -147,42 +166,52 @@ function AppNavigator() {
 export default function App() {
   const [showSplash, setShowSplash] = useState(true);
   const [appReady, setAppReady] = useState(false);
-  const notificationListener = useRef<Notifications.Subscription | null>(null);
-  const responseListener = useRef<Notifications.Subscription | null>(null);
 
   useEffect(() => {
-    // Configure notification handler for background
-    Notifications.setNotificationHandler({
-      handleNotification: async () => ({
-        shouldShowAlert: true,
-        shouldPlaySound: true,
-        shouldSetBadge: true,
-        shouldShowBanner: true,
-        shouldShowList: true,
-      }),
-    });
+    // Global error handlers to catch unhandled errors
+    let originalHandler: ((error: Error, isFatal?: boolean) => void) | undefined;
+    let originalUnhandledRejection: ((event: any) => void) | undefined;
 
-    // Set up notification listeners for background/foreground handling
-    notificationListener.current = Notifications.addNotificationReceivedListener((notification) => {
-      console.log('Background notification received:', notification);
-      // Handle background notification
-    });
-
-    responseListener.current = Notifications.addNotificationResponseReceivedListener((response) => {
-      console.log('Background notification tapped:', response);
-      const data = response.notification.request.content.data;
-      
-      // Handle navigation based on notification data
-      // This will be handled by individual screens that set up their own listeners
-    });
-
-    return () => {
-      // Use .remove() method instead of deprecated removeNotificationSubscription
-      if (notificationListener.current) {
-        notificationListener.current.remove();
+    try {
+      // Set up global error handlers for React Native
+      if (typeof ErrorUtils !== 'undefined') {
+        originalHandler = ErrorUtils.getGlobalHandler();
+        ErrorUtils.setGlobalHandler((error: Error, isFatal?: boolean) => {
+          logger.error('Global error handler:', error, isFatal ? '(Fatal)' : '(Non-fatal)');
+          // In production, you might want to send this to an error tracking service
+          // Example: Sentry.captureException(error);
+          if (originalHandler) {
+            originalHandler(error, isFatal);
+          }
+        });
       }
-      if (responseListener.current) {
-        responseListener.current.remove();
+
+      // Handle unhandled promise rejections
+      if (typeof global !== 'undefined') {
+        originalUnhandledRejection = (global as any).onunhandledrejection;
+        (global as any).onunhandledrejection = (event: any) => {
+          logger.error('Unhandled promise rejection:', event?.reason || event);
+          // In production, you might want to send this to an error tracking service
+          if (originalUnhandledRejection) {
+            originalUnhandledRejection(event);
+          }
+        };
+      }
+    } catch (error) {
+      logger.warn('Failed to set up global error handlers:', error);
+    }
+
+    // Cleanup
+    return () => {
+      try {
+        if (typeof ErrorUtils !== 'undefined' && originalHandler) {
+          ErrorUtils.setGlobalHandler(originalHandler);
+        }
+        if (typeof global !== 'undefined' && originalUnhandledRejection) {
+          (global as any).onunhandledrejection = originalUnhandledRejection;
+        }
+      } catch (error) {
+        logger.warn('Error cleaning up global handlers:', error);
       }
     };
   }, []);
@@ -196,22 +225,28 @@ export default function App() {
   };
 
   return (
-    <SafeAreaProvider>
-      <AuthProvider>
-        <AppSettingProvider>
-          <ConnectionProvider>
-            <IncidentProvider>
-              <StatusBar style="auto" />
-              {showSplash ? (
-                <SplashScreen onFinish={handleSplashFinish} />
-              ) : (
-                <AppContent onReady={handleAppReady} />
-              )}
-            </IncidentProvider>
-          </ConnectionProvider>
-        </AppSettingProvider>
-      </AuthProvider>
-    </SafeAreaProvider>
+    <ErrorBoundary>
+      <SafeAreaProvider>
+        <AuthProvider>
+          <AppSettingProvider>
+            <ConnectionProvider>
+              <IncidentProvider>
+                <TravelAdvisoryProvider>
+                  <CheckInProvider>
+                    <StatusBar style="auto" />
+                    {showSplash ? (
+                      <SplashScreen onFinish={handleSplashFinish} />
+                    ) : (
+                      <AppContent onReady={handleAppReady} />
+                    )}
+                  </CheckInProvider>
+                </TravelAdvisoryProvider>
+              </IncidentProvider>
+            </ConnectionProvider>
+          </AppSettingProvider>
+        </AuthProvider>
+      </SafeAreaProvider>
+    </ErrorBoundary>
   );
 }
 

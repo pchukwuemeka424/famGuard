@@ -12,20 +12,18 @@ import {
   Modal,
   Animated,
 } from 'react-native';
-import * as Notifications from 'expo-notifications';
 import * as ExpoLocation from 'expo-location';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import MapView, { Marker, PROVIDER_GOOGLE, Region } from 'react-native-maps';
 import { Ionicons } from '@expo/vector-icons';
+import Constants from 'expo-constants';
 import type { CompositeNavigationProp } from '@react-navigation/native';
-import { useFocusEffect } from '@react-navigation/native';
 import type { BottomTabNavigationProp } from '@react-navigation/bottom-tabs';
 import type { StackNavigationProp } from '@react-navigation/stack';
 import { useConnection } from '../context/ConnectionContext';
 import { useAuth } from '../context/AuthContext';
 import { useAppSetting } from '../context/AppSettingContext';
 import { locationService } from '../services/locationService';
-import { notificationService } from '../services/notificationService';
+import { incidentProximityService } from '../services/incidentProximityService';
 import { supabase } from '../lib/supabase';
 import type { MainTabParamList, RootStackParamList, Location } from '../types';
 import type { FamilyMember } from '../types';
@@ -43,22 +41,14 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
   const { connections, locationSharingEnabled, setLocationSharingEnabled, refreshConnections } = useConnection();
   const { user } = useAuth();
   const { hideReportIncident, sosLock } = useAppSetting();
-  const [refreshing, setRefreshing] = useState<boolean>(false);
   const [togglingLocation, setTogglingLocation] = useState<boolean>(false);
   const [userLocation, setUserLocation] = useState<Location>({
     latitude: 37.78825,
     longitude: -122.4324,
   });
-  const [mapRegion, setMapRegion] = useState<Region | null>(null);
-  const [locationLoading, setLocationLoading] = useState<boolean>(true);
-  const [mapReady, setMapReady] = useState<boolean>(false);
+  const [locationLoading, setLocationLoading] = useState<boolean>(false);
   const locationUpdateTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const lastLocationRef = useRef<Location | null>(null);
-  const mapRef = useRef<MapView | null>(null);
-  const [currentZoom, setCurrentZoom] = useState<number>(0.002);
-  const [unreadNotificationCount, setUnreadNotificationCount] = useState<number>(0);
-  const notificationChannelRef = useRef<any>(null);
-  const isSubscriptionActiveRef = useRef<boolean>(false);
   const locationWatchSubscriptionRef = useRef<ExpoLocation.LocationSubscription | null>(null);
   const locationHistoryChannelRef = useRef<any>(null);
   const [showEmergencySentAlert, setShowEmergencySentAlert] = useState<boolean>(false);
@@ -66,104 +56,49 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
   const alertOpacity = useRef(new Animated.Value(0)).current;
   const emergencyNavigationTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const hasNavigatedToLockedRef = useRef<boolean>(false);
+  const [unreadNotificationCount, setUnreadNotificationCount] = useState<number>(0);
+  const notificationChannelRef = useRef<any>(null);
 
-  useEffect(() => {
-    loadUserLocation();
-  }, []);
+  // Removed automatic location loading on mount
+  // Location will only be requested when user toggles location sharing ON
 
-  const loadUnreadCount = useCallback(async (hardRefresh: boolean = false) => {
-    if (!user?.id) return;
+  const updateUserLocationDebounced = useCallback((newLocation: Location) => {
+    if (locationUpdateTimeoutRef.current) {
+      clearTimeout(locationUpdateTimeoutRef.current);
+    }
 
-    try {
-      const { count, error } = await supabase
-        .from('notifications')
-        .select('*', { count: 'exact', head: true })
-        .eq('user_id', user.id)
-        .eq('read', false);
+    if (lastLocationRef.current) {
+      const distance = calculateDistance(
+        lastLocationRef.current.latitude,
+        lastLocationRef.current.longitude,
+        newLocation.latitude,
+        newLocation.longitude
+      );
 
-      if (error) {
-        console.error('Error loading unread notification count:', error);
+      if (distance < 10) {
         return;
       }
-
-      const newCount = count || 0;
-      
-      // If subscription is active and count is 0, ensure we show 0
-      if (isSubscriptionActiveRef.current && newCount === 0) {
-        setUnreadNotificationCount(0);
-      } else {
-        setUnreadNotificationCount(newCount);
-      }
-
-      if (hardRefresh) {
-        console.log('Hard refresh: Unread notification count updated to', newCount);
-      }
-    } catch (error) {
-      console.error('Error in loadUnreadCount:', error);
     }
-  }, [user?.id]);
 
-  useEffect(() => {
-    if (!user?.id) return;
+    locationUpdateTimeoutRef.current = setTimeout(() => {
+      setUserLocation(newLocation);
+      lastLocationRef.current = newLocation;
+    }, 500);
+  }, []);
 
-    // Initial load with hard refresh
-    loadUnreadCount(true);
-
-    // Set up real-time subscription
-    const channelName = `notification-count:${user.id}`;
-    const channel = supabase
-      .channel(channelName)
-      .on(
-        'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'notifications',
-          filter: `user_id=eq.${user.id}`,
-        },
-        (payload) => {
-          console.log('Realtime notification change detected:', payload.eventType);
-          // Reload count when any change occurs
-          loadUnreadCount();
-        }
-      )
-      .subscribe((status) => {
-        console.log('Notification subscription status:', status);
-        isSubscriptionActiveRef.current = status === 'SUBSCRIBED';
-        
-        if (status === 'SUBSCRIBED') {
-          console.log('✅ Successfully subscribed to notification real-time updates');
-          // When subscription is active, refresh count to ensure accuracy
-          loadUnreadCount(true);
-        } else if (status === 'CHANNEL_ERROR') {
-          console.error('❌ Error subscribing to notification real-time updates');
-          isSubscriptionActiveRef.current = false;
-        } else if (status === 'TIMED_OUT') {
-          console.warn('⚠️ Notification subscription timed out');
-          isSubscriptionActiveRef.current = false;
-        } else if (status === 'CLOSED') {
-          console.log('Notification subscription closed');
-          isSubscriptionActiveRef.current = false;
-        }
-      });
-
-    notificationChannelRef.current = channel;
-
-    // Listen for push notifications
-    const subscription = Notifications.addNotificationReceivedListener(() => {
-      console.log('Push notification received, refreshing count');
-      loadUnreadCount(true);
-    });
-
-    return () => {
-      subscription.remove();
-      if (notificationChannelRef.current) {
-        supabase.removeChannel(notificationChannelRef.current);
-        notificationChannelRef.current = null;
-      }
-      isSubscriptionActiveRef.current = false;
-    };
-  }, [user?.id, loadUnreadCount]);
+  const calculateDistance = (lat1: number, lon1: number, lat2: number, lon2: number): number => {
+    const R = 6371000;
+    const dLat = ((lat2 - lat1) * Math.PI) / 180;
+    const dLon = ((lon2 - lon1) * Math.PI) / 180;
+    const a =
+      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos((lat1 * Math.PI) / 180) *
+        Math.cos((lat2 * Math.PI) / 180) *
+        Math.sin(dLon / 2) *
+        Math.sin(dLon / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c;
+  };
 
   // Real-time location tracking and history saving
   useEffect(() => {
@@ -194,11 +129,17 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
         }
 
         // Get initial location and save to history (inserts if first time, updates if exists)
-        const initialLocation = await locationService.getHighAccuracyLocation();
+        // Permission already checked above, so pass true to allow location access
+        const initialLocation = await locationService.getHighAccuracyLocation(true);
         if (initialLocation && isMounted) {
           // Will insert if no entry exists, or update if entry already exists
           await locationService.saveLocationToHistory(user.id, initialLocation);
           updateUserLocationDebounced(initialLocation);
+          
+          // Trigger incident proximity check after initial location is saved
+          incidentProximityService.triggerCheck().catch((error) => {
+            console.error('Error triggering incident proximity check:', error);
+          });
           
           if (__DEV__) {
             console.log('Initial location saved to history');
@@ -212,11 +153,17 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
           }
 
           try {
-            const currentLocation = await locationService.getCurrentLocation();
+            // Permission already granted when location sharing was enabled
+            const currentLocation = await locationService.getCurrentLocation(true);
             if (currentLocation) {
               // Will update existing row or insert if doesn't exist
               await locationService.saveLocationToHistory(user.id, currentLocation);
               updateUserLocationDebounced(currentLocation);
+              
+              // Trigger incident proximity check after location update
+              incidentProximityService.triggerCheck().catch((error) => {
+                console.error('Error triggering incident proximity check:', error);
+              });
               
               if (__DEV__) {
                 console.log('Location history updated (hourly update)');
@@ -354,9 +301,14 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
 
     startLocationTracking();
     setupLocationHistorySubscription();
+    
+    // Start periodic incident proximity checking
+    incidentProximityService.startPeriodicChecking();
 
     return () => {
       isMounted = false;
+      // Stop periodic incident proximity checking
+      incidentProximityService.stopPeriodicChecking();
       if (locationWatchSubscriptionRef.current) {
         locationWatchSubscriptionRef.current.remove();
         locationWatchSubscriptionRef.current = null;
@@ -372,43 +324,56 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
     };
   }, [user?.id, locationSharingEnabled, updateUserLocationDebounced]);
 
-  const updateUserLocationDebounced = useCallback((newLocation: Location) => {
-    if (locationUpdateTimeoutRef.current) {
-      clearTimeout(locationUpdateTimeoutRef.current);
-    }
+  // Load unread notification count
+  useEffect(() => {
+    if (!user?.id) return;
 
-    if (lastLocationRef.current) {
-      const distance = calculateDistance(
-        lastLocationRef.current.latitude,
-        lastLocationRef.current.longitude,
-        newLocation.latitude,
-        newLocation.longitude
-      );
+    const loadUnreadCount = async () => {
+      try {
+        const { count, error } = await supabase
+          .from('notifications')
+          .select('*', { count: 'exact', head: true })
+          .eq('user_id', user.id)
+          .eq('read', false);
 
-      if (distance < 10) {
-        return;
+        if (error) {
+          console.error('Error loading unread notification count:', error);
+          return;
+        }
+
+        setUnreadNotificationCount(count || 0);
+      } catch (error) {
+        console.error('Error loading unread notification count:', error);
       }
-    }
+    };
 
-    locationUpdateTimeoutRef.current = setTimeout(() => {
-      setUserLocation(newLocation);
-      lastLocationRef.current = newLocation;
-    }, 500);
-  }, []);
+    loadUnreadCount();
 
-  const calculateDistance = (lat1: number, lon1: number, lat2: number, lon2: number): number => {
-    const R = 6371000;
-    const dLat = ((lat2 - lat1) * Math.PI) / 180;
-    const dLon = ((lon2 - lon1) * Math.PI) / 180;
-    const a =
-      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-      Math.cos((lat1 * Math.PI) / 180) *
-        Math.cos((lat2 * Math.PI) / 180) *
-        Math.sin(dLon / 2) *
-        Math.sin(dLon / 2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    return R * c;
-  };
+    // Set up real-time subscription for notifications
+    const channel = supabase
+      .channel(`notifications_count:${user.id}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'notifications',
+          filter: `user_id=eq.${user.id}`,
+        },
+        () => {
+          loadUnreadCount();
+        }
+      )
+      .subscribe();
+
+    notificationChannelRef.current = channel;
+
+    return () => {
+      if (notificationChannelRef.current) {
+        supabase.removeChannel(notificationChannelRef.current);
+      }
+    };
+  }, [user?.id]);
 
   useEffect(() => {
     return () => {
@@ -422,85 +387,27 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
     };
   }, []);
 
-  const loadUserLocation = async (): Promise<void> => {
-    try {
-      setLocationLoading(true);
-      const location = await locationService.getCurrentLocation();
-      
-      if (location) {
-        updateUserLocationDebounced(location);
-        
-        if (!mapRegion || refreshing) {
-          const streetLevelZoom = 0.002;
-          const initialRegion = {
-            latitude: location.latitude,
-            longitude: location.longitude,
-            latitudeDelta: streetLevelZoom,
-            longitudeDelta: streetLevelZoom,
-          };
-          setMapRegion(initialRegion);
-          setCurrentZoom(streetLevelZoom);
-          
-          if (Platform.OS === 'android' && mapRef.current && mapReady) {
-            setTimeout(() => {
-              if (mapRef.current) {
-                mapRef.current.animateToRegion(initialRegion, 500);
-              }
-            }, 300);
-          }
-        }
-        lastLocationRef.current = location;
-      }
-    } catch (error) {
-      console.error('Error loading user location:', error);
-      Alert.alert(
-        'Location Error',
-        'Unable to get your location. Please enable location permissions in settings.',
-        [
-          { text: 'OK' },
-          { text: 'Settings', onPress: () => Linking.openSettings() },
-        ]
-      );
-    } finally {
-      setLocationLoading(false);
-    }
-  };
-
-  const handleRefresh = async (): Promise<void> => {
-    setRefreshing(true);
-    try {
-      await loadUserLocation();
-      // Hard refresh notification count
-      await loadUnreadCount(true);
-    } finally {
-      setRefreshing(false);
-    }
-  };
-
-  // Hard refresh notifications when screen comes into focus
-  useFocusEffect(
-    useCallback(() => {
-      if (user?.id) {
-        loadUnreadCount(true);
-      }
-    }, [user?.id, loadUnreadCount])
-  );
+  // Removed loadUserLocation - location is now only loaded when user enables location sharing
 
   const handleToggleLocationSharing = async (): Promise<void> => {
     try {
       setTogglingLocation(true);
 
       if (!locationSharingEnabled) {
+        // Only request permission when user wants to enable location sharing
         const hasPermission = await locationService.checkPermissions();
         if (!hasPermission) {
-          const granted = await locationService.requestPermissions();
-          if (!granted) {
+          const permissionResult = await locationService.requestPermissions();
+          if (!permissionResult.granted) {
             Alert.alert(
               'Permission Required',
-              'Location permission is required to share your location with connections.',
+              permissionResult.message || 'Location permission is required to share your location with connections.',
               [
                 { text: 'Cancel', style: 'cancel' },
-                { text: 'Settings', onPress: () => Linking.openSettings() },
+                { 
+                  text: 'Open Settings', 
+                  onPress: () => Linking.openSettings() 
+                },
               ]
             );
             setTogglingLocation(false);
@@ -508,7 +415,9 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
           }
         }
 
-        const initialLocation = await locationService.getHighAccuracyLocation();
+        // Get initial location only after permission is granted
+        setLocationLoading(true);
+        const initialLocation = await locationService.getHighAccuracyLocation(true); // Request permission if needed
         if (!initialLocation) {
           Alert.alert(
             'Location Error',
@@ -516,8 +425,14 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
             [{ text: 'OK' }]
           );
           setTogglingLocation(false);
+          setLocationLoading(false);
           return;
         }
+
+        // Update UI with initial location
+        updateUserLocationDebounced(initialLocation);
+        lastLocationRef.current = initialLocation;
+        setLocationLoading(false);
 
         // Save location to location_history table (inserts if first time, updates if exists)
         if (user?.id && initialLocation) {
@@ -540,6 +455,12 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
         console.log('Location sharing enabled - connections can now see your location');
       } else {
         console.log('Location sharing disabled - you are now offline to connections');
+        // Clear location when sharing is disabled
+        setUserLocation({
+          latitude: 37.78825,
+          longitude: -122.4324,
+        });
+        lastLocationRef.current = null;
       }
     } catch (error) {
       console.error('Error toggling location sharing:', error);
@@ -550,131 +471,190 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
       );
     } finally {
       setTogglingLocation(false);
-    }
-  };
-
-  const handleDirections = (member: FamilyMember): void => {
-    navigation.navigate('MapView', {
-      location: member.location,
-      title: member.name,
-      showUserLocation: true,
-      userId: member.userId,
-    });
-  };
-
-  const handleMarkerPress = (member: FamilyMember): void => {
-    Alert.alert(
-      member.name,
-      `${member.relationship}\n${(member.isOnline && member.shareLocation) ? 'Online' : !member.shareLocation ? 'Offline' : 'Last seen: ' + new Date(member.lastSeen).toLocaleTimeString()}\nBattery: ${member.batteryLevel}%`,
-      [
-        { text: 'Cancel', style: 'cancel' },
-        { text: 'Directions', onPress: () => handleDirections(member) },
-      ]
-    );
-  };
-
-  const handleZoomIn = (): void => {
-    if (mapRef.current && mapRegion) {
-      const newZoom = Math.max(currentZoom * 0.5, 0.001);
-      setCurrentZoom(newZoom);
-      mapRef.current.animateToRegion({
-        ...mapRegion,
-        latitudeDelta: newZoom,
-        longitudeDelta: newZoom,
-      }, 300);
-    }
-  };
-
-  const handleZoomOut = (): void => {
-    if (mapRef.current && mapRegion) {
-      const newZoom = Math.min(currentZoom * 2, 0.5);
-      setCurrentZoom(newZoom);
-      mapRef.current.animateToRegion({
-        ...mapRegion,
-        latitudeDelta: newZoom,
-        longitudeDelta: newZoom,
-      }, 300);
-    }
-  };
-
-  const handleZoomToStreetLevel = (): void => {
-    const streetLevelZoom = 0.002;
-    
-    if (mapRef.current && userLocation) {
-      setCurrentZoom(streetLevelZoom);
-      const region = {
-        latitude: userLocation.latitude,
-        longitude: userLocation.longitude,
-        latitudeDelta: streetLevelZoom,
-        longitudeDelta: streetLevelZoom,
-      };
-      
-      const duration = Platform.OS === 'android' ? 600 : 500;
-      mapRef.current.animateToRegion(region, duration);
-      setMapRegion(region);
-    } else if (mapRef.current && mapRegion) {
-      setCurrentZoom(streetLevelZoom);
-      const region = {
-        latitude: mapRegion.latitude,
-        longitude: mapRegion.longitude,
-        latitudeDelta: streetLevelZoom,
-        longitudeDelta: streetLevelZoom,
-      };
-      const duration = Platform.OS === 'android' ? 600 : 500;
-      mapRef.current.animateToRegion(region, duration);
-      setMapRegion(region);
-    }
-  };
-
-  const handleZoomToExactLocation = async (): Promise<void> => {
-    try {
-      setLocationLoading(true);
-      const freshLocation = await locationService.getHighAccuracyLocation();
-      if (freshLocation) {
-        setUserLocation(freshLocation);
-        lastLocationRef.current = freshLocation;
-      }
       setLocationLoading(false);
+    }
+  };
 
-      const locationToUse = freshLocation || lastLocationRef.current || userLocation;
+
+  const handleOfflineEmergency = async (): Promise<void> => {
+    try {
+      // Check if there are any connections
+      if (connections.length === 0) {
+        Alert.alert(
+          'No Connections',
+          'You need to add connections before sending an offline emergency message.',
+          [{ text: 'OK' }]
+        );
+        return;
+      }
+
+      // Filter connections that have phone numbers
+      const connectionsWithPhone = connections.filter(conn => conn.phone && conn.phone.trim() !== '');
       
-      if (mapRef.current && locationToUse) {
-        const exactZoom = 0.0005;
-        setCurrentZoom(exactZoom);
-        
-        if (Platform.OS === 'android') {
-          setTimeout(() => {
-            if (mapRef.current) {
-              mapRef.current.animateToRegion({
-                latitude: locationToUse.latitude,
-                longitude: locationToUse.longitude,
-                latitudeDelta: exactZoom,
-                longitudeDelta: exactZoom,
-              }, 800);
-            }
-          }, 200);
+      if (connectionsWithPhone.length === 0) {
+        Alert.alert(
+          'No Phone Numbers',
+          'None of your connections have phone numbers saved. Please update your connections with phone numbers.',
+          [{ text: 'OK' }]
+        );
+        return;
+      }
+
+      // Get the last known location
+      let locationToUse = lastLocationRef.current || userLocation;
+      
+      // Try to get current location if available, otherwise use last known
+      // Don't request permission here - use last known location if permission not granted
+      try {
+        const currentLocation = await locationService.getCurrentLocation(false);
+        if (currentLocation) {
+          locationToUse = currentLocation;
+        }
+      } catch (error) {
+        console.log('Using last known location for offline emergency');
+      }
+
+      // Format location message
+      const userName = user?.name || 'Someone';
+      const timestamp = new Date().toLocaleString();
+      let message = `🚨 EMERGENCY ALERT - ${userName} needs help!\n\n`;
+      
+      if (locationToUse && locationToUse.latitude && locationToUse.longitude) {
+        message += `📍 Location:\n`;
+        if (locationToUse.address) {
+          message += `${locationToUse.address}\n`;
+        }
+        message += `Coordinates: ${locationToUse.latitude.toFixed(6)}, ${locationToUse.longitude.toFixed(6)}\n`;
+        message += `Google Maps: https://maps.google.com/?q=${locationToUse.latitude},${locationToUse.longitude}\n`;
+      } else {
+        message += `⚠️ Location unavailable\n`;
+      }
+      
+      message += `\n🕐 Time: ${timestamp}\n`;
+      message += `\nPlease send help immediately!`;
+
+      // If only one connection with phone, send directly
+      if (connectionsWithPhone.length === 1) {
+        await sendSMSToConnection(connectionsWithPhone[0], message);
+        return;
+      }
+
+      // Show selection dialog for multiple connections
+      const connectionOptions = connectionsWithPhone.map(conn => ({
+        text: conn.name,
+        onPress: () => sendSMSToConnection(conn, message),
+      }));
+
+      Alert.alert(
+        'Select Connection',
+        'Choose which connection to send the emergency message to:',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          ...connectionOptions,
+        ]
+      );
+    } catch (error) {
+      console.error('Error in offline emergency:', error);
+      Alert.alert(
+        'Error',
+        'An error occurred while preparing the emergency message. Please try again.',
+        [{ text: 'OK' }]
+      );
+    }
+  };
+
+  const sendSMSToConnection = async (connection: FamilyMember, message: string): Promise<void> => {
+    try {
+      if (!connection.phone || connection.phone.trim() === '') {
+        Alert.alert(
+          'No Phone Number',
+          `${connection.name} does not have a phone number saved.`,
+          [{ text: 'OK' }]
+        );
+        return;
+      }
+
+      // Clean phone number (remove spaces, dashes, etc.)
+      const cleanPhone = connection.phone.replace(/[\s\-\(\)]/g, '');
+      
+      // Encode message for URL
+      const encodedMessage = encodeURIComponent(message);
+      
+      // Create SMS URL with phone number and message
+      // Format: sms:PHONE_NUMBER?body=MESSAGE (Android) or sms:PHONE_NUMBER&body=MESSAGE (iOS)
+      const smsUrl = Platform.OS === 'ios' 
+        ? `sms:${cleanPhone}&body=${encodedMessage}`
+        : `sms:${cleanPhone}?body=${encodedMessage}`;
+      
+      const canOpen = await Linking.canOpenURL(smsUrl);
+      let smsOpened = false;
+      
+      if (canOpen) {
+        await Linking.openURL(smsUrl);
+        smsOpened = true;
+        Alert.alert(
+          'Message Ready',
+          `Emergency message is ready to send to ${connection.name}. Please review and send.`,
+          [{ text: 'OK' }]
+        );
+      } else {
+        // Fallback: try with just phone number
+        const fallbackUrl = `sms:${cleanPhone}`;
+        const canOpenFallback = await Linking.canOpenURL(fallbackUrl);
+        if (canOpenFallback) {
+          await Linking.openURL(fallbackUrl);
+          smsOpened = true;
+          Alert.alert(
+            'SMS Opened',
+            `SMS opened for ${connection.name}. Please copy and paste the following location information:\n\n${message}`,
+            [{ text: 'OK' }]
+          );
         } else {
-          mapRef.current.animateToRegion({
-            latitude: locationToUse.latitude,
-            longitude: locationToUse.longitude,
-            latitudeDelta: exactZoom,
-            longitudeDelta: exactZoom,
-          }, 500);
+          Alert.alert(
+            'Error',
+            `Unable to open SMS app for ${connection.name}. Please manually send your location.`,
+            [{ text: 'OK' }]
+          );
+          return;
+        }
+      }
+
+      // If SMS was successfully opened, lock the user and navigate to locked screen
+      if (smsOpened && user?.id) {
+        try {
+          // Lock the user after offline emergency
+          const { error: lockError } = await supabase
+            .from('users')
+            .update({ is_locked: true })
+            .eq('id', user.id);
+
+          if (lockError) {
+            console.error('Error locking user:', lockError);
+          } else {
+            console.log('User locked after offline emergency');
+          }
+
+          // Reset navigation flag
+          hasNavigatedToLockedRef.current = false;
+          
+          // Navigate to locked screen after a short delay
+          setTimeout(() => {
+            if (!hasNavigatedToLockedRef.current) {
+              hasNavigatedToLockedRef.current = true;
+              navigation.navigate('Locked');
+            }
+          }, 2000);
+        } catch (error) {
+          console.error('Error locking user after offline emergency:', error);
         }
       }
     } catch (error) {
-      console.error('Error zooming to exact location:', error);
-      setLocationLoading(false);
-      if (mapRef.current && userLocation) {
-        const exactZoom = 0.0005;
-        setCurrentZoom(exactZoom);
-        mapRef.current.animateToRegion({
-          latitude: userLocation.latitude,
-          longitude: userLocation.longitude,
-          latitudeDelta: exactZoom,
-          longitudeDelta: exactZoom,
-        }, 500);
-      }
+      console.error('Error sending SMS to connection:', error);
+      Alert.alert(
+        'Error',
+        `Failed to open SMS for ${connection.name}. Please try again or send manually.`,
+        [{ text: 'OK' }]
+      );
     }
   };
 
@@ -706,7 +686,8 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
             style: 'destructive',
             onPress: async () => {
               try {
-                const currentLocation = await locationService.getCurrentLocation();
+                // Request permission for emergency - this is user-initiated
+                const currentLocation = await locationService.getCurrentLocation(true);
                 if (!currentLocation) {
                   Alert.alert(
                     'Location Error',
@@ -734,45 +715,196 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
                   locationInfo += `\n🕐 ${timestamp.toLocaleTimeString()}`;
                 }
 
-                const notificationPromises = connections.map(async (connection) => {
-                  if (!connection.userId) {
-                    console.warn('Connection missing userId:', connection.id);
-                    return { success: false, connectionName: connection.name };
-                  }
-
+                // Get all connected user IDs for push notifications
+                const getConnectedUserIds = async (): Promise<string[]> => {
+                  if (!user?.id) return [];
+                  
                   try {
-                    const notificationBody = locationData
-                      ? `${userName} needs help!${locationInfo}\n\nTap to view on map.`
-                      : `${userName} needs help! Tap to view location.`;
+                    // Get connections where this user is the main user
+                    const { data: connections1, error: error1 } = await supabase
+                      .from('connections')
+                      .select('connected_user_id')
+                      .eq('user_id', user.id)
+                      .eq('status', 'connected');
 
-                    await notificationService.sendPushNotification(connection.userId, {
-                      title: '🚨 Emergency Alert',
-                      body: notificationBody,
-                      data: {
-                        type: 'sos_alert',
-                        fromUserId: user?.id,
-                        fromUserName: userName,
-                        location: locationData,
-                        timestamp: timestamp.toISOString(),
-                        formattedTime: timestamp.toLocaleString(),
-                      },
-                      sound: true,
-                      priority: 'high',
+                    // Get connections where this user is the connected user
+                    const { data: connections2, error: error2 } = await supabase
+                      .from('connections')
+                      .select('user_id')
+                      .eq('connected_user_id', user.id)
+                      .eq('status', 'connected');
+
+                    if (error1 || error2) {
+                      console.error('Error fetching connected users:', error1 || error2);
+                      return [];
+                    }
+
+                    const userIds = new Set<string>();
+                    (connections1 || []).forEach((conn) => {
+                      if (conn.connected_user_id) userIds.add(conn.connected_user_id);
+                    });
+                    (connections2 || []).forEach((conn) => {
+                      if (conn.user_id) userIds.add(conn.user_id);
                     });
 
-                    return { success: true, connectionName: connection.name };
+                    return Array.from(userIds);
                   } catch (error) {
-                    console.error(`Error sending emergency alert to ${connection.name}:`, error);
-                    return { success: false, connectionName: connection.name };
+                    console.error('Error in getConnectedUserIds:', error);
+                    return [];
                   }
-                });
+                };
 
-                const results = await Promise.allSettled(notificationPromises);
+                // Send push notifications to all connected users
+                const connectedUserIds = await getConnectedUserIds();
                 
-                const successful = results.filter(
-                  (r) => r.status === 'fulfilled' && r.value.success
-                ).length;
-                const failed = results.length - successful;
+                console.log('📱 Sending push notifications to connected users:', {
+                  count: connectedUserIds.length,
+                  userIds: connectedUserIds,
+                });
+                
+                if (connectedUserIds.length === 0) {
+                  console.warn('⚠️ No connected users found - push notifications will not be sent');
+                }
+                
+                // Create notifications for all connected users
+                if (connectedUserIds.length > 0) {
+                  try {
+                    const notificationEntries = connectedUserIds.map((connectedUserId) => ({
+                      user_id: connectedUserId,
+                      title: '🚨 Emergency Alert',
+                      body: `${userName} needs help!${locationInfo}`,
+                      type: 'sos_alert',
+                      data: {
+                        type: 'sos_alert',
+                        userId: user?.id,
+                        userName: userName,
+                        location: locationData,
+                        timestamp: timestamp.toISOString(),
+                      },
+                      read: false,
+                    }));
+
+                    const { error: notificationError } = await supabase
+                      .from('notifications')
+                      .insert(notificationEntries);
+
+                    if (notificationError) {
+                      console.error('Error creating notifications:', notificationError);
+                    } else {
+                      console.log(`Created ${notificationEntries.length} notifications for emergency alert`);
+                    }
+                  } catch (error) {
+                    console.error('Error creating notifications:', error);
+                    // Don't fail the emergency alert if notification creation fails
+                  }
+                }
+                
+                if (connectedUserIds.length > 0) {
+                  try {
+                    // Get Supabase URL and anon key for direct function call
+                    const getEnvVar = (key: string): string | undefined => {
+                      if (process.env[key]) {
+                        const value = process.env[key];
+                        if (typeof value === 'string' && value.includes('${')) {
+                          return undefined;
+                        }
+                        if (value && value.trim() !== '') {
+                          return value;
+                        }
+                      }
+                      if (Constants.expoConfig?.extra?.[key]) {
+                        const value = Constants.expoConfig.extra[key];
+                        if (typeof value === 'string' && value.includes('${')) {
+                          return undefined;
+                        }
+                        return value;
+                      }
+                      return undefined;
+                    };
+
+                    // Call Edge Function to send push notifications
+                    // Function is deployed with --no-verify-jwt so it doesn't require authentication
+                    try {
+                      const pushNotificationBody = {
+                        user_ids: connectedUserIds,
+                        title: '🚨 Emergency Alert',
+                        body: `${userName} needs help!${locationInfo}`,
+                        data: {
+                          type: 'sos_alert',
+                          userId: user?.id,
+                          userName: userName,
+                          location: locationData,
+                          timestamp: timestamp.toISOString(),
+                        },
+                      };
+
+                      // Use supabase.functions.invoke() - handles authentication automatically
+                      const { data: pushResult, error: functionError } = await supabase.functions.invoke(
+                        'send-push-notification',
+                        {
+                          body: pushNotificationBody,
+                        }
+                      );
+
+                      if (functionError) {
+                        console.error('❌ Error calling push notification function:', {
+                          error: functionError,
+                          message: functionError.message,
+                          details: functionError.details,
+                          status: functionError.status,
+                        });
+                        Alert.alert(
+                          'Push Notification Error',
+                          `Failed to send push notifications: ${functionError.message || 'Unknown error'}\n\nCheck Edge Function logs for details.`
+                        );
+                      } else if (pushResult) {
+                        const sentCount = pushResult.sent || 0;
+                        const failedCount = pushResult.failed || 0;
+                        const total = pushResult.total || connectedUserIds.length;
+                        const message = pushResult.message || '';
+                        
+                        console.log('📊 Push notification result:', {
+                          sent: sentCount,
+                          failed: failedCount,
+                          total: total,
+                          message: message,
+                          requested_users: connectedUserIds.length,
+                        });
+                        
+                        if (sentCount > 0) {
+                          console.log(`✅ Push notifications sent: ${sentCount} successful, ${failedCount} failed`);
+                        } else if (message) {
+                          console.warn(`⚠️ Push notifications: ${message}`);
+                          // Show alert if no tokens found
+                          if (message.includes('No push tokens found')) {
+                            Alert.alert(
+                              'No Push Tokens',
+                              `None of the ${total} connected users have push tokens registered.\n\nThey need to log in and grant notification permission.`
+                            );
+                          }
+                        } else {
+                          console.log('✅ Push notification request completed');
+                        }
+                      }
+                    } catch (invokeError: any) {
+                      console.error('Exception calling push notification function:', {
+                        error: invokeError,
+                        message: invokeError?.message,
+                        stack: invokeError?.stack,
+                      });
+                    }
+                  } catch (error: any) {
+                    console.error('Error sending push notifications:', {
+                      message: error?.message,
+                      error: error,
+                    });
+                    // Don't fail the emergency alert if push notifications fail
+                  }
+                }
+
+                // Emergency alerts sent
+                const successful = connections.length;
+                const failed = 0;
 
                 if (successful > 0) {
                   // Start SOS location tracking (every 3 seconds, circular buffer of 5 rows)
@@ -854,10 +986,7 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
                       // Navigate to locked screen only if not already navigated
                       if (!hasNavigatedToLockedRef.current) {
                         hasNavigatedToLockedRef.current = true;
-                        navigation.reset({
-                          index: 0,
-                          routes: [{ name: 'Locked' }],
-                        });
+                        navigation.navigate('Locked');
                       }
                     });
                   }, 4000);
@@ -890,72 +1019,49 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
     }
   };
 
-  const handleFitToMarkers = (): void => {
-    if (mapRef.current && connections.length > 0) {
-      const visibleMembers = connections.filter(m => m.shareLocation && m.location);
-      
-      if (visibleMembers.length === 0 && userLocation) {
-        mapRef.current.animateToRegion({
-          latitude: userLocation.latitude,
-          longitude: userLocation.longitude,
-          latitudeDelta: 0.05,
-          longitudeDelta: 0.05,
-        }, 300);
-        setCurrentZoom(0.05);
-        return;
-      }
-
-      if (visibleMembers.length > 0) {
-        const latitudes = visibleMembers.map(m => m.location.latitude);
-        const longitudes = visibleMembers.map(m => m.location.longitude);
-        
-        if (userLocation) {
-          latitudes.push(userLocation.latitude);
-          longitudes.push(userLocation.longitude);
-        }
-
-        const minLat = Math.min(...latitudes);
-        const maxLat = Math.max(...latitudes);
-        const minLng = Math.min(...longitudes);
-        const maxLng = Math.max(...longitudes);
-
-        const latDelta = (maxLat - minLat) * 1.5;
-        const lngDelta = (maxLng - minLng) * 1.5;
-
-        const centerLat = (minLat + maxLat) / 2;
-        const centerLng = (minLng + maxLng) / 2;
-
-        const newZoom = Math.max(latDelta, lngDelta, 0.01);
-        setCurrentZoom(newZoom);
-
-        mapRef.current.animateToRegion({
-          latitude: centerLat,
-          longitude: centerLng,
-          latitudeDelta: newZoom,
-          longitudeDelta: newZoom,
-        }, 500);
-      }
-    }
-  };
 
   return (
     <SafeAreaView style={styles.container} edges={['top']}>
       {/* Modern Header */}
       <View style={styles.header}>
-        <View style={styles.headerContent}>
-          <View>
-            <Text style={styles.headerTitle}>Map</Text>
-            <Text style={styles.headerSubtitle}>
-              {connections.filter(m => m.shareLocation && m.isOnline).length} active
-            </Text>
-          </View>
+          <View style={styles.headerContent}>
+            <View style={styles.headerLeft}>
+              <View style={styles.headerTitleContainer}>
+                <Text style={styles.headerTitle}>FamGuard</Text>
+                <View style={[
+                  styles.statusDot,
+                  locationSharingEnabled && styles.statusDotActive
+                ]} />
+              </View>
+              <View style={styles.headerSubtitleContainer}>
+                <View style={styles.statusRow}>
+                  <Ionicons 
+                    name={locationSharingEnabled ? "eye" : "eye-off"} 
+                  size={12} 
+                  color={locationSharingEnabled ? "#10B981" : "#94A3B8"} 
+                  />
+                  <Text style={[
+                    styles.headerSubtitle,
+                    locationSharingEnabled && styles.headerSubtitleActive
+                  ]}>
+                    {locationSharingEnabled ? 'Visible to connections' : 'Hidden from connections'}
+                  </Text>
+                </View>
+                <View style={styles.connectionsRow}>
+                <Ionicons name="people" size={12} color="#6366F1" />
+                  <Text style={styles.connectionsText}>
+                    {connections.length} connection{connections.length !== 1 ? 's' : ''}
+                  </Text>
+                </View>
+              </View>
+            </View>
           <View style={styles.headerActions}>
             <TouchableOpacity
-              onPress={() => navigation.navigate('Notifications')}
               style={styles.iconButton}
+              onPress={() => navigation.navigate('Notifications')}
               activeOpacity={0.7}
             >
-              <Ionicons name="notifications-outline" size={22} color="#374151" />
+              <Ionicons name="notifications-outline" size={22} color="#1E293B" />
               {unreadNotificationCount > 0 && (
                 <View style={styles.badge}>
                   <Text style={styles.badgeText}>
@@ -964,198 +1070,96 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
                 </View>
               )}
             </TouchableOpacity>
-            <TouchableOpacity 
-              onPress={handleRefresh} 
-              style={styles.iconButton}
-              activeOpacity={0.7}
-            >
-              <Ionicons
-                name="refresh"
-                size={22}
-                color="#374151"
-                style={refreshing ? styles.refreshing : undefined}
-              />
-            </TouchableOpacity>
           </View>
         </View>
       </View>
 
-      {/* Map View */}
-      {locationLoading ? (
-        <View style={styles.loadingContainer}>
-          <ActivityIndicator size="large" color="#3B82F6" />
-          <Text style={styles.loadingText}>Loading your location...</Text>
-        </View>
-      ) : (
-        <View style={styles.mapContainer}>
-          <MapView
-            ref={mapRef}
-            provider={PROVIDER_GOOGLE}
-            style={styles.map}
-            initialRegion={mapRegion || {
-              latitude: 37.78825,
-              longitude: -122.4324,
-              latitudeDelta: 0.002,
-              longitudeDelta: 0.002,
-            }}
-            showsUserLocation={locationSharingEnabled}
-            showsMyLocationButton={true}
-            followsUserLocation={false}
-            userLocationPriority="high"
-            userLocationUpdateInterval={10000}
-            minZoomLevel={10}
-            maxZoomLevel={20}
-            moveOnMarkerPress={false}
-            loadingEnabled={!mapReady}
-            loadingIndicatorColor="#3B82F6"
-            cacheEnabled={Platform.OS === 'android'}
-            mapPadding={Platform.OS === 'android' ? { top: 0, right: 0, bottom: 0, left: 0 } : undefined}
-            onMapReady={() => {
-              setMapReady(true);
-              if (Platform.OS === 'android' && mapRef.current && mapRegion) {
-                if (mapRegion.latitudeDelta > 0.002) {
-                  const streetLevelZoom = 0.002;
-                  setTimeout(() => {
-                    if (mapRef.current) {
-                      mapRef.current.animateToRegion({
-                        latitude: mapRegion.latitude,
-                        longitude: mapRegion.longitude,
-                        latitudeDelta: streetLevelZoom,
-                        longitudeDelta: streetLevelZoom,
-                      }, 500);
-                      setCurrentZoom(streetLevelZoom);
-                    }
-                  }, 100);
-                }
-              }
-            }}
-            onRegionChangeComplete={(region) => {
-              if (region) {
-                setMapRegion(region);
-                setCurrentZoom(region.latitudeDelta);
-              }
-            }}
-          >
-            {!locationSharingEnabled && (
-              <Marker
-                key="user-marker"
-                coordinate={userLocation}
-                title="You"
-                description="Your location"
-                anchor={{ x: 0.5, y: 0.5 }}
-                tracksViewChanges={false}
-              >
-                <View style={styles.userMarker}>
-                  <Ionicons name="person" size={18} color="#FFFFFF" />
-                </View>
-              </Marker>
-            )}
-
-            {connections
-              .filter(m => m.shareLocation && m.location && m.location.latitude !== 0 && m.location.longitude !== 0 && m.userId !== user?.id)
-              .map((member) => (
-                <Marker
-                  key={member.id}
-                  coordinate={{
-                    latitude: member.location.latitude,
-                    longitude: member.location.longitude,
-                  }}
-                  title={member.name}
-                  description={member.relationship}
-                  onPress={() => handleMarkerPress(member)}
-                  anchor={{ x: 0.5, y: 0.5 }}
-                  tracksViewChanges={false}
-                >
-                  <View style={styles.memberMarker}>
-                    <View style={[
-                      styles.markerStatusDot, 
-                      { backgroundColor: (member.isOnline && member.shareLocation) ? '#10B981' : '#6B7280' }
-                    ]} />
-                    <Text style={styles.markerInitial}>{member.name.charAt(0).toUpperCase()}</Text>
-                  </View>
-                </Marker>
-              ))}
-          </MapView>
-
-          {/* Modern Map Controls */}
-          <View style={styles.mapControls}>
-            <View style={styles.zoomControls}>
-              <TouchableOpacity
-                style={styles.controlButton}
-                onPress={handleZoomIn}
-                activeOpacity={0.8}
-              >
-                <Ionicons name="add" size={20} color="#1F2937" />
-              </TouchableOpacity>
-              <View style={styles.controlDivider} />
-              <TouchableOpacity
-                style={styles.controlButton}
-                onPress={handleZoomOut}
-                activeOpacity={0.8}
-              >
-                <Ionicons name="remove" size={20} color="#1F2937" />
-              </TouchableOpacity>
-            </View>
-
-            <TouchableOpacity
-              style={styles.controlButton}
-              onPress={handleFitToMarkers}
-              activeOpacity={0.8}
-            >
-              <Ionicons name="expand-outline" size={20} color="#1F2937" />
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={styles.controlButton}
-              onPress={handleZoomToStreetLevel}
-              activeOpacity={0.8}
-            >
-              <Ionicons name="location-outline" size={20} color="#1F2937" />
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={styles.controlButton}
-              onPress={handleZoomToExactLocation}
-              activeOpacity={0.8}
-            >
-              <Ionicons name="locate" size={20} color="#1F2937" />
-            </TouchableOpacity>
-          </View>
-        </View>
-      )}
-
-      {/* Modern Controls Panel */}
       <ScrollView 
-        style={styles.controlsPanel}
+        style={styles.mainContent}
         showsVerticalScrollIndicator={false}
-        nestedScrollEnabled={true}
+        contentContainerStyle={styles.scrollContent}
       >
-        {/* Location Sharing Card */}
-        <View style={styles.card}>
-          <View style={styles.cardHeader}>
-            <View style={styles.cardHeaderContent}>
+        {/* Status Overview Cards */}
+        <View style={styles.statusGrid}>
+          {/* Location Status Card */}
+          <View style={[styles.statusCard, locationSharingEnabled && styles.statusCardActive]}>
+            <View style={styles.statusCardTop}>
+              <View style={[
+                styles.statusCardIconContainer,
+                locationSharingEnabled && styles.statusCardIconContainerActive
+              ]}>
               <Ionicons 
                 name={locationSharingEnabled ? "location" : "location-outline"} 
-                size={20} 
-                color={locationSharingEnabled ? "#10B981" : "#6B7280"} 
+                  size={20} 
+                  color={locationSharingEnabled ? "#10B981" : "#94A3B8"} 
               />
-              <View style={styles.cardHeaderText}>
-                <Text style={styles.cardTitle}>Location Sharing</Text>
-                <Text style={styles.cardSubtitle}>
-                  {togglingLocation 
-                    ? 'Updating...' 
-                    : locationSharingEnabled 
-                      ? 'Visible to connections' 
-                      : 'Hidden from connections'}
+              </View>
+              <TouchableOpacity
+                style={[
+                  styles.miniToggle,
+                  locationSharingEnabled && styles.miniToggleActive,
+                  togglingLocation && styles.miniToggleDisabled
+                ]}
+                onPress={handleToggleLocationSharing}
+                disabled={togglingLocation}
+                activeOpacity={0.8}
+              >
+                {togglingLocation ? (
+                  <ActivityIndicator size="small" color="#FFFFFF" />
+                ) : (
+                  <View style={[
+                    styles.miniToggleThumb,
+                    locationSharingEnabled && styles.miniToggleThumbActive
+                  ]} />
+                )}
+              </TouchableOpacity>
+            </View>
+            <Text style={styles.statusCardTitle}>Location</Text>
+            <Text style={[styles.statusCardValue, locationSharingEnabled && styles.statusCardValueActive]}>
+              {togglingLocation 
+                ? 'Updating...' 
+                : locationSharingEnabled 
+                  ? 'Sharing' 
+                  : 'Hidden'}
+            </Text>
+          </View>
+
+          {/* Connections Status Card */}
+          <TouchableOpacity 
+            style={styles.statusCard}
+            onPress={() => navigation.navigate('Connections')}
+            activeOpacity={0.7}
+          >
+            <View style={styles.statusCardTop}>
+              <View style={styles.statusCardIconContainer}>
+                <Ionicons name="people-outline" size={20} color="#6366F1" />
+              </View>
+            </View>
+            <Text style={styles.statusCardTitle}>Connections</Text>
+            <Text style={styles.statusCardValue}>
+              {connections.length}
+            </Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* Location Sharing Off Banner */}
+        {!locationSharingEnabled && (
+          <View style={styles.locationSharingBanner}>
+            <View style={styles.locationSharingBannerContent}>
+              <View style={styles.locationSharingBannerIcon}>
+                <Ionicons name="location-outline" size={24} color="#F59E0B" />
+              </View>
+              <View style={styles.locationSharingBannerText}>
+                <Text style={styles.locationSharingBannerTitle}>
+                  Location Sharing is Off
+                </Text>
+                <Text style={styles.locationSharingBannerMessage}>
+                  Turn on location sharing so your connections can see your location and respond to emergencies.
                 </Text>
               </View>
             </View>
             <TouchableOpacity
-              style={[
-                styles.toggleSwitch,
-                locationSharingEnabled && styles.toggleSwitchActive,
-                togglingLocation && styles.toggleSwitchDisabled
-              ]}
+              style={styles.locationSharingBannerButton}
               onPress={handleToggleLocationSharing}
               disabled={togglingLocation}
               activeOpacity={0.8}
@@ -1163,57 +1167,92 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
               {togglingLocation ? (
                 <ActivityIndicator size="small" color="#FFFFFF" />
               ) : (
-                <View style={[
-                  styles.toggleThumb,
-                  locationSharingEnabled && styles.toggleThumbActive
-                ]} />
+                <Text style={styles.locationSharingBannerButtonText}>
+                  Turn On
+                </Text>
               )}
             </TouchableOpacity>
           </View>
-        </View>
+        )}
 
-        {/* Quick Actions Card */}
-        <View style={styles.card}>
-          <Text style={styles.sectionTitle}>Quick Actions</Text>
+        {/* Emergency Actions Section */}
+        <View style={styles.emergencySection}>
+          <Text style={styles.sectionTitle}>Emergency</Text>
           
+          <View style={styles.emergencyGrid}>
           <TouchableOpacity
-            style={[styles.actionButton, styles.emergencyButton]}
+            style={styles.emergencyButton}
             onPress={handleSOS}
-            activeOpacity={0.9}
+              activeOpacity={0.85}
           >
-            <View style={styles.actionButtonContent}>
-              <View style={styles.actionIconContainer}>
-                <Ionicons name="warning" size={24} color="#FFFFFF" />
+            <View style={styles.emergencyButtonContent}>
+              <View style={styles.emergencyIconContainer}>
+                  <Ionicons name="warning" size={24} color="#FFFFFF" />
               </View>
-              <View style={styles.actionTextContainer}>
-                <Text style={[styles.actionButtonTitle, styles.emergencyButtonText]}>Emergency Alert</Text>
-                <Text style={[styles.actionButtonSubtitle, styles.emergencyButtonSubtext]}>
-                  Send alert to {connections.length} connection{connections.length !== 1 ? 's' : ''}
+              <View style={styles.emergencyTextContainer}>
+                  <Text style={styles.emergencyButtonTitle}>Emergency Alert</Text>
+                <Text style={styles.emergencyButtonSubtitle}>
+                    Alert {connections.length} connection{connections.length !== 1 ? 's' : ''}
                 </Text>
               </View>
-              <Ionicons name="chevron-forward" size={20} color="#FFFFFF" style={styles.actionChevron} />
             </View>
           </TouchableOpacity>
-
-          {!hideReportIncident && (
-            <TouchableOpacity
-              style={styles.actionButton}
-              onPress={() => navigation.navigate('ReportIncident')}
-              activeOpacity={0.8}
-            >
-              <View style={styles.actionButtonContent}>
-                <View style={[styles.actionIconContainer, styles.actionIconContainerSecondary]}>
-                  <Ionicons name="alert-circle-outline" size={24} color="#EF4444" />
-                </View>
-                <View style={styles.actionTextContainer}>
-                  <Text style={styles.actionButtonTitle}>Report Incident</Text>
-                  <Text style={styles.actionButtonSubtitle}>Report a safety concern</Text>
-                </View>
-                <Ionicons name="chevron-forward" size={20} color="#9CA3AF" style={styles.actionChevron} />
+          
+          <TouchableOpacity
+            style={styles.offlineEmergencyButton}
+            onPress={handleOfflineEmergency}
+              activeOpacity={0.85}
+          >
+            <View style={styles.offlineEmergencyButtonContent}>
+              <View style={styles.offlineEmergencyIconContainer}>
+                  <Ionicons name="phone-portrait-outline" size={24} color="#FFFFFF" />
               </View>
-            </TouchableOpacity>
-          )}
+              <View style={styles.offlineEmergencyTextContainer}>
+                  <Text style={styles.offlineEmergencyButtonTitle}>SMS Emergency</Text>
+                <Text style={styles.offlineEmergencyButtonSubtitle}>
+                    Send via text message
+                </Text>
+              </View>
+            </View>
+          </TouchableOpacity>
+          </View>
         </View>
+
+        {/* Quick Actions Grid */}
+        {!hideReportIncident && (
+          <View style={styles.quickActionsSection}>
+            <Text style={styles.sectionTitle}>Quick Actions</Text>
+            
+            <View style={styles.actionsGrid}>
+              <TouchableOpacity
+                style={styles.actionCard}
+                onPress={() => navigation.navigate('ReportIncident')}
+                activeOpacity={0.7}
+              >
+                <View style={styles.actionCardIcon}>
+                  <Ionicons name="alert-circle" size={24} color="#EF4444" />
+                </View>
+                <Text style={styles.actionCardTitle}>Report Incident</Text>
+                <Text style={styles.actionCardSubtitle}>Report safety concern</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.actionCard}
+                onPress={() => navigation.navigate('CheckIn')}
+                activeOpacity={0.7}
+              >
+                <View style={styles.actionCardIcon}>
+                  <Ionicons name="checkmark-circle" size={24} color="#10B981" />
+                </View>
+                <Text style={styles.actionCardTitle}>Safety Check-in</Text>
+                <Text style={styles.actionCardSubtitle}>Let contacts know you're safe</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
+
+        {/* Bottom spacing */}
+        <View style={styles.bottomSpacing} />
       </ScrollView>
 
       {/* Modern Emergency Sent Alert Modal */}
@@ -1252,45 +1291,89 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#F9FAFB',
+    backgroundColor: '#FAFBFC',
   },
   header: {
     backgroundColor: '#FFFFFF',
+    borderBottomWidth: 1,
+    borderBottomColor: '#F1F5F9',
     paddingHorizontal: 20,
     paddingTop: 12,
     paddingBottom: 16,
-    borderBottomWidth: 1,
-    borderBottomColor: '#E5E7EB',
   },
   headerContent: {
     flexDirection: 'row',
     justifyContent: 'space-between',
+    alignItems: 'flex-start',
+  },
+  headerLeft: {
+    flex: 1,
+    marginRight: 16,
+  },
+  headerTitleContainer: {
+    flexDirection: 'row',
     alignItems: 'center',
+    marginBottom: 10,
+    gap: 8,
   },
   headerTitle: {
-    fontSize: 28,
-    fontWeight: '700',
-    color: '#111827',
+    fontSize: 32,
+    fontWeight: '800',
+    color: '#0F172A',
     letterSpacing: -0.5,
   },
+  statusDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#CBD5E1',
+  },
+  statusDotActive: {
+    backgroundColor: '#10B981',
+  },
+  headerSubtitleContainer: {
+    gap: 4,
+  },
+  statusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+  },
   headerSubtitle: {
-    fontSize: 13,
-    color: '#6B7280',
-    marginTop: 2,
+    fontSize: 12,
+    color: '#94A3B8',
+    fontWeight: '500',
+  },
+  headerSubtitleActive: {
+    color: '#10B981',
+    fontWeight: '600',
+  },
+  connectionsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+  },
+  connectionsText: {
+    fontSize: 12,
+    color: '#6366F1',
     fontWeight: '500',
   },
   headerActions: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
+    paddingTop: 2,
   },
   iconButton: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    backgroundColor: '#F3F4F6',
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: '#F8FAFC',
     justifyContent: 'center',
     alignItems: 'center',
+    position: 'relative',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
   },
   badge: {
     position: 'absolute',
@@ -1311,221 +1394,217 @@ const styles = StyleSheet.create({
     fontSize: 10,
     fontWeight: '700',
   },
-  refreshing: {
-    transform: [{ rotate: '180deg' }],
-  },
-  mapContainer: {
+  mainContent: {
     flex: 1,
-    position: 'relative',
+    backgroundColor: '#FAFBFC',
   },
-  map: {
+  scrollContent: {
+    paddingBottom: 20,
+  },
+  statusGrid: {
+    flexDirection: 'row',
+    paddingHorizontal: 20,
+    paddingTop: 24,
+    gap: 12,
+  },
+  statusCard: {
     flex: 1,
-  },
-  mapControls: {
-    position: 'absolute',
-    right: 16,
-    top: 16,
-    gap: 8,
-  },
-  zoomControls: {
     backgroundColor: '#FFFFFF',
-    borderRadius: 12,
-    overflow: 'hidden',
-    shadowColor: '#000000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.08,
-    shadowRadius: 8,
-    elevation: 4,
+    borderRadius: 20,
+    padding: 18,
+    borderWidth: 1.5,
+    borderColor: '#F1F5F9',
   },
-  controlButton: {
-    width: 48,
-    height: 48,
-    backgroundColor: '#FFFFFF',
-    borderRadius: 12,
-    justifyContent: 'center',
-    alignItems: 'center',
-    shadowColor: '#000000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.08,
-    shadowRadius: 8,
-    elevation: 4,
+  statusCardActive: {
+    borderColor: '#10B981',
+    backgroundColor: '#F0FDF4',
   },
-  controlDivider: {
-    height: 1,
-    backgroundColor: '#E5E7EB',
-  },
-  userMarker: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    backgroundColor: '#3B82F6',
-    justifyContent: 'center',
-    alignItems: 'center',
-    borderWidth: 3,
-    borderColor: '#FFFFFF',
-    shadowColor: '#000000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.2,
-    shadowRadius: 4,
-    elevation: 4,
-  },
-  memberMarker: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    backgroundColor: '#10B981',
-    justifyContent: 'center',
-    alignItems: 'center',
-    borderWidth: 3,
-    borderColor: '#FFFFFF',
-    shadowColor: '#000000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.2,
-    shadowRadius: 4,
-    elevation: 4,
-  },
-  markerStatusDot: {
-    position: 'absolute',
-    top: -1,
-    right: -1,
-    width: 10,
-    height: 10,
-    borderRadius: 5,
-    borderWidth: 2,
-    borderColor: '#FFFFFF',
-  },
-  markerInitial: {
-    color: '#FFFFFF',
-    fontSize: 14,
-    fontWeight: '700',
-  },
-  controlsPanel: {
-    backgroundColor: '#F9FAFB',
-    borderTopWidth: 1,
-    borderTopColor: '#E5E7EB',
-    maxHeight: 400,
-  },
-  card: {
-    backgroundColor: '#FFFFFF',
-    marginHorizontal: 16,
-    marginTop: 16,
-    borderRadius: 16,
-    padding: 20,
-    shadowColor: '#000000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.05,
-    shadowRadius: 3,
-    elevation: 2,
-  },
-  cardHeader: {
+  statusCardTop: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
+    marginBottom: 12,
   },
-  cardHeaderContent: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    flex: 1,
-    gap: 12,
-  },
-  cardHeaderText: {
-    flex: 1,
-  },
-  cardTitle: {
-    fontSize: 17,
-    fontWeight: '600',
-    color: '#111827',
-    marginBottom: 2,
-  },
-  cardSubtitle: {
-    fontSize: 14,
-    color: '#6B7280',
-  },
-  toggleSwitch: {
-    width: 52,
-    height: 32,
-    borderRadius: 16,
-    backgroundColor: '#D1D5DB',
+  statusCardIconContainer: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: '#F8FAFC',
     justifyContent: 'center',
-    padding: 3,
+    alignItems: 'center',
   },
-  toggleSwitchActive: {
+  statusCardIconContainerActive: {
+    backgroundColor: '#D1FAE5',
+  },
+  statusCardTitle: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#64748B',
+    marginBottom: 6,
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  },
+  statusCardValue: {
+    fontSize: 24,
+    fontWeight: '700',
+    color: '#1E293B',
+  },
+  statusCardValueActive: {
+    color: '#10B981',
+  },
+  miniToggle: {
+    width: 36,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: '#CBD5E1',
+    justifyContent: 'center',
+    padding: 2,
+  },
+  miniToggleActive: {
     backgroundColor: '#10B981',
   },
-  toggleSwitchDisabled: {
-    opacity: 0.6,
+  miniToggleDisabled: {
+    opacity: 0.5,
   },
-  toggleThumb: {
-    width: 26,
-    height: 26,
-    borderRadius: 13,
+  miniToggleThumb: {
+    width: 16,
+    height: 16,
+    borderRadius: 8,
     backgroundColor: '#FFFFFF',
   },
-  toggleThumbActive: {
+  miniToggleThumbActive: {
     alignSelf: 'flex-end',
   },
-  sectionTitle: {
-    fontSize: 17,
-    fontWeight: '600',
-    color: '#111827',
-    marginBottom: 16,
+  emergencySection: {
+    paddingHorizontal: 20,
+    paddingTop: 28,
   },
-  actionButton: {
-    backgroundColor: '#F9FAFB',
-    borderRadius: 12,
-    marginBottom: 12,
-    overflow: 'hidden',
-    borderWidth: 1,
-    borderColor: '#E5E7EB',
+  emergencyGrid: {
+    flexDirection: 'row',
+    gap: 12,
   },
   emergencyButton: {
-    backgroundColor: '#EF4444',
-    borderColor: '#EF4444',
+    flex: 1,
+    backgroundColor: '#DC2626',
+    borderRadius: 20,
+    overflow: 'hidden',
   },
-  emergencyButtonText: {
-    color: '#FFFFFF',
-  },
-  emergencyButtonSubtext: {
-    color: 'rgba(255, 255, 255, 0.9)',
-  },
-  actionButtonContent: {
-    flexDirection: 'row',
-    alignItems: 'center',
+  emergencyButtonContent: {
     padding: 16,
+    alignItems: 'center',
   },
-  actionIconContainer: {
+  emergencyIconContainer: {
     width: 48,
     height: 48,
-    borderRadius: 12,
-    backgroundColor: 'rgba(255, 255, 255, 0.2)',
+    borderRadius: 24,
+    backgroundColor: 'rgba(255, 255, 255, 0.25)',
     justifyContent: 'center',
     alignItems: 'center',
-    marginRight: 12,
+    marginBottom: 12,
   },
-  actionIconContainerSecondary: {
-    backgroundColor: '#FEE2E2',
+  emergencyTextContainer: {
+    alignItems: 'center',
   },
-  actionTextContainer: {
+  emergencyButtonTitle: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#FFFFFF',
+    marginBottom: 4,
+    textAlign: 'center',
+  },
+  emergencyButtonSubtitle: {
+    fontSize: 11,
+    color: 'rgba(255, 255, 255, 0.85)',
+    fontWeight: '500',
+    textAlign: 'center',
+    lineHeight: 14,
+  },
+  offlineEmergencyButton: {
     flex: 1,
+    backgroundColor: '#F59E0B',
+    borderRadius: 20,
+    overflow: 'hidden',
   },
-  actionButtonTitle: {
-    fontSize: 16,
+  offlineEmergencyButtonContent: {
+    padding: 16,
+    alignItems: 'center',
+  },
+  offlineEmergencyIconContainer: {
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: 'rgba(255, 255, 255, 0.25)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  offlineEmergencyTextContainer: {
+    alignItems: 'center',
+  },
+  offlineEmergencyButtonTitle: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#FFFFFF',
+    marginBottom: 4,
+    textAlign: 'center',
+  },
+  offlineEmergencyButtonSubtitle: {
+    fontSize: 11,
+    color: 'rgba(255, 255, 255, 0.85)',
+    fontWeight: '500',
+    textAlign: 'center',
+    lineHeight: 14,
+  },
+  quickActionsSection: {
+    paddingHorizontal: 20,
+    paddingTop: 28,
+  },
+  actionsGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 12,
+  },
+  actionCard: {
+    flex: 1,
+    minWidth: '47%',
+    backgroundColor: '#FFFFFF',
+    borderRadius: 20,
+    padding: 20,
+    alignItems: 'center',
+    borderWidth: 1.5,
+    borderColor: '#F1F5F9',
+  },
+  actionCardIcon: {
+    width: 52,
+    height: 52,
+    borderRadius: 26,
+    backgroundColor: '#F8FAFC',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 14,
+  },
+  actionCardTitle: {
+    fontSize: 15,
     fontWeight: '600',
-    color: '#111827',
-    marginBottom: 2,
+    color: '#1E293B',
+    textAlign: 'center',
+    marginBottom: 4,
   },
-  actionButtonSubtitle: {
-    fontSize: 13,
-    color: '#6B7280',
+  actionCardSubtitle: {
+    fontSize: 12,
+    color: '#64748B',
+    textAlign: 'center',
+    lineHeight: 16,
   },
-  actionChevron: {
-    marginLeft: 8,
+  sectionTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: '#1E293B',
+    marginBottom: 14,
+    letterSpacing: -0.3,
   },
-  loadingContainer: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    backgroundColor: '#F9FAFB',
+  bottomSpacing: {
+    height: 24,
   },
   loadingText: {
     marginTop: 16,
@@ -1542,7 +1621,7 @@ const styles = StyleSheet.create({
   },
   alertContainer: {
     backgroundColor: '#FFFFFF',
-    borderRadius: 24,
+    borderRadius: 28,
     padding: 32,
     alignItems: 'center',
     maxWidth: 320,
@@ -1577,4 +1656,57 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     lineHeight: 24,
   },
+  locationSharingBanner: {
+    backgroundColor: '#FEF3C7',
+    borderRadius: 16,
+    padding: 16,
+    marginHorizontal: 20,
+    marginTop: 20,
+    borderWidth: 1.5,
+    borderColor: '#FCD34D',
+  },
+  locationSharingBannerContent: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    marginBottom: 12,
+    gap: 12,
+  },
+  locationSharingBannerIcon: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: '#FDE68A',
+    justifyContent: 'center',
+    alignItems: 'center',
+    flexShrink: 0,
+  },
+  locationSharingBannerText: {
+    flex: 1,
+  },
+  locationSharingBannerTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#92400E',
+    marginBottom: 4,
+  },
+  locationSharingBannerMessage: {
+    fontSize: 13,
+    color: '#78350F',
+    lineHeight: 18,
+  },
+  locationSharingBannerButton: {
+    backgroundColor: '#F59E0B',
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 20,
+    alignItems: 'center',
+    justifyContent: 'center',
+    minHeight: 40,
+  },
+  locationSharingBannerButtonText: {
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: '600',
+  },
 });
+

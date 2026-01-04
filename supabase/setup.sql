@@ -1,5 +1,5 @@
 -- ============================================
--- SafeZone Database Setup Script
+-- FamGuard Database Setup Script
 -- Complete consolidated schema
 -- Run this in your Supabase SQL Editor
 -- ============================================
@@ -172,7 +172,7 @@ CREATE TABLE IF NOT EXISTS notifications (
   user_id TEXT NOT NULL,
   title TEXT NOT NULL,
   body TEXT NOT NULL,
-  type TEXT NOT NULL CHECK (type IN ('sos_alert', 'connection_added', 'location_updated', 'incident', 'general')),
+  type TEXT NOT NULL CHECK (type IN ('sos_alert', 'connection_added', 'location_updated', 'incident', 'check_in', 'check_in_emergency', 'check_in_unsafe', 'missed_check_in', 'travel_advisory', 'route_risk', 'general')),
   data JSONB DEFAULT '{}'::jsonb,
   read BOOLEAN DEFAULT false,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -367,7 +367,7 @@ CREATE TABLE IF NOT EXISTS user_settings (
   community_reports_enabled BOOLEAN DEFAULT true,
   -- Location settings
   location_update_frequency_minutes INTEGER DEFAULT 60,
-  location_sharing_enabled BOOLEAN DEFAULT true,
+  location_sharing_enabled BOOLEAN DEFAULT false,
   location_accuracy TEXT DEFAULT 'exact',
   -- App settings
   language TEXT DEFAULT 'en',

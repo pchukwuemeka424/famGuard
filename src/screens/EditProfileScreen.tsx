@@ -33,24 +33,11 @@ export default function EditProfileScreen({ navigation }: EditProfileScreenProps
       return;
     }
 
-    if (!email.trim()) {
-      Alert.alert('Error', 'Email is required');
-      return;
-    }
-
-    // Basic email validation
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
-      Alert.alert('Error', 'Please enter a valid email address');
-      return;
-    }
-
     setLoading(true);
     try {
       await updateUser({
         name: name.trim(),
-        email: email.trim(),
-        phone: phone.trim() || null,
+        // Email and phone are readonly, so we don't update them
       });
       Alert.alert('Success', 'Profile updated successfully', [
         { text: 'OK', onPress: () => navigation.goBack() },
@@ -89,9 +76,9 @@ export default function EditProfileScreen({ navigation }: EditProfileScreenProps
         <View style={styles.section}>
           <Text style={styles.label}>Email</Text>
           <TextInput
-            style={styles.input}
+            style={[styles.input, styles.readonlyInput]}
             value={email}
-            onChangeText={setEmail}
+            editable={false}
             placeholder="Enter your email"
             placeholderTextColor="#8E8E93"
             keyboardType="email-address"
@@ -103,9 +90,9 @@ export default function EditProfileScreen({ navigation }: EditProfileScreenProps
         <View style={styles.section}>
           <Text style={styles.label}>Phone</Text>
           <TextInput
-            style={styles.input}
+            style={[styles.input, styles.readonlyInput]}
             value={phone}
-            onChangeText={setPhone}
+            editable={false}
             placeholder="Enter your phone number"
             placeholderTextColor="#8E8E93"
             keyboardType="phone-pad"
@@ -173,6 +160,10 @@ const styles = StyleSheet.create({
     fontSize: 16,
     color: '#000000',
     backgroundColor: '#F9F9F9',
+  },
+  readonlyInput: {
+    backgroundColor: '#F0F0F0',
+    opacity: 0.7,
   },
   saveButton: {
     backgroundColor: '#007AFF',

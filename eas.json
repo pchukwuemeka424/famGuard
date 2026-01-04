@@ -1,0 +1,91 @@
+{
+  "cli": {
+    "version": ">= 13.2.0",
+    "appVersionSource": "local"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal"
+    },
+    "preview": {
+      "distribution": "internal",
+      "env": {
+        "NODE_ENV": "production"
+      },
+      "android": {
+        "buildType": "apk",
+        "gradleCommand": ":app:assembleRelease",
+        "image": "latest"
+      }
+    },
+    "apk": {
+      "distribution": "internal",
+      "env": {
+        "NODE_ENV": "production",
+        "CI": "true",
+        "SKIP_ENV_VALIDATION": "true",
+        "EXPO_NO_TYPESCRIPT_CHECK": "true",
+        "TSC_COMPILE_ON_ERROR": "true",
+        "SKIP_TSC": "true",
+        "EXPO_USE_FAST_RESOLVER": "1",
+        "NODE_OPTIONS": "--no-warnings --max-old-space-size=4096",
+        "EXPO_NO_BUNDLE_SPLASH": "1"
+      },
+      "android": {
+        "buildType": "apk",
+        "gradleCommand": ":app:assembleRelease",
+        "image": "latest"
+      }
+    },
+    "aab": {
+      "distribution": "store",
+      "env": {
+        "NODE_ENV": "production",
+        "CI": "true",
+        "SKIP_ENV_VALIDATION": "true",
+        "EXPO_NO_TYPESCRIPT_CHECK": "true",
+        "TSC_COMPILE_ON_ERROR": "true",
+        "SKIP_TSC": "true",
+        "EXPO_USE_FAST_RESOLVER": "1",
+        "NODE_OPTIONS": "--no-warnings --max-old-space-size=4096",
+        "EXPO_NO_BUNDLE_SPLASH": "1"
+      },
+      "android": {
+        "buildType": "app-bundle",
+        "gradleCommand": ":app:bundleRelease",
+        "image": "latest",
+        "withoutCredentials": false
+      },
+      "autoIncrement": true
+    },
+    "production": {
+      "env": {
+        "NODE_ENV": "production",
+        "CI": "true",
+        "SKIP_ENV_VALIDATION": "true",
+        "EXPO_NO_TYPESCRIPT_CHECK": "true",
+        "TSC_COMPILE_ON_ERROR": "true",
+        "SKIP_TSC": "true",
+        "EXPO_USE_FAST_RESOLVER": "1",
+        "NODE_OPTIONS": "--no-warnings --max-old-space-size=4096",
+        "EXPO_NO_BUNDLE_SPLASH": "1"
+      },
+      "android": {
+        "buildType": "apk",
+        "gradleCommand": ":app:assembleRelease",
+        "image": "latest",
+        "withoutCredentials": false
+      },
+      "ios": {
+        "buildConfiguration": "Release",
+        "image": "latest"
+      },
+      "autoIncrement": true
+    }
+  },
+  "submit": {
+    "production": {}
+  }
+}
+

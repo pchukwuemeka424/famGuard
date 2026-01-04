@@ -61,3 +61,19 @@ web-build/
 .env
 .env.local
 .env.*.local
+
+# Production build artifacts
+*.aab
+*.apk
+*.ipa
+*.dSYM.zip
+mapping.txt
+
+# Logs
+*.log
+logs/
+
+# Firebase service account keys (sensitive credentials)
+# Note: google-services.json is safe to commit - it's a public config file
+*-firebase-adminsdk-*.json
+firebase-service-account.json

@@ -1,12 +1,17 @@
 {
-  "name": "safezone",
-  "version": "1.0.0",
+  "name": "famguard",
+  "version": "1.0.1",
   "main": "node_modules/expo/AppEntry.js",
   "scripts": {
     "start": "expo start",
     "android": "expo start --android",
     "ios": "expo start --ios",
-    "web": "expo start --web"
+    "web": "expo start --web",
+    "export:embed": "node scripts/export-with-error-handling.js",
+    "build:android": "eas build --platform android --profile production",
+    "build:android:apk": "eas build --platform android --profile apk --non-interactive",
+    "build:ios": "eas build --platform ios --profile production",
+    "build:all": "eas build --platform all --profile production"
   },
   "dependencies": {
     "@expo/vector-icons": "^15.0.0",
@@ -21,6 +26,7 @@
     "expo-clipboard": "^8.0.8",
     "expo-constants": "~18.0.12",
     "expo-device": "^8.0.10",
+    "expo-file-system": "~19.0.21",
     "expo-font": "~14.0.10",
     "expo-location": "~19.0.8",
     "expo-notifications": "~0.32.15",
@@ -37,7 +43,9 @@
   },
   "devDependencies": {
     "@babel/core": "^7.26.0",
+    "@expo/config-plugins": "^54.0.4",
     "@types/react": "~19.1.10",
+    "babel-plugin-transform-remove-console": "^6.9.4",
     "babel-preset-expo": "^54.0.9",
     "typescript": "~5.9.2"
   },

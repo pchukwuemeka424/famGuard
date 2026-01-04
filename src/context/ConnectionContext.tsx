@@ -1,7 +1,6 @@
 import React, { createContext, useState, useContext, useEffect, useRef, ReactNode } from 'react';
 import { supabase } from '../lib/supabase';
 import { useAuth } from './AuthContext';
-import { notificationService } from '../services/notificationService';
 import { locationService } from '../services/locationService';
 import type { FamilyMember, Location } from '../types';
 
@@ -30,7 +29,7 @@ interface ConnectionProviderProps {
 export const ConnectionProvider: React.FC<ConnectionProviderProps> = ({ children }) => {
   const { user } = useAuth();
   const [connections, setConnections] = useState<FamilyMember[]>([]);
-  const [locationSharingEnabled, setLocationSharingEnabled] = useState<boolean>(true);
+  const [locationSharingEnabled, setLocationSharingEnabled] = useState<boolean>(false);
   const [locationUpdateFrequencyMinutes, setLocationUpdateFrequencyMinutes] = useState<number>(60); // Default 1 hour
   const [loading, setLoading] = useState<boolean>(true);
   const realtimeChannelRef = useRef<any>(null);
@@ -50,7 +49,6 @@ export const ConnectionProvider: React.FC<ConnectionProviderProps> = ({ children
         });
       });
       setupSettingsRealtimeSubscription();
-      registerPushNotifications();
     }
 
     return () => {
@@ -67,7 +65,7 @@ export const ConnectionProvider: React.FC<ConnectionProviderProps> = ({ children
         try {
           supabase.removeChannel(realtimeChannelRef.current);
         } catch (error) {
-          console.warn('Error removing channel during cleanup:', error);
+          // Silently handle cleanup errors - channel may already be removed
         }
         realtimeChannelRef.current = null;
       }
@@ -76,7 +74,7 @@ export const ConnectionProvider: React.FC<ConnectionProviderProps> = ({ children
         try {
           supabase.removeChannel(settingsChannelRef.current);
         } catch (error) {
-          console.warn('Error removing settings channel during cleanup:', error);
+          // Silently handle cleanup errors - channel may already be removed
         }
         settingsChannelRef.current = null;
       }
@@ -101,12 +99,12 @@ export const ConnectionProvider: React.FC<ConnectionProviderProps> = ({ children
         if (error.code === 'PGRST116') {
           await createDefaultSettings();
           setLocationUpdateFrequencyMinutes(60); // Default 1 hour
-          setLocationSharingEnabled(true);
+          setLocationSharingEnabled(false);
         } else {
           console.error('Error loading settings:', error);
           // Use defaults on error
           setLocationUpdateFrequencyMinutes(60);
-          setLocationSharingEnabled(true);
+          setLocationSharingEnabled(false);
         }
       } else if (data) {
         setLocationUpdateFrequencyMinutes(data.location_update_frequency_minutes || 60);
@@ -118,7 +116,7 @@ export const ConnectionProvider: React.FC<ConnectionProviderProps> = ({ children
       console.error('Error loading settings:', error);
       // Use defaults on error
       setLocationUpdateFrequencyMinutes(60);
-      setLocationSharingEnabled(true);
+      setLocationSharingEnabled(false);
     }
   };
 
@@ -132,7 +130,7 @@ export const ConnectionProvider: React.FC<ConnectionProviderProps> = ({ children
         .insert({
           user_id: user.id,
           location_update_frequency_minutes: 60, // Default 1 hour
-          location_sharing_enabled: true,
+          location_sharing_enabled: false,
           notifications_enabled: true,
           community_reports_enabled: true,
         });
@@ -205,6 +203,14 @@ export const ConnectionProvider: React.FC<ConnectionProviderProps> = ({ children
         const currentLocation = await locationService.getCurrentLocation();
         if (!currentLocation) return;
 
+        // Check if location update should be blocked (user stationary for 1+ hour within 30m)
+        if (locationService.shouldBlockLocationUpdate(currentLocation)) {
+          if (__DEV__) {
+            console.log('Skipping connection location update - user stationary for 1+ hour');
+          }
+          return;
+        }
+
         // Get current battery level
         const batteryLevel = await locationService.getBatteryLevel();
 
@@ -225,6 +231,8 @@ export const ConnectionProvider: React.FC<ConnectionProviderProps> = ({ children
         if (error) {
           console.error('Error updating connection location:', error);
         } else {
+          // Notify location service that update was made (for blocking logic)
+          locationService.notifyLocationUpdated(currentLocation);
           // Refresh connections to update UI
           await refreshConnections();
         }
@@ -443,19 +451,10 @@ export const ConnectionProvider: React.FC<ConnectionProviderProps> = ({ children
             console.log('Realtime connection update received:', payload.eventType);
           }
           
-          // Send push notification for important events (non-blocking)
+          // Handle new connections
           if (payload.eventType === 'INSERT') {
             const newConnection = payload.new;
             if (newConnection.connected_user_id !== user.id) {
-              // Only notify if it's not the current user
-              notificationService.sendPushNotification(user.id, {
-                title: 'New Connection',
-                body: `${newConnection.connected_user_name} connected with you`,
-                data: { type: 'connection_added', connectionId: newConnection.id },
-              }).catch((err) => {
-                console.warn('Failed to send push notification for new connection:', err);
-              });
-              
               // Refresh data only when new connection is added (not current user)
               refreshConnections().catch((error) => {
                 console.error('Error refreshing connections after real-time update:', error);
@@ -484,16 +483,6 @@ export const ConnectionProvider: React.FC<ConnectionProviderProps> = ({ children
               });
             }
 
-            // Notify on location update (only for significant changes)
-            if (hasLocationChange) {
-              notificationService.sendPushNotification(user.id, {
-                title: 'Location Updated',
-                body: `${newData.connected_user_name} updated their location`,
-                data: { type: 'location_updated', connectionId: newData.id },
-              }).catch((err) => {
-                console.warn('Failed to send push notification for location update:', err);
-              });
-            }
           } else if (payload.eventType === 'DELETE') {
             // Connection was removed - always refresh
             refreshConnections().catch((error) => {
@@ -574,15 +563,6 @@ export const ConnectionProvider: React.FC<ConnectionProviderProps> = ({ children
     realtimeChannelRef.current = channel;
   };
 
-  const registerPushNotifications = async (): Promise<void> => {
-    if (!user?.id) return;
-
-    try {
-      await notificationService.registerForPushNotifications(user.id);
-    } catch (error) {
-      console.error('Error registering push notifications:', error);
-    }
-  };
 
   return (
     <ConnectionContext.Provider

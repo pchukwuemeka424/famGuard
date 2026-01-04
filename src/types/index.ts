@@ -72,6 +72,7 @@ export interface Connection {
   createdAt: string;
   updatedAt: string;
   isLocked?: boolean;
+  locationSharingEnabled?: boolean;
 }
 
 export interface AppSetting {
@@ -104,8 +105,13 @@ export type RootStackParamList = {
   BatterySaving: undefined;
   LocationUpdateFrequency: undefined;
   HelpSupport: undefined;
+  UserManual: undefined;
   PrivacyPolicy: undefined;
   TermsOfService: undefined;
+  TravelAdvisory: undefined;
+  CheckIn: undefined;
+  CheckInSettings: undefined;
+  OfflineMaps: undefined;
 };
 
 export type MainTabParamList = {
@@ -114,4 +120,105 @@ export type MainTabParamList = {
   Connections: undefined;
   Profile: undefined;
 };
+
+export interface TravelAdvisory {
+  id: string;
+  state: string;
+  region?: string;
+  lga?: string;
+  riskLevel: 'low' | 'moderate' | 'high' | 'critical';
+  advisoryType: 'security' | 'weather' | 'combined';
+  title: string;
+  description: string;
+  affectedAreas?: string[];
+  startDate: string;
+  endDate?: string;
+  isActive: boolean;
+  source?: string;
+  createdByUserId?: string;
+  upvotes: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RouteRiskData {
+  id: string;
+  originState: string;
+  originCity?: string;
+  destinationState: string;
+  destinationCity?: string;
+  routeCoordinates?: Array<{ latitude: number; longitude: number }>;
+  riskScore: number; // 0-100
+  incidentCount24h: number;
+  incidentCount7d: number;
+  incidentCount30d: number;
+  lastIncidentAt?: string;
+  averageTravelTimeMinutes?: number;
+  lastUpdated: string;
+  createdAt: string;
+}
+
+export interface UserCheckIn {
+  id: string;
+  userId: string;
+  checkInType: 'manual' | 'automatic' | 'scheduled' | 'emergency';
+  location?: Location;
+  status: 'safe' | 'unsafe' | 'delayed' | 'missed';
+  message?: string;
+  nextCheckInDueAt?: string;
+  isEmergency: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CheckInSettings {
+  id: string;
+  userId: string;
+  enabled: boolean;
+  checkInIntervalMinutes: number;
+  autoCheckInEnabled: boolean;
+  autoCheckInDuringTravel: boolean;
+  travelSpeedThresholdKmh: number;
+  missedCheckInAlertMinutes: number;
+  emergencyContacts: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface OfflineMap {
+  id: string;
+  name: string;
+  centerLatitude: number;
+  centerLongitude: number;
+  latitudeDelta: number;
+  longitudeDelta: number;
+  zoomLevel: number;
+  sizeBytes: number;
+  tileCount: number;
+  downloadedAt: string;
+  expiresAt?: string;
+}
+
+export interface OfflineMapDownloadProgress {
+  mapId: string;
+  downloadedTiles: number;
+  totalTiles: number;
+  percentage: number;
+  estimatedTimeRemaining?: number;
+}
+
+export interface ConnectionInvitation {
+  id: string;
+  inviterUserId: string;
+  inviterName: string;
+  inviterPhone?: string;
+  inviterEmail?: string;
+  inviterPhoto?: string;
+  inviteePhone: string;
+  status: 'pending' | 'accepted' | 'rejected' | 'expired';
+  expiresAt: string;
+  acceptedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
 

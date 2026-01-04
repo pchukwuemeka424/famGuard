@@ -148,7 +148,7 @@ export default function LocationUpdateFrequencyScreen({ navigation }: LocationUp
           location_update_frequency_minutes: 60, // Default 1 hour
           notifications_enabled: true,
           community_reports_enabled: true,
-          location_sharing_enabled: true,
+          location_sharing_enabled: false,
         });
 
       if (error) {

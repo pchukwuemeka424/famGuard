@@ -59,36 +59,34 @@ export default function ReportIncidentScreen({ navigation }: ReportIncidentScree
   const autoFillIncidentDetails = (): void => {
     if (!type || !currentLocation) return;
 
-    const locationName = currentLocation.address 
-      ? currentLocation.address.split(',')[0] // Get street name or first part of address
-      : 'this location';
+    const fullAddress = currentLocation.address || 'this location';
 
-    // Generate title based on incident type
+    // Generate title based on incident type (NO address in title)
     const titles: Record<string, string> = {
-      'Robbery': `${type} reported near ${locationName}`,
-      'Kidnapping': `Suspicious activity reported at ${locationName}`,
-      'Accident': `Traffic accident reported at ${locationName}`,
-      'Fire': `${type} reported at ${locationName}`,
-      'Protest': `Protest gathering reported at ${locationName}`,
-      'Assault': `${type} incident reported at ${locationName}`,
-      'Theft': `${type} reported at ${locationName}`,
-      'Other': `Incident reported at ${locationName}`,
+      'Robbery': `${type} Reported`,
+      'Kidnapping': 'Suspicious Activity Reported',
+      'Accident': 'Traffic Accident Reported',
+      'Fire': `${type} Reported`,
+      'Protest': 'Protest Gathering Reported',
+      'Assault': `${type} Incident Reported`,
+      'Theft': `${type} Reported`,
+      'Other': 'Incident Reported',
     };
 
-    // Generate description based on incident type
+    // Generate description based on incident type (WITH full address)
     const descriptions: Record<string, string> = {
-      'Robbery': `A ${type.toLowerCase()} incident has been reported at ${locationName}. Please exercise caution and avoid the area if possible. Authorities have been notified.`,
-      'Kidnapping': `Suspicious activity related to ${type.toLowerCase()} has been reported at ${locationName}. Please remain vigilant and report any suspicious behavior to authorities immediately.`,
-      'Accident': `A traffic accident has been reported at ${locationName}. Emergency services are responding. Please expect delays and use alternate routes if possible.`,
-      'Fire': `A ${type.toLowerCase()} has been reported at ${locationName}. Fire department is responding. Please avoid the area and follow instructions from emergency personnel.`,
-      'Protest': `A protest gathering has been reported at ${locationName}. Please expect traffic delays and exercise caution if in the area.`,
-      'Assault': `An ${type.toLowerCase()} incident has been reported at ${locationName}. Please avoid the area and report any relevant information to authorities.`,
-      'Theft': `A ${type.toLowerCase()} has been reported at ${locationName}. Please secure your belongings and report any suspicious activity.`,
-      'Other': `An incident has been reported at ${locationName}. Please exercise caution in the area.`,
+      'Robbery': `A ${type.toLowerCase()} incident has been reported.\n\nLocation: ${fullAddress}\n\nPlease exercise caution and avoid the area if possible. Authorities have been notified.`,
+      'Kidnapping': `Suspicious activity related to ${type.toLowerCase()} has been reported.\n\nLocation: ${fullAddress}\n\nPlease remain vigilant and report any suspicious behavior to authorities immediately.`,
+      'Accident': `A traffic accident has been reported.\n\nLocation: ${fullAddress}\n\nEmergency services are responding. Please expect delays and use alternate routes if possible.`,
+      'Fire': `A ${type.toLowerCase()} has been reported.\n\nLocation: ${fullAddress}\n\nFire department is responding. Please avoid the area and follow instructions from emergency personnel.`,
+      'Protest': `A protest gathering has been reported.\n\nLocation: ${fullAddress}\n\nPlease expect traffic delays and exercise caution if in the area.`,
+      'Assault': `An ${type.toLowerCase()} incident has been reported.\n\nLocation: ${fullAddress}\n\nPlease avoid the area and report any relevant information to authorities.`,
+      'Theft': `A ${type.toLowerCase()} has been reported.\n\nLocation: ${fullAddress}\n\nPlease secure your belongings and report any suspicious activity.`,
+      'Other': `An incident has been reported.\n\nLocation: ${fullAddress}\n\nPlease exercise caution in the area.`,
     };
 
-    const newTitle = titles[type] || `Incident reported at ${locationName}`;
-    const newDescription = descriptions[type] || `An incident has been reported at ${locationName}. Please exercise caution in the area.`;
+    const newTitle = titles[type] || 'Incident Reported';
+    const newDescription = descriptions[type] || `An incident has been reported.\n\nLocation: ${fullAddress}\n\nPlease exercise caution in the area.`;
 
     // Check if type has changed
     const typeChanged = lastAutoFilledType !== type && lastAutoFilledType !== '';
@@ -130,9 +128,9 @@ export default function ReportIncidentScreen({ navigation }: ReportIncidentScree
       // Request permissions first
       const hasPermission = await locationService.checkPermissions();
       if (!hasPermission) {
-        const granted = await locationService.requestPermissions();
-        if (!granted) {
-          setLocationError('Location permission denied. Please enable location access in settings.');
+        const permissionResult = await locationService.requestPermissions();
+        if (!permissionResult.granted) {
+          setLocationError(permissionResult.message || 'Location permission denied. Please enable location access in settings.');
           setLocationLoading(false);
           return;
         }

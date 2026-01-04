@@ -5,8 +5,8 @@ import {
   StyleSheet,
   Animated,
   Platform,
+  Image,
 } from 'react-native';
-import { Ionicons } from '@expo/vector-icons';
 
 interface SplashScreenProps {
   onFinish?: () => void;
@@ -84,6 +84,13 @@ export default function SplashScreen({ onFinish }: SplashScreenProps) {
 
   return (
     <View style={styles.container}>
+      {/* Background Blob Shapes */}
+      <View style={styles.blobContainer}>
+        <View style={[styles.blob, styles.blob1]} />
+        <View style={[styles.blob, styles.blob2]} />
+        <View style={[styles.blob, styles.blob3]} />
+      </View>
+
       <Animated.View
         style={[
           styles.content,
@@ -99,12 +106,16 @@ export default function SplashScreen({ onFinish }: SplashScreenProps) {
         {/* App Icon/Logo */}
         <View style={styles.logoContainer}>
           <View style={styles.iconCircle}>
-            <Ionicons name="shield-checkmark" size={64} color="#007AFF" />
+            <Image 
+              source={require('../../assets/icon.png')} 
+              style={styles.logoImage}
+              resizeMode="contain"
+            />
           </View>
         </View>
 
         {/* App Name */}
-        <Text style={styles.appName}>SafeZone</Text>
+        <Text style={styles.appName}>FamGuard</Text>
         <Text style={styles.tagline}>Stay Safe, Stay Connected</Text>
       </Animated.View>
 
@@ -175,6 +186,13 @@ export default function SplashScreen({ onFinish }: SplashScreenProps) {
           ]}
         />
       </Animated.View>
+
+      {/* Company Name */}
+      <View style={styles.companyContainer}>
+        <Text style={styles.companyText}>
+          Acehub Technologies Ltd
+        </Text>
+      </View>
     </View>
   );
 }
@@ -182,7 +200,8 @@ export default function SplashScreen({ onFinish }: SplashScreenProps) {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#FFFFFF',
+    position: 'relative',
+    backgroundColor: '#DC2626',
     justifyContent: 'center',
     alignItems: 'center',
   },
@@ -197,14 +216,16 @@ const styles = StyleSheet.create({
     width: 120,
     height: 120,
     borderRadius: 60,
-    backgroundColor: '#F0F8FF',
+    backgroundColor: '#FFFFFF',
     justifyContent: 'center',
     alignItems: 'center',
+    borderWidth: 0,
+    overflow: 'hidden',
     ...Platform.select({
       ios: {
-        shadowColor: '#007AFF',
+        shadowColor: '#000000',
         shadowOffset: { width: 0, height: 4 },
-        shadowOpacity: 0.2,
+        shadowOpacity: 0.3,
         shadowRadius: 8,
       },
       android: {
@@ -212,16 +233,23 @@ const styles = StyleSheet.create({
       },
     }),
   },
+  logoImage: {
+    width: 100,
+    height: 100,
+  },
   appName: {
     fontSize: 36,
     fontWeight: '700',
-    color: '#1C1C1E',
+    color: '#FFFFFF',
     marginTop: 24,
     letterSpacing: 0.5,
+    textShadowColor: 'rgba(0, 0, 0, 0.2)',
+    textShadowOffset: { width: 0, height: 2 },
+    textShadowRadius: 4,
   },
   tagline: {
     fontSize: 16,
-    color: '#8E8E93',
+    color: 'rgba(255, 255, 255, 0.9)',
     marginTop: 8,
     fontWeight: '400',
   },
@@ -235,8 +263,55 @@ const styles = StyleSheet.create({
     width: 8,
     height: 8,
     borderRadius: 4,
-    backgroundColor: '#007AFF',
+    backgroundColor: '#FFFFFF',
     marginHorizontal: 4,
+  },
+  blobContainer: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    overflow: 'hidden',
+  },
+  blob: {
+    position: 'absolute',
+    borderRadius: 50,
+    opacity: 0.2,
+  },
+  blob1: {
+    width: 200,
+    height: 200,
+    backgroundColor: '#F87171',
+    top: 50,
+    right: -30,
+  },
+  blob2: {
+    width: 180,
+    height: 180,
+    backgroundColor: '#EF4444',
+    bottom: 100,
+    left: -20,
+  },
+  blob3: {
+    width: 160,
+    height: 160,
+    backgroundColor: '#FCA5A5',
+    top: '40%',
+    right: 40,
+  },
+  companyContainer: {
+    position: 'absolute',
+    bottom: 40,
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+  },
+  companyText: {
+    fontSize: 10,
+    color: 'rgba(255, 255, 255, 0.6)',
+    textAlign: 'center',
+    letterSpacing: 0.5,
   },
 });
 

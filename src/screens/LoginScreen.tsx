@@ -91,8 +91,9 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
             <View style={styles.quickLoginScreen}>
               {/* Background Blob Shapes */}
               <View style={styles.blobContainer}>
-                <View style={[styles.blob, styles.blobMustard]} />
-                <View style={[styles.blob, styles.blobTeal]} />
+                <View style={[styles.blob, styles.blob1]} />
+                <View style={[styles.blob, styles.blob2]} />
+                <View style={[styles.blob, styles.blob3]} />
               </View>
 
               {/* Back Button */}
@@ -105,23 +106,23 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
                 }}
                 activeOpacity={0.7}
               >
-                <Ionicons name="chevron-back" size={24} color="#9CA3AF" />
+                <Ionicons name="chevron-back" size={24} color="#FFFFFF" />
               </TouchableOpacity>
 
               {/* Main Content */}
               <View style={styles.quickLoginContent}>
                 <View style={styles.welcomeBackContainer}>
-                  <Text style={styles.welcomeBackText}>Welcome back!</Text>
-                  {lastLoggedInName && (
-                    <Text style={styles.userNameText}>{lastLoggedInName}</Text>
-                  )}
+                  <Text style={styles.welcomeBackText}>
+                    Welcome{'\n'}back! {lastLoggedInName && lastLoggedInName}
+                  </Text>
                 </View>
 
                 <View style={styles.inputWrapper}>
-                  <Text style={styles.underlineLabel}>Password</Text>
-                  <View style={styles.underlineInputContainer}>
+                  <Text style={styles.label}>Password</Text>
+                  <View style={styles.inputContainer}>
+                    <Ionicons name="lock-closed-outline" size={22} color="#6B7280" style={styles.inputIcon} />
                     <TextInput
-                      style={styles.underlineInput}
+                      style={styles.input}
                       placeholder="Enter your password"
                       placeholderTextColor="#9CA3AF"
                       value={password}
@@ -138,7 +139,7 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
                     >
                       <Ionicons
                         name={showPassword ? 'eye-outline' : 'eye-off-outline'}
-                        size={20}
+                        size={22}
                         color="#6B7280"
                       />
                     </TouchableOpacity>
@@ -169,10 +170,21 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
                 >
                   <Text style={styles.forgotPasswordText}>Forgot password?</Text>
                 </TouchableOpacity>
+
+                <Text style={styles.companyText}>
+                  Acehub Technologies Ltd
+                </Text>
               </View>
             </View>
           ) : (
             <View style={styles.content}>
+              {/* Background Blob Shapes */}
+              <View style={styles.blobContainer}>
+                <View style={[styles.blob, styles.blob1]} />
+                <View style={[styles.blob, styles.blob2]} />
+                <View style={[styles.blob, styles.blob3]} />
+              </View>
+
               <View style={styles.header}>
                 <Text style={styles.title}>Welcome</Text>
                 <Text style={styles.subtitle}>Sign in to your account to continue</Text>
@@ -272,6 +284,10 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
                   <Text style={styles.signupLink}>Sign Up</Text>
                 </TouchableOpacity>
               </View>
+
+              <Text style={styles.companyText}>
+                Acehub Technologies Ltd
+              </Text>
             </View>
           )}
         </ScrollView>
@@ -283,10 +299,10 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#F9FAFB',
+    backgroundColor: '#DC2626',
   },
   quickLoginContainer: {
-    backgroundColor: '#F5F5DC',
+    backgroundColor: '#DC2626',
   },
   keyboardView: {
     flex: 1,
@@ -296,6 +312,7 @@ const styles = StyleSheet.create({
   },
   content: {
     flex: 1,
+    position: 'relative',
     paddingHorizontal: 24,
     paddingTop: Platform.OS === 'ios' ? 20 : 40,
     paddingBottom: 32,
@@ -308,13 +325,16 @@ const styles = StyleSheet.create({
   title: {
     fontSize: 36,
     fontWeight: '700',
-    color: '#111827',
+    color: '#FFFFFF',
     marginBottom: 12,
     letterSpacing: -0.5,
+    textShadowColor: 'rgba(0, 0, 0, 0.2)',
+    textShadowOffset: { width: 0, height: 2 },
+    textShadowRadius: 4,
   },
   subtitle: {
     fontSize: 16,
-    color: '#6B7280',
+    color: 'rgba(255, 255, 255, 0.9)',
     textAlign: 'center',
     lineHeight: 24,
   },
@@ -327,7 +347,7 @@ const styles = StyleSheet.create({
   label: {
     fontSize: 14,
     fontWeight: '600',
-    color: '#374151',
+    color: '#FFFFFF',
     marginBottom: 8,
     letterSpacing: 0.2,
   },
@@ -337,18 +357,18 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFFFFF',
     borderRadius: 16,
     borderWidth: 1.5,
-    borderColor: '#E5E7EB',
+    borderColor: 'rgba(255, 255, 255, 0.3)',
     paddingHorizontal: 18,
     height: 58,
     ...Platform.select({
       ios: {
         shadowColor: '#000',
-        shadowOffset: { width: 0, height: 1 },
-        shadowOpacity: 0.05,
-        shadowRadius: 2,
+        shadowOffset: { width: 0, height: 2 },
+        shadowOpacity: 0.1,
+        shadowRadius: 4,
       },
       android: {
-        elevation: 1,
+        elevation: 2,
       },
     }),
   },
@@ -371,14 +391,14 @@ const styles = StyleSheet.create({
     marginTop: -8,
   },
   forgotPasswordText: {
-    color: '#9CA3AF',
+    color: 'rgba(255, 255, 255, 0.9)',
     fontSize: 14,
     fontWeight: '400',
   },
   errorContainer: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#FEF2F2',
+    backgroundColor: '#FFFFFF',
     borderRadius: 12,
     padding: 14,
     marginBottom: 24,
@@ -393,7 +413,7 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   button: {
-    backgroundColor: '#007AFF',
+    backgroundColor: '#FFFFFF',
     borderRadius: 16,
     paddingVertical: 18,
     paddingHorizontal: 24,
@@ -401,7 +421,7 @@ const styles = StyleSheet.create({
     marginBottom: 32,
     ...Platform.select({
       ios: {
-        shadowColor: '#007AFF',
+        shadowColor: '#000',
         shadowOffset: { width: 0, height: 4 },
         shadowOpacity: 0.3,
         shadowRadius: 8,
@@ -412,7 +432,7 @@ const styles = StyleSheet.create({
     }),
   },
   buttonText: {
-    color: '#FFFFFF',
+    color: '#DC2626',
     fontSize: 17,
     fontWeight: '600',
     letterSpacing: 0.3,
@@ -436,12 +456,12 @@ const styles = StyleSheet.create({
   dividerLine: {
     flex: 1,
     height: 1,
-    backgroundColor: '#E5E7EB',
+    backgroundColor: 'rgba(255, 255, 255, 0.3)',
   },
   dividerText: {
     marginHorizontal: 16,
     fontSize: 13,
-    color: '#9CA3AF',
+    color: 'rgba(255, 255, 255, 0.8)',
     fontWeight: '500',
   },
   signupContainer: {
@@ -450,13 +470,14 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   signupText: {
-    color: '#6B7280',
+    color: 'rgba(255, 255, 255, 0.9)',
     fontSize: 15,
   },
   signupLink: {
-    color: '#007AFF',
+    color: '#FFFFFF',
     fontSize: 15,
     fontWeight: '600',
+    textDecorationLine: 'underline',
   },
   quickLoginScreen: {
     flex: 1,
@@ -465,35 +486,6 @@ const styles = StyleSheet.create({
     paddingTop: Platform.OS === 'ios' ? 20 : 40,
     paddingBottom: 32,
     justifyContent: 'center',
-  },
-  blobContainer: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    overflow: 'hidden',
-  },
-  blob: {
-    position: 'absolute',
-  },
-  blobMustard: {
-    width: 280,
-    height: 280,
-    backgroundColor: '#D4A574',
-    top: -80,
-    left: -80,
-    borderRadius: 140,
-    transform: [{ scaleX: 1.2 }, { scaleY: 0.9 }],
-  },
-  blobTeal: {
-    width: 320,
-    height: 320,
-    backgroundColor: '#7FB3B3',
-    bottom: -100,
-    right: -100,
-    borderRadius: 160,
-    transform: [{ scaleX: 1.1 }, { scaleY: 0.95 }],
   },
   backButton: {
     position: 'absolute',
@@ -514,51 +506,34 @@ const styles = StyleSheet.create({
   welcomeBackText: {
     fontSize: 42,
     fontWeight: '700',
-    color: '#374151',
-    marginBottom: 12,
+    color: '#FFFFFF',
+    marginBottom: 0,
     letterSpacing: -1,
+    textShadowColor: 'rgba(0, 0, 0, 0.2)',
+    textShadowOffset: { width: 0, height: 2 },
+    textShadowRadius: 4,
   },
   userNameText: {
     fontSize: 18,
     fontWeight: '400',
-    color: '#6B7280',
+    color: 'rgba(255, 255, 255, 0.9)',
     letterSpacing: -0.3,
-  },
-  underlineLabel: {
-    fontSize: 14,
-    fontWeight: '500',
-    color: '#9CA3AF',
-    marginBottom: 12,
-  },
-  underlineInputContainer: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    borderBottomWidth: 1.5,
-    borderBottomColor: '#374151',
-    paddingBottom: 12,
-  },
-  underlineInput: {
-    flex: 1,
-    fontSize: 16,
-    color: '#111827',
-    fontWeight: '400',
-    paddingVertical: 8,
   },
   forgotPasswordLink: {
     alignSelf: 'flex-start',
     marginTop: 8,
   },
   quickLoginButton: {
-    backgroundColor: '#007AFF',
-    borderRadius: 12,
-    paddingVertical: 16,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 16,
+    paddingVertical: 18,
     paddingHorizontal: 24,
     alignItems: 'center',
     marginTop: 16,
     width: '100%',
     ...Platform.select({
       ios: {
-        shadowColor: '#007AFF',
+        shadowColor: '#000',
         shadowOffset: { width: 0, height: 4 },
         shadowOpacity: 0.3,
         shadowRadius: 8,
@@ -569,10 +544,51 @@ const styles = StyleSheet.create({
     }),
   },
   quickLoginButtonText: {
-    color: '#FFFFFF',
+    color: '#DC2626',
     fontSize: 17,
     fontWeight: '600',
     letterSpacing: 0.3,
+  },
+  blobContainer: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    overflow: 'hidden',
+  },
+  blob: {
+    position: 'absolute',
+    borderRadius: 50,
+    opacity: 0.2,
+  },
+  blob1: {
+    width: 200,
+    height: 200,
+    backgroundColor: '#F87171',
+    top: 50,
+    right: -30,
+  },
+  blob2: {
+    width: 180,
+    height: 180,
+    backgroundColor: '#EF4444',
+    bottom: 100,
+    left: -20,
+  },
+  blob3: {
+    width: 160,
+    height: 160,
+    backgroundColor: '#FCA5A5',
+    top: '40%',
+    right: 40,
+  },
+  companyText: {
+    fontSize: 10,
+    color: 'rgba(255, 255, 255, 0.6)',
+    textAlign: 'center',
+    marginTop: 24,
+    letterSpacing: 0.5,
   },
 });
 

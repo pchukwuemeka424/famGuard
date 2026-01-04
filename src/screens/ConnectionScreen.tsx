@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View,
   Text,
@@ -12,18 +12,24 @@ import {
   Platform,
   Modal,
   Pressable,
+  AppState,
+  AppStateStatus,
+  RefreshControl,
+  Linking,
+  Switch,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import * as Clipboard from 'expo-clipboard';
 import type { CompositeNavigationProp } from '@react-navigation/native';
+import { useFocusEffect } from '@react-navigation/native';
 import type { BottomTabNavigationProp } from '@react-navigation/bottom-tabs';
 import type { StackNavigationProp } from '@react-navigation/stack';
 import { useAuth } from '../context/AuthContext';
 import { useConnection } from '../context/ConnectionContext';
 import { supabase } from '../lib/supabase';
 import { locationService } from '../services/locationService';
-import type { MainTabParamList, RootStackParamList, Connection } from '../types';
+import type { MainTabParamList, RootStackParamList, Connection, ConnectionInvitation } from '../types';
 
 type ConnectionScreenNavigationProp = CompositeNavigationProp<
   BottomTabNavigationProp<MainTabParamList, 'Connections'>,
@@ -39,28 +45,120 @@ export default function ConnectionScreen({ navigation }: ConnectionScreenProps) 
   const { locationSharingEnabled } = useConnection();
   const [connections, setConnections] = useState<Connection[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
-  const [searchQuery, setSearchQuery] = useState<string>('');
-  const [searchResults, setSearchResults] = useState<any[]>([]);
-  const [searching, setSearching] = useState<boolean>(false);
-  const [connecting, setConnecting] = useState<string | null>(null);
-  const [myCode, setMyCode] = useState<string>('');
-  const [generatingCode, setGeneratingCode] = useState<boolean>(false);
-  const [codeInput, setCodeInput] = useState<string>('');
-  const [validatingCode, setValidatingCode] = useState<boolean>(false);
+  const [showInviteByPhoneModal, setShowInviteByPhoneModal] = useState<boolean>(false);
+  const [phoneInput, setPhoneInput] = useState<string>('');
+  const [sendingInvitation, setSendingInvitation] = useState<boolean>(false);
+  const [pendingInvitations, setPendingInvitations] = useState<ConnectionInvitation[]>([]);
+  const [loadingInvitations, setLoadingInvitations] = useState<boolean>(false);
+  const [refreshing, setRefreshing] = useState<boolean>(false);
   const [showGenerateCodeModal, setShowGenerateCodeModal] = useState<boolean>(false);
   const [showEnterCodeModal, setShowEnterCodeModal] = useState<boolean>(false);
-  const [activeTab, setActiveTab] = useState<'home' | 'connections'>('home');
+  const [connectionCode, setConnectionCode] = useState<string>('');
+  const [codeInput, setCodeInput] = useState<string>('');
+  const [generatingCode, setGeneratingCode] = useState<boolean>(false);
+  const [connectingByCode, setConnectingByCode] = useState<boolean>(false);
+  const phoneInputRef = useRef<TextInput>(null);
   const codeInputRef = useRef<TextInput>(null);
   const connectionsChannelRef = useRef<any>(null);
   const usersChannelRef = useRef<any>(null);
-  const codesChannelRef = useRef<any>(null);
+  const invitationsChannelRef = useRef<any>(null);
+  const appStateRef = useRef<AppStateStatus>(AppState.currentState);
+  const updateLocationIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const blankScreenReloadAttemptedRef = useRef<boolean>(false);
+
+  // Create a refresh handler that reloads everything
+  // Note: This is defined early but will call functions defined later
+  // The functions will be available when the callback executes
+  const handleRefresh = useCallback(async (): Promise<void> => {
+    if (!user?.id) {
+      setRefreshing(false);
+      setLoading(false);
+      return;
+    }
+    
+    console.log('🔄 Refreshing connections...');
+    setRefreshing(true);
+    setLoading(true); // Also set main loading state
+    
+    try {
+      // Force reload by clearing existing subscriptions first
+      if (connectionsChannelRef.current) {
+        supabase.removeChannel(connectionsChannelRef.current);
+        connectionsChannelRef.current = null;
+      }
+      if (usersChannelRef.current) {
+        supabase.removeChannel(usersChannelRef.current);
+        usersChannelRef.current = null;
+      }
+      if (invitationsChannelRef.current) {
+        supabase.removeChannel(invitationsChannelRef.current);
+        invitationsChannelRef.current = null;
+      }
+      
+      // Reload connections and invitations in parallel
+      await Promise.all([
+        loadConnections(),
+        loadPendingInvitations(),
+      ]);
+      
+      // Re-establish subscriptions after a small delay to ensure cleanup is complete
+      setTimeout(() => {
+        setupConnectionsRealtimeSubscription();
+        setupInvitationsRealtimeSubscription();
+      }, 100);
+      
+      // Update location if sharing is enabled
+      if (locationSharingEnabled) {
+        updateConnectionsLocation();
+      }
+    } catch (error) {
+      console.error('❌ Error refreshing connections:', error);
+      // Ensure loading state is cleared even on error
+      setLoading(false);
+    } finally {
+      setRefreshing(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id, locationSharingEnabled]);
+
+  // Handle app state changes (foreground/background)
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (nextAppState) => {
+      if (
+        appStateRef.current.match(/inactive|background/) &&
+        nextAppState === 'active' &&
+        user?.id
+      ) {
+        // App has come to the foreground - reload connections and re-establish subscriptions
+        console.log('App came to foreground, reloading connections...');
+        handleRefresh();
+      }
+      appStateRef.current = nextAppState;
+    });
+
+    return () => {
+      subscription.remove();
+    };
+  }, [user?.id, handleRefresh]);
+
+  // Reload connections when screen comes into focus (e.g., after device unlock)
+  useFocusEffect(
+    useCallback(() => {
+      if (user?.id) {
+        console.log('ConnectionScreen focused, reloading connections...');
+        handleRefresh();
+      }
+    }, [user?.id, handleRefresh])
+  );
 
   useEffect(() => {
-    if (!user?.id) return;
+    if (!user?.id) {
+      setLoading(false);
+      return;
+    }
 
     // Initial load
     loadConnections();
-    loadMyCode();
     
     // Update location immediately if sharing is enabled, then periodically
     if (locationSharingEnabled) {
@@ -68,18 +166,22 @@ export default function ConnectionScreen({ navigation }: ConnectionScreenProps) 
     }
     
     // Update location for connections periodically (only if sharing is enabled)
-    const updateLocationInterval = setInterval(() => {
+    updateLocationIntervalRef.current = setInterval(() => {
       if (locationSharingEnabled) {
         updateConnectionsLocation();
       }
-    }, 5 * 60 * 1000); // Update every 5 minutes
+    }, 45 * 60 * 1000); // Update every 45 minutes
 
-    // Set up real-time subscriptions for connections and codes
+    // Set up real-time subscriptions for connections
     setupConnectionsRealtimeSubscription();
-    setupCodesRealtimeSubscription();
+    loadPendingInvitations();
+    setupInvitationsRealtimeSubscription();
 
     return () => {
-      clearInterval(updateLocationInterval);
+      if (updateLocationIntervalRef.current) {
+        clearInterval(updateLocationIntervalRef.current);
+        updateLocationIntervalRef.current = null;
+      }
       // Cleanup real-time subscriptions
       if (connectionsChannelRef.current) {
         supabase.removeChannel(connectionsChannelRef.current);
@@ -89,28 +191,132 @@ export default function ConnectionScreen({ navigation }: ConnectionScreenProps) 
         supabase.removeChannel(usersChannelRef.current);
         usersChannelRef.current = null;
       }
-      if (codesChannelRef.current) {
-        supabase.removeChannel(codesChannelRef.current);
-        codesChannelRef.current = null;
+      if (invitationsChannelRef.current) {
+        supabase.removeChannel(invitationsChannelRef.current);
+        invitationsChannelRef.current = null;
       }
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.id, locationSharingEnabled]);
+
+  // Safety check: If screen is blank (not loading, no connections, but user exists), reload
+  useEffect(() => {
+    if (user?.id && !loading && connections.length === 0 && !refreshing && !blankScreenReloadAttemptedRef.current) {
+      // Small delay to avoid race conditions, then check again
+      const timeoutId = setTimeout(() => {
+        if (user?.id && !loading && connections.length === 0 && !blankScreenReloadAttemptedRef.current) {
+          console.log('⚠️ Screen appears blank, triggering reload...');
+          blankScreenReloadAttemptedRef.current = true;
+          handleRefresh().finally(() => {
+            // Reset after reload completes
+            setTimeout(() => {
+              blankScreenReloadAttemptedRef.current = false;
+            }, 5000);
+          });
+        }
+      }, 2000); // Increased delay to 2 seconds to avoid race conditions
+      
+      return () => clearTimeout(timeoutId);
+    } else if (connections.length > 0) {
+      // Reset flag when connections are loaded
+      blankScreenReloadAttemptedRef.current = false;
+    }
+  }, [user?.id, loading, connections.length, refreshing, handleRefresh]);
 
   const updateConnectionsLocation = async (): Promise<void> => {
     if (!user?.id || !locationSharingEnabled) return;
 
     try {
-      // Check permissions first
+      // Request permissions if needed (important for Android)
       const hasPermission = await locationService.checkPermissions();
       if (!hasPermission) {
-        console.warn('Location permission not granted, skipping location update');
+        console.warn('Location permission not granted, requesting permission...');
+        const permissionResult = await locationService.requestPermissions();
+        if (!permissionResult.granted) {
+          console.warn('Location permission denied:', permissionResult.message);
+          // On Android, show alert if permission is permanently denied
+          if (Platform.OS === 'android' && permissionResult.message && !permissionResult.canAskAgain) {
+            Alert.alert(
+              'Location Permission Required',
+              permissionResult.message || 'Location permission is required to share your location with connections.',
+              [
+                { text: 'Cancel', style: 'cancel' },
+                { 
+                  text: 'Open Settings', 
+                  onPress: () => {
+                    Linking.openSettings().catch((error) => {
+                      console.error('Error opening settings:', error);
+                    });
+                  }
+                },
+              ]
+            );
+          }
+          return;
+        }
+      }
+
+      // Use getCurrentLocation with requestPermissionIfNeeded for Android compatibility
+      // This ensures permissions are requested if needed
+      const currentLocation = await locationService.getCurrentLocation(true);
+      if (!currentLocation) {
+        console.warn('Could not get current location - location may not be available');
+        // On Android, try using getCurrentLocationFast as fallback
+        if (Platform.OS === 'android') {
+          const fastLocation = await locationService.getCurrentLocationFast(true, true);
+          if (fastLocation) {
+            // Always force geocoding to get actual address
+            const geocodedAddress = await locationService.getAddressFromCoordinates(
+              fastLocation.latitude,
+              fastLocation.longitude,
+              true // Force geocoding
+            );
+            const address = geocodedAddress || fastLocation.address || null;
+            
+            const batteryLevel = await locationService.getBatteryLevel();
+            const { error } = await supabase
+              .from('connections')
+              .update({
+                location_latitude: fastLocation.latitude,
+                location_longitude: fastLocation.longitude,
+                location_address: address,
+                location_updated_at: new Date().toISOString(),
+                battery_level: batteryLevel,
+              })
+              .eq('connected_user_id', user.id)
+              .eq('status', 'connected')
+              .eq('location_sharing_enabled', true); // Only update connections where location sharing is enabled
+
+            if (error) {
+              console.error('Error updating connection location (fast mode):', error);
+            } else {
+              // Notify location service that update was made (for blocking logic)
+              locationService.notifyLocationUpdated(fastLocation);
+              console.log('Location updated successfully (fast mode) with address:', address ? 'yes' : 'no');
+            }
+          }
+        }
         return;
       }
 
-      const currentLocation = await locationService.getCurrentLocation();
-      if (!currentLocation) {
-        console.warn('Could not get current location');
+      // Check if location update should be blocked (user stationary for 1+ hour within 30m)
+      if (locationService.shouldBlockLocationUpdate(currentLocation)) {
+        if (__DEV__) {
+          console.log('Skipping connection location update - user stationary for 1+ hour');
+        }
         return;
+      }
+
+      // Always force geocoding to get actual address
+      const geocodedAddress = await locationService.getAddressFromCoordinates(
+        currentLocation.latitude,
+        currentLocation.longitude,
+        true // Force geocoding
+      );
+      const address = geocodedAddress || currentLocation.address || null;
+      // Update location object with address
+      if (address) {
+        currentLocation.address = address;
       }
 
       // Get current battery level
@@ -118,218 +324,97 @@ export default function ConnectionScreen({ navigation }: ConnectionScreenProps) 
 
       // Update location for all connections where this user is the connected user
       // (i.e., update the location that others see)
-      const { error } = await supabase
+      // Only update connections where location_sharing_enabled is true
+      const locationUpdatedAt = new Date().toISOString();
+      const { data, error } = await supabase
         .from('connections')
         .update({
           location_latitude: currentLocation.latitude,
           location_longitude: currentLocation.longitude,
           location_address: currentLocation.address || null,
-          location_updated_at: new Date().toISOString(),
+          location_updated_at: locationUpdatedAt,
           battery_level: batteryLevel,
         })
         .eq('connected_user_id', user.id)
-        .eq('status', 'connected');
+        .eq('status', 'connected')
+        .eq('location_sharing_enabled', true) // Only update connections where location sharing is enabled
+        .select('id, user_id'); // Select to verify update succeeded and get user_id for reverse update
 
       if (error) {
         console.error('Error updating connection location:', error);
+        // On Android, log more details for debugging
+        if (Platform.OS === 'android') {
+          console.error('Android location update error:', {
+            errorCode: error.code,
+            errorMessage: error.message,
+            errorDetails: error.details,
+            userId: user.id,
+            location: {
+              lat: currentLocation.latitude,
+              lng: currentLocation.longitude,
+            },
+          });
+        }
       } else {
-        // Refresh connections to update UI with new location
-        loadConnections();
+        const updatedCount = data?.length || 0;
+        console.log(`Location updated successfully (${updatedCount} connection(s)):`, {
+          lat: currentLocation.latitude.toFixed(6),
+          lng: currentLocation.longitude.toFixed(6),
+          hasAddress: !!currentLocation.address,
+          updatedAt: locationUpdatedAt,
+          platform: Platform.OS,
+        });
+        
+        // Verify update on Android
+        if (Platform.OS === 'android' && updatedCount === 0) {
+          console.warn('⚠️ Location update returned 0 rows - connection may not exist or query failed');
+        } else if (updatedCount > 0) {
+          // Notify location service that update was made (for blocking logic)
+          locationService.notifyLocationUpdated(currentLocation);
+          
+          // Also update the reverse connections (where this user is the main user)
+          // This ensures both sides of the connection have location data
+          // We update where user_id = current user.id and connected_user_id = the other user
+          // This updates the location that the current user sees for their connections
+          try {
+            const { error: reverseError } = await supabase
+              .from('connections')
+              .update({
+                location_latitude: currentLocation.latitude,
+                location_longitude: currentLocation.longitude,
+                location_address: currentLocation.address || null,
+                location_updated_at: locationUpdatedAt,
+                battery_level: batteryLevel,
+              })
+              .eq('user_id', user.id)
+              .eq('status', 'connected')
+              .is('location_latitude', null); // Only update if location is null (initial update)
+            
+            if (reverseError) {
+              console.warn('Warning: Could not update reverse connection location:', reverseError);
+            } else {
+              console.log('✅ Reverse connection location updated (if needed)');
+            }
+          } catch (reverseUpdateError) {
+            console.warn('Warning: Error updating reverse connection location:', reverseUpdateError);
+            // Don't fail the main update if reverse update fails
+          }
+        }
       }
+      // Real-time subscription will automatically update the UI when location is updated
+      // No need to manually reload - real-time will handle it
     } catch (error) {
       console.error('Error in updateConnectionsLocation:', error);
-    }
-  };
-
-  const loadMyCode = async (): Promise<void> => {
-    if (!user?.id) return;
-
-    try {
-      const { data, error } = await supabase
-        .from('connection_codes')
-        .select('code, expires_at')
-        .eq('user_id', user.id)
-        .eq('is_used', false)
-        .gt('expires_at', new Date().toISOString())
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .single();
-
-      if (error && error.code !== 'PGRST116') {
-        console.error('Error loading code:', error);
-        return;
-      }
-
-      if (data) {
-        setMyCode(data.code);
-      }
-    } catch (error) {
-      console.error('Error in loadMyCode:', error);
-    }
-  };
-
-  const generateCode = async (): Promise<void> => {
-    if (!user?.id) return;
-
-    try {
-      setGeneratingCode(true);
-      const code = Math.floor(100000 + Math.random() * 900000).toString();
-      const expiresAt = new Date();
-      expiresAt.setHours(expiresAt.getHours() + 1);
-
-      await supabase
-        .from('connection_codes')
-        .update({ is_used: true })
-        .eq('user_id', user.id)
-        .eq('is_used', false)
-        .gt('expires_at', new Date().toISOString());
-
-      const { error } = await supabase
-        .from('connection_codes')
-        .insert({
-          user_id: user.id,
-          code: code,
-          expires_at: expiresAt.toISOString(),
-          is_used: false,
+      // On Android, log more details for debugging
+      if (Platform.OS === 'android' && __DEV__) {
+        console.error('Android location update error details:', {
+          error: error instanceof Error ? error.message : String(error),
+          stack: error instanceof Error ? error.stack : undefined,
         });
-
-      if (error) {
-        console.error('Error generating code:', error);
-        Alert.alert('Error', 'Failed to generate code. Please try again.');
-        return;
       }
-
-      setMyCode(code);
-    } catch (error) {
-      console.error('Error in generateCode:', error);
-      Alert.alert('Error', 'Failed to generate code. Please try again.');
-    } finally {
-      setGeneratingCode(false);
     }
   };
 
-  const copyCodeToClipboard = async (): Promise<void> => {
-    if (myCode) {
-      await Clipboard.setStringAsync(myCode);
-      Alert.alert('Copied!', 'Connection code copied to clipboard.');
-    }
-  };
-
-  const validateAndConnect = async (): Promise<void> => {
-    if (!codeInput.trim() || !user?.id) {
-      Alert.alert('Invalid Code', 'Please enter a 6-digit code.');
-      return;
-    }
-
-    if (codeInput.length !== 6 || !/^\d{6}$/.test(codeInput)) {
-      Alert.alert('Invalid Code', 'Code must be exactly 6 digits.');
-      return;
-    }
-
-    try {
-      setValidatingCode(true);
-
-      const { data: codeData, error: codeError } = await supabase
-        .from('connection_codes')
-        .select('*')
-        .eq('code', codeInput)
-        .eq('is_used', false)
-        .gt('expires_at', new Date().toISOString())
-        .single();
-
-      if (codeError || !codeData) {
-        Alert.alert('Invalid Code', 'This code is invalid or has expired.');
-        setCodeInput('');
-        return;
-      }
-
-      if (codeData.user_id === user.id) {
-        Alert.alert('Invalid Code', 'You cannot connect to yourself.');
-        setCodeInput('');
-        return;
-      }
-
-      const { data: targetUser, error: userError } = await supabase
-        .from('users')
-        .select('id, name, email, phone, photo')
-        .eq('id', codeData.user_id)
-        .single();
-
-      if (userError || !targetUser) {
-        Alert.alert('Error', 'User not found.');
-        setCodeInput('');
-        return;
-      }
-
-      const { data: existingConnection } = await supabase
-        .from('connections')
-        .select('id')
-        .eq('user_id', user.id)
-        .eq('connected_user_id', targetUser.id)
-        .single();
-
-      if (existingConnection) {
-        Alert.alert('Already Connected', 'You are already connected to this user.');
-        await supabase
-          .from('connection_codes')
-          .update({ is_used: true, used_by_user_id: user.id })
-          .eq('id', codeData.id);
-        setCodeInput('');
-        return;
-      }
-
-      // Get current location if available
-      let locationData: any = {};
-      try {
-        const currentLocation = await locationService.getCurrentLocation();
-        if (currentLocation) {
-          locationData = {
-            location_latitude: currentLocation.latitude,
-            location_longitude: currentLocation.longitude,
-            location_address: currentLocation.address || null,
-            location_updated_at: new Date().toISOString(),
-          };
-        }
-      } catch (locationError) {
-        console.warn('Could not get location for connection:', locationError);
-        // Continue without location
-      }
-
-      const { error: connectError } = await supabase
-        .from('connections')
-        .insert({
-          user_id: user.id,
-          connected_user_id: targetUser.id,
-          connected_user_name: targetUser.name,
-          connected_user_email: targetUser.email,
-          connected_user_phone: targetUser.phone || '',
-          connected_user_photo: targetUser.photo,
-          status: 'connected',
-          ...locationData,
-        });
-
-      if (connectError) {
-        console.error('Error creating connection:', connectError);
-        Alert.alert('Error', 'Failed to connect. Please try again.');
-        return;
-      }
-
-      await supabase
-        .from('connection_codes')
-        .update({ is_used: true, used_by_user_id: user.id })
-        .eq('id', codeData.id);
-
-      // Real-time subscription will automatically update connections
-      setCodeInput('');
-      setShowEnterCodeModal(false);
-      Alert.alert('Connected!', `You are now connected to ${targetUser.name}.`);
-    } catch (error) {
-      console.error('Error in validateAndConnect:', error);
-      Alert.alert('Error', 'Failed to connect. Please try again.');
-    } finally {
-      setValidatingCode(false);
-    }
-  };
 
   const setupConnectionsRealtimeSubscription = (): void => {
     if (!user?.id) return;
@@ -353,10 +438,56 @@ export default function ConnectionScreen({ navigation }: ConnectionScreenProps) 
           table: 'connections',
           filter: `user_id=eq.${user.id}`,
         },
-        (payload) => {
-          console.log('Connection change detected:', payload.eventType);
-          // Reload connections when changes occur
-          loadConnections();
+        async (payload) => {
+          console.log('Connection change detected:', payload.eventType, payload.new || payload.old);
+          
+          if (payload.eventType === 'DELETE') {
+            console.log('Connection deleted via real-time:', payload.old?.id);
+            // Update state directly - remove deleted connection
+            setConnections((prev) => prev.filter((conn) => conn.id !== payload.old?.id));
+            // Refresh connections to ensure all data is current
+            setTimeout(() => {
+              loadConnections();
+            }, 300);
+          } else if (payload.eventType === 'INSERT') {
+            console.log('New connection added via real-time:', payload.new?.id);
+            // Reload to get full connection data with user details
+            loadConnections().then(() => {
+              // After loading, automatically update location for the new connection
+              // This ensures the connection shows as online with location immediately
+              if (locationSharingEnabled) {
+                // Small delay to ensure connection is fully loaded
+                setTimeout(() => {
+                  updateConnectionsLocation();
+                }, 500);
+              }
+            });
+          } else if (payload.eventType === 'UPDATE') {
+            console.log('Connection updated via real-time:', payload.new?.id);
+            // Update state directly for location updates and location sharing settings
+            if (payload.new) {
+              setConnections((prev) =>
+                prev.map((conn) =>
+                  conn.id === payload.new.id
+                    ? {
+                        ...conn,
+                        location: payload.new.location_latitude && payload.new.location_longitude
+                          ? {
+                              latitude: payload.new.location_latitude,
+                              longitude: payload.new.location_longitude,
+                              address: payload.new.location_address || undefined,
+                            }
+                          : null,
+                        locationUpdatedAt: payload.new.location_updated_at || null,
+                        locationSharingEnabled: payload.new.location_sharing_enabled !== undefined 
+                          ? payload.new.location_sharing_enabled 
+                          : conn.locationSharingEnabled ?? true,
+                      }
+                    : conn
+                )
+              );
+            }
+          }
         }
       )
       .on(
@@ -368,12 +499,58 @@ export default function ConnectionScreen({ navigation }: ConnectionScreenProps) 
           filter: `connected_user_id=eq.${user.id}`,
         },
         (payload) => {
-          console.log('Location update detected from connected user');
-          // Reload connections to get updated location
-          loadConnections();
+          console.log('Location update detected from connected user via real-time:', payload.new?.id);
+          // Update state directly with new location data and location sharing settings
+          if (payload.new) {
+            setConnections((prev) =>
+              prev.map((conn) =>
+                conn.connectedUserId === payload.new.connected_user_id
+                  ? {
+                      ...conn,
+                      location: payload.new.location_latitude && payload.new.location_longitude
+                        ? {
+                            latitude: payload.new.location_latitude,
+                            longitude: payload.new.location_longitude,
+                            address: payload.new.location_address || undefined,
+                          }
+                        : null,
+                      locationUpdatedAt: payload.new.location_updated_at || null,
+                      locationSharingEnabled: payload.new.location_sharing_enabled !== undefined 
+                        ? payload.new.location_sharing_enabled 
+                        : conn.locationSharingEnabled ?? true,
+                    }
+                  : conn
+              )
+            );
+          }
         }
       )
-      .subscribe();
+      .on(
+        'postgres_changes',
+        {
+          event: 'DELETE',
+          schema: 'public',
+          table: 'connections',
+          filter: `connected_user_id=eq.${user.id}`,
+        },
+        (payload) => {
+          console.log('Connection deleted by other user via real-time:', payload.old?.id);
+          // When the other user removes their connection to us, update state directly
+          // This handles cases where the other user removes the connection from their side
+          setConnections((prev) => prev.filter((conn) => conn.connectedUserId !== payload.old?.user_id));
+          // Refresh connections to ensure all data is current
+          setTimeout(() => {
+            loadConnections();
+          }, 300);
+        }
+      )
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') {
+          console.log('✅ Successfully subscribed to connections real-time updates');
+        } else if (status === 'CHANNEL_ERROR') {
+          console.error('❌ Error subscribing to connections real-time updates');
+        }
+      });
 
     connectionsChannelRef.current = connectionsChannel;
   };
@@ -399,49 +576,796 @@ export default function ConnectionScreen({ navigation }: ConnectionScreenProps) 
           filter: `id=in.(${connectedUserIds.join(',')})`,
         },
         (payload) => {
-          console.log('User lock status change detected');
-          // Reload connections to update lock status
-          loadConnections();
+          console.log('User lock status change detected via real-time:', payload.new?.id);
+          // Update lock status directly in connections state
+          if (payload.new) {
+            setConnections((prev) =>
+              prev.map((conn) =>
+                conn.connectedUserId === payload.new.id
+                  ? { ...conn, isLocked: payload.new.is_locked || false }
+                  : conn
+              )
+            );
+          }
         }
       )
-      .subscribe();
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') {
+          console.log('✅ Successfully subscribed to users real-time updates');
+        } else if (status === 'CHANNEL_ERROR') {
+          console.error('❌ Error subscribing to users real-time updates');
+        }
+      });
 
     usersChannelRef.current = usersChannel;
   };
 
-  const setupCodesRealtimeSubscription = (): void => {
-    if (!user?.id) return;
+
+  const loadPendingInvitations = async (): Promise<void> => {
+    if (!user?.id || !user?.phone) return;
+
+    try {
+      setLoadingInvitations(true);
+      // Normalize user phone for comparison
+      const normalizedUserPhone = user.phone.replace(/[\s\-\(\)]/g, '');
+      
+      // Get all pending invitations and filter by normalized phone
+      const { data, error } = await supabase
+        .from('connection_invitations')
+        .select('*')
+        .eq('status', 'pending')
+        .gt('expires_at', new Date().toISOString())
+        .order('created_at', { ascending: false });
+
+      if (error) {
+        console.error('Error loading pending invitations:', error);
+        return;
+      }
+
+      if (data) {
+        // Filter by normalized phone number
+        const filteredData = data.filter((inv) => {
+          if (!inv.invitee_phone) return false;
+          const normalizedInviteePhone = inv.invitee_phone.replace(/[\s\-\(\)]/g, '');
+          return normalizedInviteePhone === normalizedUserPhone;
+        });
+
+        const formattedInvitations: ConnectionInvitation[] = filteredData.map((inv) => ({
+          id: inv.id,
+          inviterUserId: inv.inviter_user_id,
+          inviterName: inv.inviter_name,
+          inviterPhone: inv.inviter_phone,
+          inviterEmail: inv.inviter_email,
+          inviterPhoto: inv.inviter_photo,
+          inviteePhone: inv.invitee_phone,
+          status: inv.status,
+          expiresAt: inv.expires_at,
+          acceptedAt: inv.accepted_at,
+          createdAt: inv.created_at,
+          updatedAt: inv.updated_at,
+        }));
+        setPendingInvitations(formattedInvitations);
+      }
+    } catch (error) {
+      console.error('Error in loadPendingInvitations:', error);
+    } finally {
+      setLoadingInvitations(false);
+    }
+  };
+
+  const setupInvitationsRealtimeSubscription = (): void => {
+    if (!user?.id || !user?.phone) return;
 
     // Remove existing subscription if any
-    if (codesChannelRef.current) {
-      supabase.removeChannel(codesChannelRef.current);
-      codesChannelRef.current = null;
+    if (invitationsChannelRef.current) {
+      supabase.removeChannel(invitationsChannelRef.current);
+      invitationsChannelRef.current = null;
     }
 
-    // Subscribe to connection_codes table changes (for code generation/usage)
-    const codesChannel = supabase
-      .channel(`connection_screen_codes:${user.id}`)
+    // Subscribe to connection_invitations table changes
+    // Note: We subscribe to all invitations and filter by normalized phone in the handler
+    // because Supabase real-time filters don't support complex phone number matching
+    const invitationsChannel = supabase
+      .channel(`connection_screen_invitations:${user.id}`)
       .on(
         'postgres_changes',
         {
-          event: '*',
+          event: 'INSERT',
           schema: 'public',
-          table: 'connection_codes',
-          filter: `user_id=eq.${user.id}`,
+          table: 'connection_invitations',
         },
-        (payload) => {
-          console.log('Connection code change detected:', payload.eventType);
-          // Reload code when changes occur
-          loadMyCode();
+        async (payload) => {
+          const newInvitation = payload.new;
+          if (!newInvitation) return;
+
+          // Normalize phone numbers for comparison
+          const normalizedUserPhone = user.phone?.replace(/\D/g, '') || '';
+          const normalizedInviteePhone = newInvitation.invitee_phone?.replace(/\D/g, '') || '';
+
+          // Check if this invitation is for the current user
+          if (normalizedInviteePhone === normalizedUserPhone && newInvitation.status === 'pending') {
+            console.log('New invitation received for current user:', newInvitation.id);
+            
+            // Check if notification was already sent to prevent duplicates
+            // Check if a notification already exists for this invitation (created within last 5 seconds)
+            const fiveSecondsAgo = new Date(Date.now() - 5000).toISOString();
+            const { data: existingNotification } = await supabase
+              .from('notifications')
+              .select('id, created_at')
+              .eq('user_id', user.id)
+              .eq('type', 'connection_added')
+              .eq('title', 'Connection Invitation')
+              .contains('data', { 
+                type: 'connection_invitation',
+                inviterUserId: newInvitation.inviter_user_id 
+              })
+              .gte('created_at', fiveSecondsAgo)
+              .limit(1)
+              .maybeSingle();
+
+            // Notifications removed - invitation data is still tracked
+            
+            // Update invitations state directly from real-time payload
+            const formattedInvitation: ConnectionInvitation = {
+              id: newInvitation.id,
+              inviterUserId: newInvitation.inviter_user_id,
+              inviterName: newInvitation.inviter_name,
+              inviterPhone: newInvitation.inviter_phone,
+              inviterEmail: newInvitation.inviter_email,
+              inviterPhoto: newInvitation.inviter_photo,
+              inviteePhone: newInvitation.invitee_phone,
+              status: newInvitation.status,
+              expiresAt: newInvitation.expires_at,
+              acceptedAt: newInvitation.accepted_at,
+              createdAt: newInvitation.created_at,
+              updatedAt: newInvitation.updated_at,
+            };
+            setPendingInvitations((prev) => [formattedInvitation, ...prev]);
+          }
         }
       )
-      .subscribe();
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'connection_invitations',
+        },
+        (payload) => {
+          const updatedInvitation = payload.new;
+          const oldInvitation = payload.old;
+          if (!updatedInvitation) return;
 
-    codesChannelRef.current = codesChannel;
+          // Normalize phone numbers for comparison
+          const normalizedUserPhone = user.phone?.replace(/\D/g, '') || '';
+          const normalizedInviteePhone = updatedInvitation.invitee_phone?.replace(/\D/g, '') || '';
+
+          // Check if this invitation is for the current user or sent by the current user
+          if (normalizedInviteePhone === normalizedUserPhone || updatedInvitation.inviter_user_id === user.id) {
+            console.log('Invitation update detected:', payload.eventType);
+            
+            // If invitation was accepted, connection will be created and real-time will handle it
+            if (updatedInvitation.status === 'accepted' && oldInvitation?.status === 'pending') {
+              console.log('Invitation accepted via real-time, connection will be created automatically');
+              // Real-time subscription for connections will automatically update when connection is created
+            }
+            
+            // Update invitations state directly from real-time payload
+            if (updatedInvitation.status === 'rejected' || updatedInvitation.status === 'accepted') {
+              // Remove from pending invitations
+              setPendingInvitations((prev) => prev.filter((inv) => inv.id !== updatedInvitation.id));
+            } else if (updatedInvitation.status === 'pending') {
+              // Update existing invitation or add if new
+              const formattedInvitation: ConnectionInvitation = {
+                id: updatedInvitation.id,
+                inviterUserId: updatedInvitation.inviter_user_id,
+                inviterName: updatedInvitation.inviter_name,
+                inviterPhone: updatedInvitation.inviter_phone,
+                inviterEmail: updatedInvitation.inviter_email,
+                inviterPhoto: updatedInvitation.inviter_photo,
+                inviteePhone: updatedInvitation.invitee_phone,
+                status: updatedInvitation.status,
+                expiresAt: updatedInvitation.expires_at,
+                acceptedAt: updatedInvitation.accepted_at,
+                createdAt: updatedInvitation.created_at,
+                updatedAt: updatedInvitation.updated_at,
+              };
+              setPendingInvitations((prev) => {
+                const existingIndex = prev.findIndex((inv) => inv.id === formattedInvitation.id);
+                if (existingIndex >= 0) {
+                  const updated = [...prev];
+                  updated[existingIndex] = formattedInvitation;
+                  return updated;
+                }
+                return [formattedInvitation, ...prev];
+              });
+            }
+          }
+        }
+      )
+      .on(
+        'postgres_changes',
+        {
+          event: 'DELETE',
+          schema: 'public',
+          table: 'connection_invitations',
+        },
+        (payload) => {
+          const deletedInvitation = payload.old;
+          if (!deletedInvitation) return;
+
+          // Normalize phone numbers for comparison
+          const normalizedUserPhone = user.phone?.replace(/\D/g, '') || '';
+          const normalizedInviteePhone = deletedInvitation.invitee_phone?.replace(/\D/g, '') || '';
+
+          // Check if this invitation was for the current user or sent by the current user
+          if (normalizedInviteePhone === normalizedUserPhone || deletedInvitation.inviter_user_id === user.id) {
+            console.log('Invitation deleted via real-time:', deletedInvitation.id);
+            // Update state directly - remove deleted invitation
+            setPendingInvitations((prev) => prev.filter((inv) => inv.id !== deletedInvitation.id));
+          }
+        }
+      )
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') {
+          console.log('✅ Successfully subscribed to invitations real-time updates');
+        } else if (status === 'CHANNEL_ERROR') {
+          console.error('❌ Error subscribing to invitations real-time updates');
+        }
+      });
+
+    invitationsChannelRef.current = invitationsChannel;
+  };
+
+  const formatPhoneNumber = (text: string): string => {
+    // Remove all non-digit characters
+    const digitsOnly = text.replace(/\D/g, '');
+    
+    // Limit to 11 digits
+    if (digitsOnly.length > 11) {
+      return digitsOnly.slice(0, 11);
+    }
+    
+    return digitsOnly;
+  };
+
+  const sendInvitationByPhone = async (): Promise<void> => {
+    if (!user?.id || !phoneInput.trim()) {
+      Alert.alert('Invalid Input', 'Please enter a phone number.');
+      return;
+    }
+
+    // Normalize phone number (remove all non-digit characters)
+    const normalizedPhone = phoneInput.replace(/\D/g, '');
+
+    if (normalizedPhone.length !== 11) {
+      Alert.alert('Invalid Phone', 'Please enter an 11-digit phone number.');
+      return;
+    }
+
+    // Check if trying to invite self
+    if (user.phone && normalizedPhone === user.phone.replace(/[\s\-\(\)]/g, '')) {
+      Alert.alert('Invalid Phone', 'You cannot invite yourself.');
+      setPhoneInput('');
+      return;
+    }
+
+    try {
+      setSendingInvitation(true);
+
+      // Check if phone number exists in users table
+      // Try exact match first, then try with different formats
+      let existingUser = null;
+      let userError = null;
+
+      // Try exact match
+      const { data: exactMatch, error: exactError } = await supabase
+        .from('users')
+        .select('id, name, email, phone')
+        .eq('phone', normalizedPhone)
+        .maybeSingle();
+
+      if (exactMatch) {
+        existingUser = exactMatch;
+      } else if (exactError && exactError.code !== 'PGRST116') {
+        userError = exactError;
+      } else {
+        // Try with common formats (with spaces, dashes, etc.)
+        const formats = [
+          normalizedPhone,
+          normalizedPhone.replace(/(\d{3})(\d{3})(\d{4})/, '($1) $2-$3'),
+          normalizedPhone.replace(/(\d{3})(\d{3})(\d{4})/, '$1-$2-$3'),
+          normalizedPhone.replace(/(\d{3})(\d{3})(\d{4})/, '$1 $2 $3'),
+        ];
+
+        for (const format of formats) {
+          const { data: formatMatch } = await supabase
+            .from('users')
+            .select('id, name, email, phone')
+            .eq('phone', format)
+            .maybeSingle();
+
+          if (formatMatch) {
+            existingUser = formatMatch;
+            break;
+          }
+        }
+      }
+
+      if (userError) {
+        console.error('Error checking user:', userError);
+        Alert.alert('Error', 'Failed to check phone number. Please try again.');
+        return;
+      }
+
+      if (!existingUser) {
+        // Phone number doesn't exist - show error message
+        Alert.alert(
+          'User Not Found',
+          'This phone number is not registered on the app. Please ask them to download the app first to accept your invitation.',
+          [{ text: 'OK' }]
+        );
+        setPhoneInput('');
+        return;
+      }
+
+      // Check if already connected
+      const { data: existingConnection } = await supabase
+        .from('connections')
+        .select('id')
+        .eq('user_id', user.id)
+        .eq('connected_user_id', existingUser.id)
+        .single();
+
+      if (existingConnection) {
+        Alert.alert('Already Connected', 'You are already connected to this user.');
+        setPhoneInput('');
+        setShowInviteByPhoneModal(false);
+        return;
+      }
+
+      // Check if there's already a pending invitation
+      const { data: existingInvitation } = await supabase
+        .from('connection_invitations')
+        .select('id')
+        .eq('inviter_user_id', user.id)
+        .eq('invitee_phone', normalizedPhone)
+        .eq('status', 'pending')
+        .gt('expires_at', new Date().toISOString())
+        .single();
+
+      if (existingInvitation) {
+        Alert.alert('Invitation Sent', 'You have already sent an invitation to this phone number.');
+        setPhoneInput('');
+        setShowInviteByPhoneModal(false);
+        return;
+      }
+
+      // Create invitation (expires in 7 days)
+      const expiresAt = new Date();
+      expiresAt.setDate(expiresAt.getDate() + 7);
+
+      const { error: inviteError } = await supabase
+        .from('connection_invitations')
+        .insert({
+          inviter_user_id: user.id,
+          inviter_name: user.name,
+          inviter_phone: user.phone,
+          inviter_email: user.email,
+          inviter_photo: user.photo,
+          invitee_phone: normalizedPhone,
+          status: 'pending',
+          expires_at: expiresAt.toISOString(),
+        });
+
+      if (inviteError) {
+        console.error('Error sending invitation:', inviteError);
+        Alert.alert('Error', 'Failed to send invitation. Please try again.');
+        return;
+      }
+
+      // Check if a notification already exists for this invitation (to prevent duplicates)
+      const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+      const { data: existingNotification } = await supabase
+        .from('notifications')
+        .select('id')
+        .eq('user_id', existingUser.id)
+        .eq('type', 'connection_added')
+        .eq('title', 'Connection Invitation')
+        .contains('data', {
+          type: 'connection_invitation',
+          inviterUserId: user.id,
+        })
+        .gte('created_at', fiveMinutesAgo)
+        .limit(1)
+        .maybeSingle();
+
+      // Only create notification if one doesn't already exist
+      if (!existingNotification) {
+        // Create notification for the invitee in database
+        const notificationTitle = 'Connection Invitation';
+        const notificationBody = `${user.name} wants to connect with you`;
+        
+        await supabase
+          .from('notifications')
+          .insert({
+            user_id: existingUser.id,
+            title: notificationTitle,
+            body: notificationBody,
+            type: 'connection_added',
+            data: {
+              type: 'connection_invitation',
+              inviterUserId: user.id,
+              inviterName: user.name,
+            },
+          });
+
+        // Send push notification to the invitee
+        try {
+          const { data: pushResult, error: pushError } = await supabase.functions.invoke(
+            'send-push-notification',
+            {
+              body: {
+                user_ids: [existingUser.id],
+                title: notificationTitle,
+                body: notificationBody,
+                data: {
+                  type: 'connection_invitation',
+                  inviterUserId: user.id,
+                  inviterName: user.name,
+                  timestamp: new Date().toISOString(),
+                },
+              },
+            }
+          );
+
+          if (pushError) {
+            console.error('Error sending connection request push notification:', pushError);
+            // Don't fail the invitation if push notification fails
+          } else if (pushResult) {
+            const sentCount = pushResult.sent || 0;
+            if (sentCount > 0) {
+              console.log(`✅ Connection request push notification sent to ${existingUser.name}`);
+            } else {
+              console.log(`ℹ️ Connection request push notification: ${pushResult.message || 'No push token found'}`);
+            }
+          }
+        } catch (pushError: any) {
+          console.error('Exception sending connection request push notification:', pushError);
+          // Don't fail the invitation if push notification fails
+        }
+      }
+
+      Alert.alert('Invitation Sent', `Invitation sent to ${normalizedPhone}. They will receive a notification.`);
+      setPhoneInput('');
+      setShowInviteByPhoneModal(false);
+      // Real-time subscription will automatically update invitations for the recipient
+      // No need to manually reload
+    } catch (error) {
+      console.error('Error in sendInvitationByPhone:', error);
+      Alert.alert('Error', 'Failed to send invitation. Please try again.');
+    } finally {
+      setSendingInvitation(false);
+    }
+  };
+
+  const acceptInvitation = async (invitationId: string): Promise<void> => {
+    if (!user?.id) return;
+
+    try {
+      // Call the database function to accept invitation
+      // This will create a connection and update the invitation status
+      // Real-time subscriptions will automatically update the UI
+      const { data, error } = await supabase.rpc('accept_connection_invitation', {
+        p_invitation_id: invitationId,
+        p_invitee_user_id: user.id,
+      });
+
+      if (error) {
+        console.error('Error accepting invitation:', error);
+        Alert.alert('Error', 'Failed to accept invitation. Please try again.');
+        return;
+      }
+
+      if (data && data.length > 0) {
+        const result = data[0];
+        if (result.success) {
+          // Send push notification to the inviter that their invitation was accepted
+          try {
+            // Get inviter user ID from the invitation
+            const { data: invitationData } = await supabase
+              .from('connection_invitations')
+              .select('inviter_user_id')
+              .eq('id', invitationId)
+              .single();
+
+            if (invitationData?.inviter_user_id) {
+              const { data: pushResult, error: pushError } = await supabase.functions.invoke(
+                'send-push-notification',
+                {
+                  body: {
+                    user_ids: [invitationData.inviter_user_id],
+                    title: 'Connection Accepted',
+                    body: `${user?.name || 'Someone'} accepted your connection invitation`,
+                    data: {
+                      type: 'connection_added',
+                      connectionId: result.connection_id,
+                      timestamp: new Date().toISOString(),
+                    },
+                  },
+                }
+              );
+
+              if (pushError) {
+                console.error('Error sending connection accepted push notification:', pushError);
+              } else if (pushResult?.sent > 0) {
+                console.log('✅ Connection accepted push notification sent');
+              }
+            }
+          } catch (notifError) {
+            console.error('Exception sending connection accepted push notification:', notifError);
+          }
+
+          Alert.alert('Connected!', 'You are now connected.');
+          // Automatically update location when connection is accepted
+          // This ensures the connection shows as online with location immediately
+          if (locationSharingEnabled) {
+            // Small delay to ensure connection is fully created in database
+            setTimeout(() => {
+              updateConnectionsLocation();
+            }, 500);
+          }
+          // Real-time subscriptions will automatically update connections and invitations
+          // No need to manually reload - real-time will handle it
+        } else {
+          Alert.alert('Error', result.message || 'Failed to accept invitation.');
+        }
+      }
+    } catch (error) {
+      console.error('Error in acceptInvitation:', error);
+      Alert.alert('Error', 'Failed to accept invitation. Please try again.');
+    }
+  };
+
+  const rejectInvitation = async (invitationId: string): Promise<void> => {
+    try {
+      // Update invitation status to rejected
+      // Real-time subscription will automatically update the UI
+      const { error } = await supabase
+        .from('connection_invitations')
+        .update({ status: 'rejected' })
+        .eq('id', invitationId);
+
+      if (error) {
+        console.error('Error rejecting invitation:', error);
+        Alert.alert('Error', 'Failed to reject invitation. Please try again.');
+        return;
+      }
+
+      // Real-time subscription will automatically reload pending invitations
+      // No need to manually reload
+    } catch (error) {
+      console.error('Error in rejectInvitation:', error);
+      Alert.alert('Error', 'Failed to reject invitation. Please try again.');
+    }
+  };
+
+  const generateConnectionCode = async (): Promise<void> => {
+    if (!user?.id) return;
+
+    try {
+      setGeneratingCode(true);
+
+      // Generate a 6-digit code
+      const code = Math.floor(100000 + Math.random() * 900000).toString();
+
+      // Set expiration to 24 hours from now
+      const expiresAt = new Date();
+      expiresAt.setHours(expiresAt.getHours() + 24);
+
+      // Invalidate any existing active codes for this user
+      await supabase
+        .from('connection_codes')
+        .update({ is_used: true })
+        .eq('user_id', user.id)
+        .eq('is_used', false)
+        .gt('expires_at', new Date().toISOString());
+
+      // Create new code
+      const { data, error } = await supabase
+        .from('connection_codes')
+        .insert({
+          user_id: user.id,
+          code: code,
+          expires_at: expiresAt.toISOString(),
+          is_used: false,
+        })
+        .select()
+        .single();
+
+      if (error) {
+        console.error('Error generating connection code:', error);
+        Alert.alert('Error', 'Failed to generate connection code. Please try again.');
+        return;
+      }
+
+      setConnectionCode(code);
+      setShowGenerateCodeModal(true);
+    } catch (error) {
+      console.error('Error in generateConnectionCode:', error);
+      Alert.alert('Error', 'Failed to generate connection code. Please try again.');
+    } finally {
+      setGeneratingCode(false);
+    }
+  };
+
+  const connectByCode = async (): Promise<void> => {
+    if (!user?.id || !codeInput.trim()) {
+      Alert.alert('Invalid Input', 'Please enter a connection code.');
+      return;
+    }
+
+    const normalizedCode = codeInput.trim().replace(/\s/g, '');
+
+    if (normalizedCode.length !== 6) {
+      Alert.alert('Invalid Code', 'Please enter a 6-digit connection code.');
+      return;
+    }
+
+    try {
+      setConnectingByCode(true);
+
+      // Find the code
+      const { data: codeData, error: codeError } = await supabase
+        .from('connection_codes')
+        .select('user_id')
+        .eq('code', normalizedCode)
+        .eq('is_used', false)
+        .gt('expires_at', new Date().toISOString())
+        .single();
+
+      if (codeError || !codeData) {
+        Alert.alert('Invalid Code', 'This connection code is invalid or has expired.');
+        setCodeInput('');
+        return;
+      }
+
+      // Get the code owner's details
+      const { data: codeOwner, error: ownerError } = await supabase
+        .from('users')
+        .select('id, name, email, phone, photo')
+        .eq('id', codeData.user_id)
+        .single();
+
+      if (ownerError || !codeOwner) {
+        Alert.alert('Error', 'Code owner not found.');
+        return;
+      }
+
+      // Check if trying to connect to self
+      if (codeOwner.id === user.id) {
+        Alert.alert('Invalid Code', 'You cannot use your own connection code.');
+        setCodeInput('');
+        return;
+      }
+
+      // Check if already connected
+      const { data: existingConnection } = await supabase
+        .from('connections')
+        .select('id')
+        .eq('user_id', user.id)
+        .eq('connected_user_id', codeOwner.id)
+        .single();
+
+      if (existingConnection) {
+        Alert.alert('Already Connected', 'You are already connected to this user.');
+        setCodeInput('');
+        setShowEnterCodeModal(false);
+        return;
+      }
+
+      // Mark code as used
+      await supabase
+        .from('connection_codes')
+        .update({
+          is_used: true,
+          used_by_user_id: user.id,
+        })
+        .eq('id', codeData.id);
+
+      // Create connection (bidirectional connection will be created automatically by trigger)
+      const { error: connectionError } = await supabase
+        .from('connections')
+        .insert({
+          user_id: user.id,
+          connected_user_id: codeOwner.id,
+          connected_user_name: codeOwner.name,
+          connected_user_email: codeOwner.email,
+          connected_user_phone: codeOwner.phone,
+          connected_user_photo: codeOwner.photo,
+          status: 'connected',
+        });
+
+      if (connectionError) {
+        console.error('Error creating connection:', connectionError);
+        Alert.alert('Error', 'Failed to create connection. Please try again.');
+        return;
+      }
+
+      // Send push notification to the code owner that someone used their code
+      try {
+        const { data: pushResult, error: pushError } = await supabase.functions.invoke(
+          'send-push-notification',
+          {
+            body: {
+              user_ids: [codeOwner.id],
+              title: 'New Connection',
+              body: `${user?.name || 'Someone'} connected with you using your connection code`,
+              data: {
+                type: 'connection_added',
+                userId: user.id,
+                userName: user?.name,
+                timestamp: new Date().toISOString(),
+              },
+            },
+          }
+        );
+
+        if (pushError) {
+          console.error('Error sending connection push notification:', pushError);
+        } else if (pushResult?.sent > 0) {
+          console.log('✅ Connection push notification sent to code owner');
+        }
+      } catch (notifError) {
+        console.error('Exception sending connection push notification:', notifError);
+      }
+
+      // Also create in-app notification for code owner
+      try {
+        await supabase.from('notifications').insert({
+          user_id: codeOwner.id,
+          title: 'New Connection',
+          body: `${user?.name || 'Someone'} connected with you using your connection code`,
+          type: 'connection_added',
+          data: {
+            userId: user.id,
+            userName: user?.name,
+          },
+        });
+      } catch (notifError) {
+        console.error('Error creating in-app notification:', notifError);
+      }
+
+      Alert.alert('Connected!', `You are now connected to ${codeOwner.name}.`);
+      setCodeInput('');
+      setShowEnterCodeModal(false);
+
+      // Automatically update location when connection is created via code
+      // This ensures the connection shows as online with location immediately
+      if (locationSharingEnabled) {
+        // Small delay to ensure connection is fully created in database
+        setTimeout(() => {
+          updateConnectionsLocation();
+        }, 500);
+      }
+
+      // Refresh connections
+      setTimeout(() => {
+        loadConnections();
+      }, 500);
+    } catch (error) {
+      console.error('Error in connectByCode:', error);
+      Alert.alert('Error', 'Failed to connect. Please try again.');
+    } finally {
+      setConnectingByCode(false);
+    }
   };
 
   const loadConnections = async (): Promise<void> => {
-    if (!user?.id) return;
+    if (!user?.id) {
+      setLoading(false);
+      return;
+    }
 
     try {
       setLoading(true);
@@ -454,6 +1378,7 @@ export default function ConnectionScreen({ navigation }: ConnectionScreenProps) 
 
       if (error) {
         console.error('Error loading connections:', error);
+        setConnections([]); // Set empty array on error to prevent blank screen
         return;
       }
 
@@ -473,25 +1398,37 @@ export default function ConnectionScreen({ navigation }: ConnectionScreenProps) 
           });
         }
 
-        const formattedConnections: Connection[] = data.map((conn) => ({
-          id: conn.id,
-          userId: conn.user_id,
-          connectedUserId: conn.connected_user_id,
-          connectedUserName: conn.connected_user_name,
-          connectedUserEmail: conn.connected_user_email,
-          connectedUserPhone: conn.connected_user_phone,
-          connectedUserPhoto: conn.connected_user_photo,
-          status: conn.status,
-          location: conn.location_latitude && conn.location_longitude ? {
-            latitude: conn.location_latitude,
-            longitude: conn.location_longitude,
-            address: conn.location_address || undefined,
-          } : null,
-          locationUpdatedAt: conn.location_updated_at || null,
-          createdAt: conn.created_at,
-          updatedAt: conn.updated_at,
-          isLocked: lockedStatusMap.get(conn.connected_user_id) || false,
-        }));
+        const formattedConnections: Connection[] = data
+          .map((conn) => ({
+            id: conn.id,
+            userId: conn.user_id,
+            connectedUserId: conn.connected_user_id,
+            connectedUserName: conn.connected_user_name || 'Unknown User',
+            connectedUserEmail: conn.connected_user_email,
+            connectedUserPhone: conn.connected_user_phone,
+            connectedUserPhoto: conn.connected_user_photo,
+            status: conn.status,
+            location: conn.location_latitude && conn.location_longitude ? {
+              latitude: conn.location_latitude,
+              longitude: conn.location_longitude,
+              address: conn.location_address || undefined,
+            } : null,
+            locationUpdatedAt: conn.location_updated_at || null,
+            createdAt: conn.created_at,
+            updatedAt: conn.updated_at,
+            isLocked: lockedStatusMap.get(conn.connected_user_id) || false,
+            locationSharingEnabled: conn.location_sharing_enabled !== undefined ? conn.location_sharing_enabled : true, // Default to true if not set
+          }))
+          .filter((conn) => {
+            // Filter out connections with missing critical data
+            if (!conn.id || !conn.connectedUserId) {
+              console.warn('⚠️ Filtering out connection with missing data:', conn);
+              return false;
+            }
+            return true;
+          });
+        
+        console.log(`✅ Loaded ${formattedConnections.length} connections`);
         setConnections(formattedConnections);
 
         // Update users subscription with new connected user IDs
@@ -504,121 +1441,6 @@ export default function ConnectionScreen({ navigation }: ConnectionScreenProps) 
     }
   };
 
-  const searchUsers = async (query: string): Promise<void> => {
-    if (!query.trim() || !user?.id) {
-      setSearchResults([]);
-      return;
-    }
-
-    try {
-      setSearching(true);
-      
-      const { data, error } = await supabase
-        .from('users')
-        .select('id, name, email, phone, photo')
-        .or(`email.ilike.%${query}%,phone.ilike.%${query}%`)
-        .neq('id', user.id)
-        .limit(10);
-
-      if (error) {
-        console.error('Error searching users:', error);
-        return;
-      }
-
-      if (data) {
-        const connectedUserIds = connections.map(c => c.connectedUserId);
-        const filteredResults = data.filter(
-          (u) => !connectedUserIds.includes(u.id)
-        );
-        setSearchResults(filteredResults);
-      }
-    } catch (error) {
-      console.error('Error in searchUsers:', error);
-    } finally {
-      setSearching(false);
-    }
-  };
-
-  useEffect(() => {
-    const timeoutId = setTimeout(() => {
-      if (searchQuery.trim()) {
-        searchUsers(searchQuery);
-      } else {
-        setSearchResults([]);
-      }
-    }, 300);
-
-    return () => clearTimeout(timeoutId);
-  }, [searchQuery]);
-
-  const connectToUser = async (targetUserId: string, targetUserName: string, targetUserEmail: string, targetUserPhone: string, targetUserPhoto: string | null): Promise<void> => {
-    if (!user?.id) return;
-
-    try {
-      setConnecting(targetUserId);
-
-      const { data: existingConnection } = await supabase
-        .from('connections')
-        .select('id')
-        .eq('user_id', user.id)
-        .eq('connected_user_id', targetUserId)
-        .single();
-
-      if (existingConnection) {
-        Alert.alert('Already Connected', 'You are already connected to this user.');
-        setConnecting(null);
-        return;
-      }
-
-      // Get current location if available
-      let locationData: any = {};
-      try {
-        const currentLocation = await locationService.getCurrentLocation();
-        if (currentLocation) {
-          locationData = {
-            location_latitude: currentLocation.latitude,
-            location_longitude: currentLocation.longitude,
-            location_address: currentLocation.address || null,
-            location_updated_at: new Date().toISOString(),
-          };
-        }
-      } catch (locationError) {
-        console.warn('Could not get location for connection:', locationError);
-        // Continue without location
-      }
-
-      const { data, error } = await supabase
-        .from('connections')
-        .insert({
-          user_id: user.id,
-          connected_user_id: targetUserId,
-          connected_user_name: targetUserName,
-          connected_user_email: targetUserEmail,
-          connected_user_phone: targetUserPhone,
-          connected_user_photo: targetUserPhoto,
-          status: 'connected',
-          ...locationData,
-        })
-        .select()
-        .single();
-
-      if (error) {
-        console.error('Error creating connection:', error);
-        Alert.alert('Error', 'Failed to connect. Please try again.');
-        return;
-      }
-
-      // Real-time subscription will automatically update connections
-      setSearchQuery('');
-      setSearchResults([]);
-      Alert.alert('Connected', `You are now connected to ${targetUserName}.`);
-    } catch (error) {
-      console.error('Error in connectToUser:', error);
-      Alert.alert('Error', 'Failed to connect. Please try again.');
-    } finally {
-      setConnecting(null);
-    }
-  };
 
   const unlockUser = async (connectedUserId: string, connectedUserName: string): Promise<void> => {
     Alert.alert(
@@ -631,6 +1453,15 @@ export default function ConnectionScreen({ navigation }: ConnectionScreenProps) 
           style: 'default',
           onPress: async () => {
             try {
+              // Optimistically update the UI immediately
+              setConnections((prev) =>
+                prev.map((conn) =>
+                  conn.connectedUserId === connectedUserId
+                    ? { ...conn, isLocked: false }
+                    : conn
+                )
+              );
+
               const { error } = await supabase
                 .from('users')
                 .update({ is_locked: false })
@@ -638,14 +1469,35 @@ export default function ConnectionScreen({ navigation }: ConnectionScreenProps) 
 
               if (error) {
                 console.error('Error unlocking user:', error);
+                // Revert optimistic update on error
+                setConnections((prev) =>
+                  prev.map((conn) =>
+                    conn.connectedUserId === connectedUserId
+                      ? { ...conn, isLocked: true }
+                      : conn
+                  )
+                );
                 Alert.alert('Error', 'Failed to unlock user. Please try again.');
                 return;
               }
 
-              // Real-time subscription will automatically update connections
+              // Reload connections to ensure all data is fresh and properly formatted
+              setTimeout(() => {
+                console.log('🔄 Reloading connections after unlock...');
+                loadConnections();
+              }, 500);
+
               Alert.alert('Success', `${connectedUserName} has been unlocked and can now access the app.`);
             } catch (error) {
               console.error('Error in unlockUser:', error);
+              // Revert optimistic update on error
+              setConnections((prev) =>
+                prev.map((conn) =>
+                  conn.connectedUserId === connectedUserId
+                    ? { ...conn, isLocked: true }
+                    : conn
+                )
+              );
               Alert.alert('Error', 'Failed to unlock user. Please try again.');
             }
           },
@@ -671,56 +1523,146 @@ export default function ConnectionScreen({ navigation }: ConnectionScreenProps) 
     };
   };
 
+  const toggleLocationSharing = async (connectionId: string, connectedUserId: string, connectedUserName: string, currentValue: boolean): Promise<void> => {
+    if (!user?.id) return;
+
+    try {
+      const newValue = !currentValue;
+      
+      // Optimistically update the UI
+      setConnections((prev) =>
+        prev.map((conn) =>
+          conn.id === connectionId
+            ? { ...conn, locationSharingEnabled: newValue }
+            : conn
+        )
+      );
+
+      // Update in database
+      const { error } = await supabase
+        .from('connections')
+        .update({ location_sharing_enabled: newValue })
+        .eq('id', connectionId);
+
+      if (error) {
+        console.error('Error toggling location sharing:', error);
+        // Revert optimistic update on error
+        setConnections((prev) =>
+          prev.map((conn) =>
+            conn.id === connectionId
+              ? { ...conn, locationSharingEnabled: currentValue }
+              : conn
+          )
+        );
+        Alert.alert('Error', 'Failed to update location sharing setting. Please try again.');
+        return;
+      }
+
+      // Also update the reverse connection (where this user is the connected user)
+      // This ensures both sides of the connection have the same setting
+      const { error: reverseError } = await supabase
+        .from('connections')
+        .update({ location_sharing_enabled: newValue })
+        .eq('user_id', connectedUserId)
+        .eq('connected_user_id', user.id);
+
+      if (reverseError) {
+        console.warn('Warning: Could not update reverse connection location sharing setting:', reverseError);
+        // Don't fail if reverse update fails
+      }
+
+      // Show alert when location sharing is turned off
+      if (!newValue) {
+        Alert.alert(
+          'Location Sharing Disabled',
+          `${connectedUserName} won't be able to see your live location.`,
+          [{ text: 'OK' }]
+        );
+      }
+
+      // If location sharing was just enabled, update location immediately
+      if (newValue && locationSharingEnabled) {
+        setTimeout(() => {
+          updateConnectionsLocation();
+        }, 500);
+      }
+
+      console.log(`✅ Location sharing ${newValue ? 'enabled' : 'disabled'} for connection`);
+    } catch (error) {
+      console.error('Error in toggleLocationSharing:', error);
+      // Revert optimistic update on error
+      setConnections((prev) =>
+        prev.map((conn) =>
+          conn.id === connectionId
+            ? { ...conn, locationSharingEnabled: currentValue }
+            : conn
+        )
+      );
+      Alert.alert('Error', 'Failed to update location sharing setting. Please try again.');
+    }
+  };
+
   const removeConnection = async (connectionId: string, connectedUserName: string): Promise<void> => {
-    Alert.alert(
-      'Remove Connection',
-      `Are you sure you want to remove ${connectedUserName} from your connections?`,
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Remove',
-          style: 'destructive',
-          onPress: async () => {
             try {
               const connection = connections.find(c => c.id === connectionId);
               
-              // Delete the connection from both sides
-              const { error: deleteError1 } = await supabase
-                .from('connections')
-                .delete()
-                .eq('id', connectionId);
-
-              if (deleteError1) {
-                console.error('Error removing connection:', deleteError1);
-                Alert.alert('Error', 'Failed to remove connection. Please try again.');
+      if (!connection) {
+        console.error('Connection not found:', connectionId);
                 return;
               }
 
-              // Delete the reverse connection if it exists
-              if (connection) {
-                const { error: deleteError2 } = await supabase
+      // Optimistically remove from UI immediately
+      setConnections((prev) => prev.filter((conn) => conn.id !== connectionId));
+
+      // Delete the connection from both sides in parallel
+      const [deleteResult1, deleteResult2] = await Promise.allSettled([
+        // Delete this user's connection
+        supabase
+          .from('connections')
+          .delete()
+          .eq('id', connectionId),
+        // Delete the reverse connection
+        supabase
                   .from('connections')
                   .delete()
                   .eq('user_id', connection.connectedUserId)
-                  .eq('connected_user_id', connection.userId);
+          .eq('connected_user_id', connection.userId),
+      ]);
 
-                if (deleteError2) {
-                  console.warn('Error removing reverse connection (non-critical):', deleteError2);
-                }
+      // Check for errors
+      if (deleteResult1.status === 'rejected' || (deleteResult1.status === 'fulfilled' && deleteResult1.value.error)) {
+        const error = deleteResult1.status === 'rejected' 
+          ? deleteResult1.reason 
+          : deleteResult1.value.error;
+        console.error('Error removing connection:', error);
+        
+        // Revert optimistic update on error
+        loadConnections();
+        Alert.alert('Error', 'Failed to remove connection. Please try again.');
+        return;
+      }
+
+      if (deleteResult2.status === 'rejected' || (deleteResult2.status === 'fulfilled' && deleteResult2.value.error)) {
+        const error = deleteResult2.status === 'rejected' 
+          ? deleteResult2.reason 
+          : deleteResult2.value.error;
+        console.warn('Error removing reverse connection (non-critical):', error);
+        // Don't fail if reverse deletion fails - it might not exist
               }
 
-              // Reload connections to update the UI
-              await loadConnections();
-              
-              Alert.alert('Success', `${connectedUserName} has been removed from your connections.`);
+              // Real-time subscription will automatically update the UI when connection is deleted
+      // Also manually refresh to ensure all connections are current
+      setTimeout(() => {
+        loadConnections();
+      }, 500);
+
+      console.log(`✅ Connection removed: ${connectedUserName}`);
             } catch (error) {
               console.error('Error in removeConnection:', error);
+      // Revert optimistic update on error
+      loadConnections();
               Alert.alert('Error', 'Failed to remove connection. Please try again.');
             }
-          },
-        },
-      ]
-    );
   };
 
   return (
@@ -731,258 +1673,240 @@ export default function ConnectionScreen({ navigation }: ConnectionScreenProps) 
             <TouchableOpacity
               onPress={() => navigation.goBack()}
               style={styles.backButton}
+              activeOpacity={0.7}
             >
-              <View style={styles.backButtonContainer}>
-                <Ionicons name="arrow-back" size={22} color="#000000" />
-              </View>
+              <Ionicons name="arrow-back" size={24} color="#1C1C1E" />
             </TouchableOpacity>
           ) : (
             <View style={styles.backButton} />
           )}
           <View style={styles.headerTitleContainer}>
-            <View style={styles.headerIconContainer}>
-              <Ionicons name="people" size={28} color="#007AFF" />
-            </View>
-            <View>
               <Text style={styles.headerTitle}>Connections</Text>
+            {connections.length > 0 && (
               <Text style={styles.headerSubtitle}>
-                {connections.length > 0 
-                  ? `${connections.length} ${connections.length === 1 ? 'connection' : 'connections'}`
-                  : 'Connect with others'}
+                {connections.length} {connections.length === 1 ? 'connection' : 'connections'}
               </Text>
-            </View>
+            )}
           </View>
           <View style={styles.backButton} />
         </View>
       </View>
 
-      {/* Tab Navigation */}
-      <View style={styles.tabContainer}>
-        <TouchableOpacity
-          style={[styles.tab, activeTab === 'home' && styles.tabActive]}
-          onPress={() => setActiveTab('home')}
-        >
-          <Ionicons 
-            name={activeTab === 'home' ? 'home' : 'home-outline'} 
-            size={20} 
-            color={activeTab === 'home' ? '#007AFF' : '#8E8E93'} 
-          />
-          <Text style={[styles.tabText, activeTab === 'home' && styles.tabTextActive]}>
-            Home
-          </Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={[styles.tab, activeTab === 'connections' && styles.tabActive]}
-          onPress={() => setActiveTab('connections')}
-        >
-          <Ionicons 
-            name={activeTab === 'connections' ? 'people' : 'people-outline'} 
-            size={20} 
-            color={activeTab === 'connections' ? '#007AFF' : '#8E8E93'} 
-          />
-          <Text style={[styles.tabText, activeTab === 'connections' && styles.tabTextActive]}>
-            {connections.length > 0 ? `Connections (${connections.length})` : 'Connections'}
-          </Text>
-        </TouchableOpacity>
-      </View>
-
-      {/* Home Tab */}
-      {activeTab === 'home' && (
+      {/* Main Content */}
         <ScrollView 
           style={styles.content} 
           showsVerticalScrollIndicator={false}
+          refreshControl={
+            <RefreshControl
+              refreshing={refreshing}
+              onRefresh={handleRefresh}
+              tintColor="#007AFF"
+              colors={['#007AFF']}
+            />
+          }
         >
-          {/* Action Section */}
-          <View style={styles.actionSection}>
-          <Text style={styles.sectionTitle}>Connect with Others</Text>
-          <Text style={styles.sectionDescription}>
-            Generate a code to share or enter a code from someone else to connect
-          </Text>
-          <View style={styles.actionButtonsContainer}>
+        {/* Quick Actions Section */}
+        <View style={styles.quickActionsSection}>
+          <Text style={styles.sectionTitle}>Quick Actions</Text>
+          <View style={styles.quickActionsGrid}>
             <TouchableOpacity
-              style={styles.actionButtonCard}
-              onPress={() => setShowGenerateCodeModal(true)}
+              style={styles.quickActionCard}
+            onPress={() => setShowInviteByPhoneModal(true)}
+              activeOpacity={0.7}
             >
-              <View style={styles.actionButtonIconContainer}>
-                <Ionicons name="qr-code" size={32} color="#007AFF" />
+              <View style={[styles.quickActionIconContainer, styles.quickActionIconPrimary]}>
+                <Ionicons name="call" size={24} color="#007AFF" />
               </View>
-              <Text style={styles.actionButtonTitle}>Generate Code</Text>
-              <Text style={styles.actionButtonDescription}>
-                Create a 6-digit code to share with others
-              </Text>
+              <Text style={styles.quickActionTitle}>Invite by Phone</Text>
+              <Text style={styles.quickActionSubtitle}>Send invitation</Text>
             </TouchableOpacity>
+
             <TouchableOpacity
-              style={[styles.actionButtonCard, styles.actionButtonCardSecondary]}
+              style={styles.quickActionCard}
+              onPress={generateConnectionCode}
+              disabled={generatingCode}
+              activeOpacity={0.7}
+            >
+              <View style={[styles.quickActionIconContainer, styles.quickActionIconSecondary]}>
+                {generatingCode ? (
+                  <ActivityIndicator size="small" color="#10B981" />
+                ) : (
+                  <Ionicons name="qr-code" size={24} color="#10B981" />
+                )}
+              </View>
+              <Text style={styles.quickActionTitle}>
+                {generatingCode ? 'Generating...' : 'Generate Code'}
+              </Text>
+              <Text style={styles.quickActionSubtitle}>Create code</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.quickActionCard}
               onPress={() => setShowEnterCodeModal(true)}
+              activeOpacity={0.7}
             >
-              <View style={[styles.actionButtonIconContainer, styles.actionButtonIconContainerSecondary]}>
-                <Ionicons name="key" size={32} color="#34C759" />
+              <View style={[styles.quickActionIconContainer, styles.quickActionIconTertiary]}>
+                <Ionicons name="keypad" size={24} color="#8B5CF6" />
               </View>
-              <Text style={styles.actionButtonTitle}>Enter Code</Text>
-              <Text style={styles.actionButtonDescription}>
-                Connect by entering someone's code
-              </Text>
+              <Text style={styles.quickActionTitle}>Enter Code</Text>
+              <Text style={styles.quickActionSubtitle}>Connect now</Text>
             </TouchableOpacity>
           </View>
-        </View>
-
-        {/* Instructions Section */}
-        <View style={styles.instructionsSection}>
-          <View style={styles.instructionsHeader}>
-            <Ionicons name="information-circle" size={24} color="#007AFF" />
-            <Text style={styles.instructionsTitle}>How to Connect</Text>
+              </View>
+        {/* Pending Invitations Section */}
+        {pendingInvitations.length > 0 && (
+          <View style={styles.invitationsSection}>
+            <View style={styles.sectionHeader}>
+              <Text style={styles.sectionTitle}>Pending Invitations</Text>
+              <View style={styles.badge}>
+                <Text style={styles.badgeText}>{pendingInvitations.length}</Text>
+              </View>
+            </View>
+            <View style={styles.invitationsList}>
+              {pendingInvitations.map((invitation) => (
+                <View key={invitation.id} style={styles.invitationCard}>
+                  <View style={styles.invitationCardContent}>
+                    <View style={styles.invitationAvatar}>
+                      <Text style={styles.invitationAvatarText}>
+                        {invitation.inviterName?.charAt(0).toUpperCase() || 'U'}
+                      </Text>
+                    </View>
+                    <View style={styles.invitationDetails}>
+                      <Text style={styles.invitationName}>{invitation.inviterName}</Text>
+                      <Text style={styles.invitationText}>
+                        Wants to connect with you
+                      </Text>
+                    </View>
+                  </View>
+                  <View style={styles.invitationActions}>
+                    <TouchableOpacity
+                      style={styles.acceptButton}
+                      onPress={() => acceptInvitation(invitation.id)}
+                      activeOpacity={0.8}
+                    >
+                      <Ionicons name="checkmark-circle" size={18} color="#FFFFFF" />
+                      <Text style={styles.acceptButtonText}>Accept</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={styles.rejectButton}
+                      onPress={() => rejectInvitation(invitation.id)}
+                      activeOpacity={0.8}
+                    >
+                      <Ionicons name="close-circle" size={18} color="#EF4444" />
+                      <Text style={styles.rejectButtonText}>Reject</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              ))}
+            </View>
           </View>
-          <View style={styles.instructionsList}>
-            <View style={styles.instructionItem}>
-              <View style={styles.instructionNumber}>
-                <Text style={styles.instructionNumberText}>1</Text>
-              </View>
-              <View style={styles.instructionContent}>
-                <Text style={styles.instructionTitle}>Generate Your Code</Text>
-                <Text style={styles.instructionText}>
-                  Tap "Generate Code" to create a unique 6-digit code. Share this code with people you want to connect with.
-                </Text>
-              </View>
-            </View>
-            <View style={styles.instructionItem}>
-              <View style={styles.instructionNumber}>
-                <Text style={styles.instructionNumberText}>2</Text>
-              </View>
-              <View style={styles.instructionContent}>
-                <Text style={styles.instructionTitle}>Enter Their Code</Text>
-                <Text style={styles.instructionText}>
-                  Tap "Enter Code" and type the 6-digit code you received from someone else to connect with them.
-                </Text>
-              </View>
-            </View>
-            <View style={styles.instructionItem}>
-              <View style={styles.instructionNumber}>
-                <Text style={styles.instructionNumberText}>3</Text>
-              </View>
-              <View style={styles.instructionContent}>
-                <Text style={styles.instructionTitle}>Stay Connected</Text>
-                <Text style={styles.instructionText}>
-                  Once connected, you can see each other's locations and help in emergencies.
-                </Text>
-              </View>
-            </View>
-          </View>
-        </View>
-        </ScrollView>
-      )}
+        )}
 
-      {/* Connections Tab */}
-      {activeTab === 'connections' && (
-        <ScrollView 
-          style={styles.content} 
-          showsVerticalScrollIndicator={false}
-        >
+        {/* Connections Section */}
           {loading ? (
             <View style={styles.loadingContainer}>
-              <ActivityIndicator size="large" color="#007AFF" />
+              <ActivityIndicator size="large" color="#6366F1" />
               <Text style={styles.loadingText}>Loading connections...</Text>
             </View>
           ) : connections.length === 0 ? (
             <View style={styles.emptyState}>
               <View style={styles.emptyStateIcon}>
-                <Ionicons name="people-outline" size={64} color="#8E8E93" />
+                <Ionicons name="people-outline" size={80} color="#CBD5E1" />
               </View>
               <Text style={styles.emptyStateTitle}>No connections yet</Text>
               <Text style={styles.emptyStateSubtext}>
-                Use the Home tab to generate or enter a code to start connecting
+                Start by inviting someone using the quick actions above
               </Text>
             </View>
           ) : (
             <View style={styles.connectionsSection}>
-              <Text style={styles.connectionsSectionTitle}>
-                Your Connections ({connections.length})
-              </Text>
+              <View style={styles.sectionHeader}>
+                <Text style={styles.sectionTitle}>Your Connections</Text>
+                <View style={styles.badge}>
+                  <Text style={styles.badgeText}>{connections.length}</Text>
+                </View>
+              </View>
               <View style={styles.connectionsList}>
               {connections.map((connection) => {
-                const { isOnline, statusText } = getConnectionStatus(connection);
+                // Skip rendering if connection data is incomplete
+                if (!connection.connectedUserId || !connection.id) {
+                  console.warn('⚠️ Skipping connection with incomplete data:', connection);
+                  return null;
+                }
+                
+                const displayName = connection.connectedUserName || 'Unknown User';
+                
                 return (
-                  <View 
+                  <TouchableOpacity
                     key={connection.id} 
                     style={[
                       styles.connectionCard,
                       connection.isLocked && styles.connectionCardEmergency
                     ]}
+                    activeOpacity={0.95}
                   >
+                    {/* Emergency Banner */}
                     {connection.isLocked && (
                       <View style={styles.emergencyBanner}>
-                        <Ionicons name="warning" size={20} color="#FFFFFF" />
+                        <Ionicons name="warning" size={16} color="#FFFFFF" />
                         <Text style={styles.emergencyBannerText}>EMERGENCY</Text>
                       </View>
                     )}
+
+                    {/* Main Card Content */}
                     <View style={styles.connectionCardContent}>
+                      {/* Avatar Section */}
+                      <View style={styles.avatarSection}>
                       <View style={[
                         styles.connectionAvatar,
                         connection.isLocked && styles.connectionAvatarEmergency
                       ]}>
                         <Text style={styles.connectionAvatarText}>
-                          {connection.connectedUserName?.charAt(0) || 'U'}
+                          {displayName.charAt(0).toUpperCase()}
                         </Text>
-                        <View style={[styles.statusIndicator, isOnline && styles.statusIndicatorOnline]} />
                       </View>
-                      <View style={styles.connectionDetails}>
-                        <View style={styles.connectionNameRow}>
+                        {connection.isLocked && (
+                          <View style={styles.lockIconContainer}>
+                            <Ionicons name="lock-closed" size={14} color="#DC2626" />
+                          </View>
+                        )}
+                      </View>
+
+                      {/* Info Section */}
+                      <View style={styles.infoSection}>
+                        <View style={styles.nameRow}>
                           <Text style={[
                             styles.connectionName,
                             connection.isLocked && styles.connectionNameEmergency
-                          ]}>
-                            {connection.connectedUserName}
+                          ]} numberOfLines={1}>
+                            {displayName}
                           </Text>
-                          {!connection.isLocked && (
-                            <View style={styles.statusBadge}>
-                              <View style={[styles.statusDot, isOnline && styles.statusDotOnline]} />
-                              <Text style={[styles.statusText, isOnline && styles.statusTextOnline]}>
-                                {statusText}
-                              </Text>
-                            </View>
-                          )}
                         </View>
+
+                        {/* Status Messages */}
                         {connection.isLocked && (
-                          <View style={styles.emergencyMessage}>
-                            <Ionicons name="alert-circle" size={16} color="#EF4444" />
-                            <Text style={styles.emergencyMessageText}>
-                              This user's account is locked and needs assistance
+                          <View style={styles.alertMessage}>
+                            <Ionicons name="alert-circle" size={14} color="#DC2626" />
+                            <Text style={styles.alertMessageText}>
+                              Account locked - needs assistance
                             </Text>
                           </View>
                         )}
-                        {connection.location && (
-                          <View style={styles.locationInfo}>
-                            <Ionicons 
-                              name="location" 
-                              size={14} 
-                              color={connection.isLocked ? "#EF4444" : "#34C759"} 
-                            />
-                            <Text style={[
-                              styles.locationText,
-                              connection.isLocked && styles.locationTextEmergency
-                            ]}>
-                              {connection.location.address || 
-                                `${connection.location.latitude.toFixed(4)}, ${connection.location.longitude.toFixed(4)}`}
+                        {!connection.locationSharingEnabled && (
+                          <View style={styles.infoMessage}>
+                            <Ionicons name="location-outline" size={12} color="#64748B" />
+                            <Text style={styles.infoMessageText}>
+                              Location sharing disabled
                             </Text>
                           </View>
-                        )}
-                        {!connection.location && (
-                          <Text style={styles.noLocationText}>Location not available</Text>
                         )}
                       </View>
-                    </View>
-                    <View style={styles.connectionActions}>
-                      {connection.isLocked && (
+
+                      {/* Action Buttons */}
+                      <View style={styles.actionButtonsContainer}>
+                        {connection.locationSharingEnabled && connection.location && (
                         <TouchableOpacity
-                          style={styles.unlockButton}
-                          onPress={() => unlockUser(connection.connectedUserId, connection.connectedUserName)}
-                        >
-                          <Ionicons name="lock-open-outline" size={16} color="#34C759" />
-                          <Text style={styles.unlockButtonText}>Unlock</Text>
-                        </TouchableOpacity>
-                      )}
-                      {connection.location && (
-                        <TouchableOpacity
-                          style={styles.viewLocationButton}
+                            style={styles.mapButton}
                           onPress={() => {
                             if (connection.location) {
                               navigation.navigate('MapView', {
@@ -993,312 +1917,310 @@ export default function ConnectionScreen({ navigation }: ConnectionScreenProps) 
                               });
                             }
                           }}
+                            activeOpacity={0.7}
                         >
-                          <Ionicons name="navigate" size={16} color="#007AFF" />
-                          <Text style={styles.viewLocationButtonText}>Location</Text>
+                            <Ionicons name="map" size={16} color="#6366F1" />
+                            <Text style={styles.mapButtonText}>Map</Text>
                         </TouchableOpacity>
                       )}
                       <TouchableOpacity
-                        style={styles.removeButton}
-                        onPress={() =>
-                          removeConnection(connection.id, connection.connectedUserName)
-                        }
+                          style={styles.menuButton}
+                        onPress={() => {
+                          Alert.alert(
+                              connection.connectedUserName,
+                              'Choose an action',
+                              [
+                                {
+                                  text: connection.isLocked ? 'Unlock Account' : 'Lock Account',
+                                  onPress: () => {
+                                    if (connection.isLocked) {
+                                      unlockUser(connection.connectedUserId, connection.connectedUserName);
+                                    }
+                                  },
+                                  style: connection.isLocked ? 'default' : 'cancel',
+                                },
+                              {
+                                  text: 'Remove Connection',
+                                onPress: () => removeConnection(connection.id, connection.connectedUserName),
+                                  style: 'destructive',
+                              },
+                                { text: 'Cancel', style: 'cancel' },
+                            ]
+                          );
+                        }}
+                          activeOpacity={0.7}
                       >
-                        <Ionicons name="trash-outline" size={16} color="#FF3B30" />
-                        <Text style={styles.removeButtonText}>Remove</Text>
+                          <Ionicons name="ellipsis-vertical" size={20} color="#94A3B8" />
                       </TouchableOpacity>
                     </View>
                   </View>
+
+                    {/* Location Sharing Toggle */}
+                    <View style={styles.toggleSection}>
+                      <View style={styles.toggleContent}>
+                        <Ionicons 
+                          name={connection.locationSharingEnabled ? "location" : "location-outline"} 
+                          size={18} 
+                          color={connection.locationSharingEnabled ? "#10B981" : "#94A3B8"} 
+                        />
+                        <Text style={[
+                          styles.toggleLabel,
+                          !connection.locationSharingEnabled && styles.toggleLabelDisabled
+                        ]}>
+                          Share my location
+                        </Text>
+                      </View>
+                      <Switch
+                        value={connection.locationSharingEnabled ?? true}
+                        onValueChange={() => toggleLocationSharing(
+                          connection.id,
+                          connection.connectedUserId,
+                          connection.connectedUserName,
+                          connection.locationSharingEnabled ?? true
+                        )}
+                        trackColor={{ false: '#E2E8F0', true: '#10B981' }}
+                        thumbColor="#FFFFFF"
+                        ios_backgroundColor="#E2E8F0"
+                      />
+                    </View>
+                  </TouchableOpacity>
                 );
               })}
               </View>
             </View>
           )}
         </ScrollView>
-      )}
 
-      {/* Generate Code Modal */}
+      {/* Invite by Phone Modal */}
       <Modal
-        visible={showGenerateCodeModal}
-        animationType="slide"
+        visible={showInviteByPhoneModal}
+        animationType="fade"
         transparent={true}
-        onRequestClose={() => setShowGenerateCodeModal(false)}
+        onRequestClose={() => {
+          setShowInviteByPhoneModal(false);
+          setPhoneInput('');
+        }}
       >
-        <Pressable 
+        <Pressable
           style={styles.modalOverlay}
-          onPress={() => setShowGenerateCodeModal(false)}
+          onPress={() => {
+            setShowInviteByPhoneModal(false);
+            setPhoneInput('');
+          }}
         >
-          <Pressable style={styles.modalContent} onPress={(e) => e.stopPropagation()}>
-            <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>My Connection Code</Text>
-              <TouchableOpacity
-                onPress={() => setShowGenerateCodeModal(false)}
-                style={styles.modalCloseButton}
-              >
-                <Ionicons name="close" size={24} color="#000000" />
-              </TouchableOpacity>
-            </View>
-            
-            {myCode ? (
-              <View style={styles.modalCodeContent}>
-                <Text style={styles.modalSubtitle}>
-                  Share this code with someone to connect with them
-                </Text>
-                <View style={styles.codeDisplayBox}>
-                  <View style={styles.codeDigitsContainer}>
-                    {myCode.split('').map((digit, index) => (
-                      <View key={index} style={styles.codeDigitDisplay}>
-                        <Text style={styles.codeDigitDisplayText}>{digit}</Text>
-                      </View>
-                    ))}
+            <KeyboardAvoidingView
+            behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+            style={styles.modalKeyboardView}
+          >
+            <Pressable
+              style={styles.invitePhoneModalContent}
+              onPress={(e) => e.stopPropagation()}
+            >
+              <View style={styles.invitePhoneModalHeader}>
+                <Text style={styles.invitePhoneModalTitle}>Invite by Phone</Text>
+                <TouchableOpacity
+                  onPress={() => {
+                    setShowInviteByPhoneModal(false);
+                    setPhoneInput('');
+                  }}
+                  style={styles.invitePhoneModalCloseButton}
+                >
+                  <Ionicons name="close" size={24} color="#000000" />
+                </TouchableOpacity>
+              </View>
+              
+              <View style={styles.invitePhoneModalBody}>
+                  <View style={styles.phoneInputContainer}>
+                  <Ionicons name="call-outline" size={20} color="#007AFF" style={styles.phoneInputIcon} />
+                    <TextInput
+                      ref={phoneInputRef}
+                      style={styles.phoneInput}
+                    placeholder="Enter 11-digit phone number"
+                      placeholderTextColor="#8E8E93"
+                      value={phoneInput}
+                      onChangeText={(text) => {
+                        const formatted = formatPhoneNumber(text);
+                        setPhoneInput(formatted);
+                      }}
+                      keyboardType="phone-pad"
+                    autoFocus={true}
+                      maxLength={11}
+                    />
                   </View>
-                </View>
-                <View style={styles.codeActions}>
+
                   <TouchableOpacity
-                    style={styles.primaryButton}
-                    onPress={copyCodeToClipboard}
+                    style={[
+                    styles.invitePhoneModalButton,
+                    (!phoneInput.trim() || sendingInvitation) && styles.invitePhoneModalButtonDisabled,
+                    ]}
+                    onPress={sendInvitationByPhone}
+                    disabled={!phoneInput.trim() || sendingInvitation}
                   >
-                    <Ionicons name="copy" size={20} color="#FFFFFF" />
-                    <Text style={styles.primaryButtonText}>Copy Code</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={styles.secondaryButtonModal}
-                    onPress={generateCode}
-                    disabled={generatingCode}
-                  >
-                    {generatingCode ? (
-                      <ActivityIndicator size="small" color="#007AFF" />
+                    {sendingInvitation ? (
+                      <ActivityIndicator size="small" color="#FFFFFF" />
                     ) : (
                       <>
-                        <Ionicons name="refresh" size={18} color="#007AFF" />
-                        <Text style={styles.secondaryButtonTextModal}>Generate New Code</Text>
+                      <Ionicons name="send" size={18} color="#FFFFFF" />
+                      <Text style={styles.invitePhoneModalButtonText}>Send Invitation</Text>
                       </>
                     )}
                   </TouchableOpacity>
+
+                <View style={styles.invitePhoneModalInfo}>
+                  <Ionicons name="information-circle-outline" size={14} color="#8E8E93" />
+                  <Text style={styles.invitePhoneModalInfoText}>
+                    Invitation expires in 7 days
+                    </Text>
+                  </View>
                 </View>
-                <View style={styles.codeInfoBox}>
-                  <Ionicons name="information-circle-outline" size={16} color="#8E8E93" />
-                  <Text style={styles.codeInfoText}>
-                    This code expires in 1 hour. Share it securely with people you trust.
-                  </Text>
-                </View>
-              </View>
-            ) : (
-              <View style={styles.modalGenerateCodeContent}>
-                <View style={styles.generateCodeIconContainer}>
-                  <Ionicons name="qr-code" size={64} color="#007AFF" />
-                </View>
-                <Text style={styles.generateCodeTitle}>
-                  Create Connection Code
-                </Text>
-                <Text style={styles.generateCodeText}>
-                  Generate a unique 6-digit code that others can use to connect with you. The code will be valid for 1 hour.
-                </Text>
+            </Pressable>
+            </KeyboardAvoidingView>
+        </Pressable>
+      </Modal>
+
+      {/* Generate Connection Code Modal */}
+      <Modal
+        visible={showGenerateCodeModal}
+        animationType="fade"
+        transparent={true}
+        onRequestClose={() => {
+          setShowGenerateCodeModal(false);
+          setConnectionCode('');
+        }}
+      >
+        <Pressable
+          style={styles.modalOverlay}
+          onPress={() => {
+            setShowGenerateCodeModal(false);
+            setConnectionCode('');
+          }}
+        >
+          <Pressable
+            style={styles.invitePhoneModalContent}
+            onPress={(e) => e.stopPropagation()}
+          >
+            <View style={styles.invitePhoneModalHeader}>
+              <Text style={styles.invitePhoneModalTitle}>Your Connection Code</Text>
                 <TouchableOpacity
-                  style={styles.primaryButton}
-                  onPress={generateCode}
-                  disabled={generatingCode}
+                  onPress={() => {
+                  setShowGenerateCodeModal(false);
+                  setConnectionCode('');
+                  }}
+                style={styles.invitePhoneModalCloseButton}
                 >
-                  {generatingCode ? (
-                    <>
-                      <ActivityIndicator size="small" color="#FFFFFF" />
-                      <Text style={styles.primaryButtonText}>Generating...</Text>
-                    </>
-                  ) : (
-                    <>
-                      <Ionicons name="qr-code-outline" size={20} color="#FFFFFF" />
-                      <Text style={styles.primaryButtonText}>Generate Connection Code</Text>
-                    </>
-                  )}
+                  <Ionicons name="close" size={24} color="#000000" />
                 </TouchableOpacity>
               </View>
-            )}
+              
+            <View style={styles.invitePhoneModalBody}>
+              <View style={styles.codeDisplayContainer}>
+                <Text style={styles.codeDisplayText}>{connectionCode}</Text>
+                  </View>
+
+              <Text style={styles.codeDisplayHint}>
+                Share this code with others to connect. The code expires in 24 hours.
+                        </Text>
+
+              <TouchableOpacity
+                style={styles.invitePhoneModalButton}
+                onPress={async () => {
+                  // Copy to clipboard
+                  await Clipboard.setStringAsync(connectionCode);
+                  Alert.alert('Copied!', 'Connection code copied to clipboard.');
+                }}
+              >
+                <Ionicons name="copy-outline" size={18} color="#FFFFFF" />
+                <Text style={styles.invitePhoneModalButtonText}>Copy Code</Text>
+              </TouchableOpacity>
+                      </View>
           </Pressable>
         </Pressable>
       </Modal>
 
-      {/* Enter Code Modal */}
+      {/* Enter Connection Code Modal */}
       <Modal
         visible={showEnterCodeModal}
-        animationType="slide"
+        animationType="fade"
         transparent={true}
         onRequestClose={() => {
           setShowEnterCodeModal(false);
           setCodeInput('');
         }}
       >
-        <Pressable 
+        <Pressable
           style={styles.modalOverlay}
           onPress={() => {
             setShowEnterCodeModal(false);
             setCodeInput('');
           }}
         >
-          {Platform.OS === 'ios' ? (
-            <KeyboardAvoidingView
-              behavior="padding"
-              keyboardVerticalOffset={0}
-            >
-              <Pressable 
-                style={styles.modalContent} 
-                onPress={(e) => e.stopPropagation()}
-              >
-                <View style={styles.modalHeader}>
-                  <Text style={styles.modalTitle}>Enter Connection Code</Text>
-                  <TouchableOpacity
-                    onPress={() => {
-                      setShowEnterCodeModal(false);
-                      setCodeInput('');
-                    }}
-                    style={styles.modalCloseButton}
-                  >
-                    <Ionicons name="close" size={24} color="#000000" />
-                  </TouchableOpacity>
-                </View>
-                
-                <ScrollView 
-                  keyboardShouldPersistTaps="handled"
-                  showsVerticalScrollIndicator={false}
-                >
-                  <View style={styles.enterCodeContainer}>
-                    <TouchableOpacity 
-                      style={styles.codeInputWrapper}
-                      activeOpacity={1}
-                      onPress={() => {
-                        codeInputRef.current?.focus();
-                      }}
-                    >
-                      <View style={styles.codeInputBox}>
-                        {codeInput.split('').map((digit, index) => (
-                          <View key={index} style={[styles.codeDigitBox, digit && styles.codeDigitBoxFilled]}>
-                            <Text style={styles.codeDigitText}>{digit}</Text>
-                          </View>
-                        ))}
-                        {Array.from({ length: 6 - codeInput.length }).map((_, index) => (
-                          <View key={`empty-${index}`} style={styles.codeDigitBox} />
-                        ))}
-                      </View>
-                      <TextInput
-                        ref={codeInputRef}
-                        style={styles.hiddenInput}
-                        value={codeInput}
-                        onChangeText={(text) => {
-                          const digitsOnly = text.replace(/[^0-9]/g, '').slice(0, 6);
-                          setCodeInput(digitsOnly);
-                        }}
-                        keyboardType="number-pad"
-                        maxLength={6}
-                        autoFocus={true}
-                        caretHidden={true}
-                        showSoftInputOnFocus={true}
-                      />
-                    </TouchableOpacity>
-                    <TouchableOpacity
-                      style={[
-                        styles.primaryButton,
-                        styles.connectButton,
-                        (codeInput.length !== 6 || validatingCode) && styles.buttonDisabled,
-                      ]}
-                      onPress={validateAndConnect}
-                      disabled={codeInput.length !== 6 || validatingCode}
-                    >
-                      {validatingCode ? (
-                        <ActivityIndicator size="small" color="#FFFFFF" />
-                      ) : (
-                        <>
-                          <Ionicons name="checkmark-circle" size={20} color="#FFFFFF" />
-                          <Text style={styles.primaryButtonText}>Connect</Text>
-                        </>
-                      )}
-                    </TouchableOpacity>
-                    <Text style={styles.enterCodeHint}>
-                      Enter the 6-digit code from another user
-                    </Text>
-                  </View>
-                </ScrollView>
-              </Pressable>
-            </KeyboardAvoidingView>
-          ) : (
-            <Pressable 
-              style={styles.modalContent} 
+          <KeyboardAvoidingView
+            behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+            style={styles.modalKeyboardView}
+          >
+            <Pressable
+              style={styles.invitePhoneModalContent}
               onPress={(e) => e.stopPropagation()}
             >
-              <ScrollView 
-                keyboardShouldPersistTaps="handled"
-                showsVerticalScrollIndicator={false}
-                contentContainerStyle={{ flexGrow: 1 }}
-              >
-                <View style={styles.modalHeader}>
-                  <Text style={styles.modalTitle}>Enter Connection Code</Text>
-                  <TouchableOpacity
-                    onPress={() => {
-                      setShowEnterCodeModal(false);
-                      setCodeInput('');
-                    }}
-                    style={styles.modalCloseButton}
-                  >
-                    <Ionicons name="close" size={24} color="#000000" />
-                  </TouchableOpacity>
+              <View style={styles.invitePhoneModalHeader}>
+                <Text style={styles.invitePhoneModalTitle}>Enter Connection Code</Text>
+                <TouchableOpacity
+                  onPress={() => {
+                    setShowEnterCodeModal(false);
+                    setCodeInput('');
+                  }}
+                  style={styles.invitePhoneModalCloseButton}
+                >
+                  <Ionicons name="close" size={24} color="#000000" />
+                </TouchableOpacity>
                 </View>
-                
-                <View style={styles.enterCodeContainer}>
-                  <TouchableOpacity 
-                    style={styles.codeInputWrapper}
-                    activeOpacity={1}
-                    onPress={() => {
-                      codeInputRef.current?.focus();
-                    }}
-                  >
-                    <View style={styles.codeInputBox}>
-                      {codeInput.split('').map((digit, index) => (
-                        <View key={index} style={[styles.codeDigitBox, digit && styles.codeDigitBoxFilled]}>
-                          <Text style={styles.codeDigitText}>{digit}</Text>
-                        </View>
-                      ))}
-                      {Array.from({ length: 6 - codeInput.length }).map((_, index) => (
-                        <View key={`empty-${index}`} style={styles.codeDigitBox} />
-                      ))}
-                    </View>
+
+              <View style={styles.invitePhoneModalBody}>
+                  <View style={styles.phoneInputContainer}>
+                  <Ionicons name="keypad-outline" size={20} color="#007AFF" style={styles.phoneInputIcon} />
                     <TextInput
-                      ref={codeInputRef}
-                      style={styles.hiddenInput}
-                      value={codeInput}
+                    ref={codeInputRef}
+                      style={styles.phoneInput}
+                    placeholder="Enter 6-digit code"
+                      placeholderTextColor="#8E8E93"
+                    value={codeInput}
                       onChangeText={(text) => {
-                        const digitsOnly = text.replace(/[^0-9]/g, '').slice(0, 6);
-                        setCodeInput(digitsOnly);
+                      const digitsOnly = text.replace(/\D/g, '').slice(0, 6);
+                      setCodeInput(digitsOnly);
                       }}
-                      keyboardType="number-pad"
-                      maxLength={6}
-                      autoFocus={false}
-                      caretHidden={true}
-                      showSoftInputOnFocus={true}
+                    keyboardType="number-pad"
+                    autoFocus={true}
+                    maxLength={6}
                     />
-                  </TouchableOpacity>
+                  </View>
+
                   <TouchableOpacity
                     style={[
-                      styles.primaryButton,
-                      styles.connectButton,
-                      (codeInput.length !== 6 || validatingCode) && styles.buttonDisabled,
+                    styles.invitePhoneModalButton,
+                    (!codeInput.trim() || connectingByCode || codeInput.length !== 6) && styles.invitePhoneModalButtonDisabled,
                     ]}
-                    onPress={validateAndConnect}
-                    disabled={codeInput.length !== 6 || validatingCode}
+                  onPress={connectByCode}
+                  disabled={!codeInput.trim() || connectingByCode || codeInput.length !== 6}
                   >
-                    {validatingCode ? (
+                  {connectingByCode ? (
                       <ActivityIndicator size="small" color="#FFFFFF" />
                     ) : (
                       <>
-                        <Ionicons name="checkmark-circle" size={20} color="#FFFFFF" />
-                        <Text style={styles.primaryButtonText}>Connect</Text>
+                      <Ionicons name="checkmark-circle" size={18} color="#FFFFFF" />
+                      <Text style={styles.invitePhoneModalButtonText}>Connect</Text>
                       </>
                     )}
                   </TouchableOpacity>
-                  <Text style={styles.enterCodeHint}>
-                    Enter the 6-digit code from another user
-                  </Text>
+
+                <View style={styles.invitePhoneModalInfo}>
+                  <Ionicons name="information-circle-outline" size={14} color="#8E8E93" />
+                  <Text style={styles.invitePhoneModalInfoText}>
+                    Enter the 6-digit code shared by the other person
+                    </Text>
+                  </View>
                 </View>
-              </ScrollView>
             </Pressable>
-          )}
+          </KeyboardAvoidingView>
         </Pressable>
       </Modal>
     </SafeAreaView>
@@ -1308,17 +2230,23 @@ export default function ConnectionScreen({ navigation }: ConnectionScreenProps) 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#F5F5F5',
+    backgroundColor: '#F8FAFC',
   },
   header: {
     backgroundColor: '#FFFFFF',
-    borderBottomWidth: 1,
-    borderBottomColor: '#E5E5EA',
-    shadowColor: '#000000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.08,
-    shadowRadius: 8,
-    elevation: 3,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: '#E2E8F0',
+    ...Platform.select({
+      ios: {
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 1 },
+        shadowOpacity: 0.05,
+        shadowRadius: 3,
+      },
+      android: {
+        elevation: 2,
+      },
+    }),
   },
   headerContent: {
     flexDirection: 'row',
@@ -1329,92 +2257,113 @@ const styles = StyleSheet.create({
     paddingBottom: 16,
   },
   backButton: {
-    width: 44,
-    height: 44,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  backButtonContainer: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    backgroundColor: '#F5F5F5',
+    width: 40,
+    height: 40,
     justifyContent: 'center',
     alignItems: 'center',
   },
   headerTitleContainer: {
     flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
     marginHorizontal: 12,
   },
-  headerIconContainer: {
-    width: 48,
-    height: 48,
-    borderRadius: 24,
-    backgroundColor: '#F0F7FF',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
   headerTitle: {
-    fontSize: 24,
+    fontSize: 28,
     fontWeight: '700',
-    color: '#000000',
-    marginBottom: 2,
+    color: '#1C1C1E',
+    letterSpacing: -0.5,
   },
   headerSubtitle: {
-    fontSize: 13,
-    fontWeight: '500',
-    color: '#8E8E93',
-  },
-  tabContainer: {
-    flexDirection: 'row',
-    backgroundColor: '#FFFFFF',
-    borderBottomWidth: 1,
-    borderBottomColor: '#E5E5EA',
-    paddingHorizontal: 8,
-  },
-  tab: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingVertical: 12,
-    gap: 6,
-    borderBottomWidth: 2,
-    borderBottomColor: 'transparent',
-  },
-  tabActive: {
-    borderBottomColor: '#007AFF',
-  },
-  tabText: {
     fontSize: 14,
-    fontWeight: '600',
-    color: '#8E8E93',
-  },
-  tabTextActive: {
-    color: '#007AFF',
+    fontWeight: '500',
+    color: '#6B7280',
+    marginTop: 2,
   },
   content: {
     flex: 1,
   },
-  actionSection: {
-    backgroundColor: '#FFFFFF',
-    padding: 20,
+  quickActionsSection: {
+    paddingHorizontal: 20,
+    paddingTop: 24,
+    paddingBottom: 8,
+  },
+  sectionHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
     marginBottom: 16,
   },
   sectionTitle: {
-    fontSize: 22,
+    fontSize: 20,
     fontWeight: '700',
-    color: '#000000',
-    marginBottom: 8,
+    color: '#1C1C1E',
+    letterSpacing: -0.3,
   },
-  sectionDescription: {
-    fontSize: 15,
-    color: '#8E8E93',
-    marginBottom: 20,
-    lineHeight: 22,
+  badge: {
+    backgroundColor: '#E0E7FF',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 12,
+    minWidth: 24,
+    alignItems: 'center',
+  },
+  badgeText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#6366F1',
+  },
+  quickActionsGrid: {
+    flexDirection: 'row',
+    gap: 12,
+    marginTop: 12,
+  },
+  quickActionCard: {
+    flex: 1,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 16,
+    padding: 16,
+    alignItems: 'center',
+    ...Platform.select({
+      ios: {
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 2 },
+        shadowOpacity: 0.05,
+        shadowRadius: 8,
+  },
+      android: {
+        elevation: 2,
+      },
+    }),
+    borderWidth: 1,
+    borderColor: '#F1F5F9',
+  },
+  quickActionIconContainer: {
+    width: 56,
+    height: 56,
+    borderRadius: 16,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  quickActionIconPrimary: {
+    backgroundColor: '#EFF6FF',
+  },
+  quickActionIconSecondary: {
+    backgroundColor: '#ECFDF5',
+  },
+  quickActionIconTertiary: {
+    backgroundColor: '#F5F3FF',
+  },
+  quickActionTitle: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#1C1C1E',
+    marginBottom: 4,
+    textAlign: 'center',
+  },
+  quickActionSubtitle: {
+    fontSize: 12,
+    color: '#6B7280',
+    textAlign: 'center',
   },
   actionButtonsContainer: {
     flexDirection: 'row',
@@ -1516,15 +2465,14 @@ const styles = StyleSheet.create({
     lineHeight: 20,
   },
   connectionsSection: {
-    paddingHorizontal: 16,
-    paddingTop: 16,
-    paddingBottom: 16,
+    paddingHorizontal: 20,
+    paddingTop: 24,
+    paddingBottom: 20,
   },
-  connectionsSectionTitle: {
-    fontSize: 20,
-    fontWeight: '700',
-    color: '#000000',
-    marginBottom: 16,
+  invitationsSection: {
+    paddingHorizontal: 20,
+    paddingTop: 24,
+    paddingBottom: 8,
   },
   card: {
     backgroundColor: '#FFFFFF',
@@ -1605,6 +2553,8 @@ const styles = StyleSheet.create({
   },
   enterCodeContainer: {
     alignItems: 'center',
+    paddingHorizontal: 20,
+    paddingBottom: 32,
   },
   codeInputWrapper: {
     position: 'relative',
@@ -1659,7 +2609,13 @@ const styles = StyleSheet.create({
     width: '100%',
   },
   connectButton: {
-    marginBottom: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 14,
+    paddingHorizontal: 20,
+    borderRadius: 12,
+    gap: 8,
   },
   primaryButtonText: {
     color: '#FFFFFF',
@@ -1774,35 +2730,37 @@ const styles = StyleSheet.create({
   },
   loadingContainer: {
     alignItems: 'center',
-    padding: 48,
+    justifyContent: 'center',
+    paddingVertical: 80,
   },
   loadingText: {
-    fontSize: 14,
-    color: '#8E8E93',
-    marginTop: 12,
+    fontSize: 15,
+    color: '#64748B',
+    marginTop: 16,
+    fontWeight: '500',
   },
   emptyState: {
     alignItems: 'center',
-    padding: 48,
-    backgroundColor: '#FFFFFF',
-    marginHorizontal: 16,
-    marginBottom: 16,
-    borderRadius: 16,
+    justifyContent: 'center',
+    paddingVertical: 80,
+    paddingHorizontal: 40,
   },
   emptyStateIcon: {
     marginBottom: 24,
+    opacity: 0.5,
   },
   emptyStateTitle: {
-    fontSize: 20,
-    fontWeight: '600',
-    color: '#000000',
-    marginBottom: 8,
+    fontSize: 22,
+    fontWeight: '700',
+    color: '#1C1C1E',
+    marginBottom: 12,
+    letterSpacing: -0.3,
   },
   emptyStateSubtext: {
-    fontSize: 14,
-    color: '#8E8E93',
+    fontSize: 15,
+    color: '#64748B',
     textAlign: 'center',
-    lineHeight: 20,
+    lineHeight: 22,
   },
   emptyStateActions: {
     flexDirection: 'row',
@@ -1832,20 +2790,25 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFFFFF',
     borderRadius: 16,
     overflow: 'hidden',
-    shadowColor: '#000000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.08,
-    shadowRadius: 8,
-    elevation: 3,
     marginBottom: 12,
+    ...Platform.select({
+      ios: {
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 1 },
+        shadowOpacity: 0.06,
+        shadowRadius: 8,
+      },
+      android: {
+        elevation: 2,
+      },
+    }),
+    borderWidth: 1,
+    borderColor: '#F1F5F9',
   },
   connectionCardEmergency: {
-    borderWidth: 2,
-    borderColor: '#EF4444',
-    shadowColor: '#EF4444',
-    shadowOpacity: 0.2,
-    shadowRadius: 8,
-    elevation: 3,
+    borderWidth: 1.5,
+    borderColor: '#FCA5A5',
+    backgroundColor: '#FEF2F2',
   },
   connectionCardContent: {
     flexDirection: 'row',
@@ -1853,22 +2816,52 @@ const styles = StyleSheet.create({
     padding: 16,
     gap: 12,
   },
+  avatarSection: {
+    position: 'relative',
+  },
   connectionAvatar: {
     width: 56,
     height: 56,
-    borderRadius: 28,
-    backgroundColor: '#34C759',
+    borderRadius: 16,
+    backgroundColor: '#E0E7FF',
     justifyContent: 'center',
     alignItems: 'center',
     position: 'relative',
   },
   connectionAvatarEmergency: {
-    backgroundColor: '#EF4444',
+    backgroundColor: '#FEE2E2',
+  },
+  connectionAvatarOnline: {
+    backgroundColor: '#D1FAE5',
   },
   connectionAvatarText: {
     fontSize: 24,
-    fontWeight: 'bold',
-    color: '#FFFFFF',
+    fontWeight: '700',
+    color: '#6366F1',
+  },
+  onlineIndicator: {
+    position: 'absolute',
+    bottom: -2,
+    right: -2,
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    backgroundColor: '#10B981',
+    borderWidth: 3,
+    borderColor: '#FFFFFF',
+  },
+  lockIconContainer: {
+    position: 'absolute',
+    top: -4,
+    right: -4,
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: '#FFFFFF',
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 1.5,
+    borderColor: '#DC2626',
   },
   statusIndicator: {
     position: 'absolute',
@@ -1884,24 +2877,26 @@ const styles = StyleSheet.create({
   statusIndicatorOnline: {
     backgroundColor: '#34C759',
   },
-  connectionDetails: {
+  infoSection: {
     flex: 1,
+    marginLeft: 4,
   },
-  connectionNameRow: {
+  nameRow: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    marginBottom: 4,
+    marginBottom: 6,
+    gap: 8,
   },
   connectionName: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#000000',
+    fontSize: 17,
+    fontWeight: '700',
+    color: '#1C1C1E',
     flex: 1,
+    letterSpacing: -0.2,
   },
   connectionNameEmergency: {
-    color: '#EF4444',
-    fontWeight: '700',
+    color: '#DC2626',
   },
   badgeContainer: {
     flexDirection: 'row',
@@ -1925,140 +2920,130 @@ const styles = StyleSheet.create({
   statusBadge: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#F5F5F5',
+    backgroundColor: '#F1F5F9',
     paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 12,
-    gap: 4,
+    paddingVertical: 3,
+    borderRadius: 10,
+    gap: 5,
   },
   statusBadgeOnline: {
-    backgroundColor: '#E8F5E9',
+    backgroundColor: '#ECFDF5',
   },
   statusDot: {
     width: 6,
     height: 6,
     borderRadius: 3,
-    backgroundColor: '#8E8E93',
+    backgroundColor: '#94A3B8',
   },
   statusDotOnline: {
-    backgroundColor: '#34C759',
+    backgroundColor: '#10B981',
   },
   statusText: {
-    fontSize: 12,
+    fontSize: 11,
     fontWeight: '600',
-    color: '#8E8E93',
+    color: '#64748B',
+    textTransform: 'uppercase',
+    letterSpacing: 0.3,
   },
   statusTextOnline: {
-    color: '#34C759',
+    color: '#10B981',
   },
-  locationInfo: {
+  alertMessage: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginTop: 6,
     gap: 4,
+    marginTop: 4,
   },
-  locationText: {
+  alertMessageText: {
     fontSize: 12,
-    color: '#34C759',
+    color: '#DC2626',
+    fontWeight: '500',
+  },
+  infoMessage: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    marginTop: 4,
+  },
+  infoMessageText: {
+    fontSize: 12,
+    color: '#64748B',
+    fontWeight: '500',
+  },
+  actionButtonsContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  mapButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    backgroundColor: '#EEF2FF',
+    gap: 6,
+  },
+  mapButtonText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#6366F1',
+  },
+  menuButton: {
+    width: 36,
+    height: 36,
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderRadius: 8,
+    backgroundColor: '#F8FAFC',
+  },
+  toggleSection: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    borderTopWidth: 1,
+    borderTopColor: '#F1F5F9',
+    backgroundColor: '#FAFBFC',
+  },
+  toggleContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
     flex: 1,
   },
-  locationTextEmergency: {
-    color: '#EF4444',
+  toggleLabel: {
+    fontSize: 14,
     fontWeight: '600',
+    color: '#1C1C1E',
   },
-  noLocationText: {
-    fontSize: 12,
-    color: '#8E8E93',
-    marginTop: 6,
-    fontStyle: 'italic',
-  },
-  connectionActions: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'flex-end',
-    gap: 8,
-    paddingHorizontal: 16,
-    paddingBottom: 16,
-    paddingTop: 8,
-    borderTopWidth: 1,
-    borderTopColor: '#E5E5EA',
-  },
-  unlockButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#E8F5E9',
-    paddingVertical: 6,
-    paddingHorizontal: 12,
-    borderRadius: 6,
-    gap: 4,
-  },
-  unlockButtonText: {
-    fontSize: 12,
-    fontWeight: '600',
-    color: '#34C759',
-  },
-  viewLocationButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#F0F7FF',
-    paddingVertical: 6,
-    paddingHorizontal: 12,
-    borderRadius: 6,
-    gap: 4,
-  },
-  viewLocationButtonText: {
-    fontSize: 12,
-    fontWeight: '600',
-    color: '#007AFF',
-  },
-  removeButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#FEE2E2',
-    paddingVertical: 6,
-    paddingHorizontal: 12,
-    borderRadius: 6,
-    gap: 4,
-  },
-  removeButtonText: {
-    fontSize: 12,
-    fontWeight: '600',
-    color: '#FF3B30',
+  toggleLabelDisabled: {
+    color: '#94A3B8',
   },
   emergencyBanner: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#EF4444',
-    paddingVertical: 10,
-    paddingHorizontal: 16,
-    gap: 8,
-  },
-  emergencyBannerText: {
-    fontSize: 14,
-    fontWeight: '700',
-    color: '#FFFFFF',
-    letterSpacing: 1,
-  },
-  emergencyMessage: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#FEE2E2',
+    backgroundColor: '#DC2626',
     paddingVertical: 8,
     paddingHorizontal: 12,
-    borderRadius: 8,
-    marginTop: 8,
-    gap: 8,
+    gap: 6,
   },
-  emergencyMessageText: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: '#EF4444',
-    flex: 1,
+  emergencyBannerText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#FFFFFF',
+    letterSpacing: 0.5,
+    textTransform: 'uppercase',
   },
   modalOverlay: {
     flex: 1,
     backgroundColor: 'rgba(0, 0, 0, 0.5)',
+  },
+  modalOverlayPressable: {
+    flex: 1,
     justifyContent: 'flex-end',
   },
   modalContent: {
@@ -2174,5 +3159,366 @@ const styles = StyleSheet.create({
     color: '#007AFF',
     fontSize: 16,
     fontWeight: '600',
+  },
+  enterCodeInstructionsSection: {
+    backgroundColor: '#FFFFFF',
+    padding: 20,
+    marginBottom: 16,
+  },
+  enterCodeInstructionsHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 20,
+    gap: 8,
+  },
+  enterCodeInstructionsTitle: {
+    fontSize: 20,
+    fontWeight: '700',
+    color: '#000000',
+  },
+  enterCodeInstructionsList: {
+    gap: 20,
+  },
+  enterCodeInstructionItem: {
+    flexDirection: 'row',
+    gap: 16,
+  },
+  enterCodeInstructionNumber: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: '#F0F7FF',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  enterCodeInstructionNumberText: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#007AFF',
+  },
+  enterCodeInstructionContent: {
+    flex: 1,
+  },
+  enterCodeInstructionTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#000000',
+    marginBottom: 4,
+  },
+  enterCodeInstructionText: {
+    fontSize: 14,
+    color: '#8E8E93',
+    lineHeight: 20,
+  },
+  enterCodeSectionTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: '#000000',
+    marginBottom: 20,
+    textAlign: 'center',
+  },
+  inviteByPhoneButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#007AFF',
+    paddingVertical: 16,
+    paddingHorizontal: 24,
+    borderRadius: 12,
+    marginTop: 12,
+    gap: 8,
+  },
+  inviteByPhoneIconContainer: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: 'rgba(255, 255, 255, 0.2)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  inviteByPhoneButtonText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  invitationsSection: {
+    paddingHorizontal: 16,
+    paddingTop: 16,
+    paddingBottom: 8,
+  },
+  invitationsSectionTitle: {
+    fontSize: 20,
+    fontWeight: '700',
+    color: '#000000',
+    marginBottom: 16,
+  },
+  invitationsList: {
+    gap: 12,
+    marginBottom: 16,
+  },
+  invitationCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 20,
+    padding: 20,
+    marginBottom: 12,
+    ...Platform.select({
+      ios: {
+        shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.08,
+        shadowRadius: 12,
+      },
+      android: {
+    elevation: 3,
+      },
+    }),
+    borderWidth: 1,
+    borderColor: '#F1F5F9',
+  },
+  invitationCardContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 16,
+    gap: 16,
+  },
+  invitationAvatar: {
+    width: 56,
+    height: 56,
+    borderRadius: 18,
+    backgroundColor: '#E0E7FF',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  invitationAvatarText: {
+    fontSize: 24,
+    fontWeight: '700',
+    color: '#6366F1',
+  },
+  invitationDetails: {
+    flex: 1,
+  },
+  invitationName: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: '#1C1C1E',
+    marginBottom: 4,
+    letterSpacing: -0.3,
+  },
+  invitationText: {
+    fontSize: 14,
+    color: '#64748B',
+  },
+  invitationActions: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  acceptButton: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#10B981',
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 12,
+    gap: 6,
+  },
+  acceptButtonText: {
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  rejectButton: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#FEF2F2',
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 12,
+    gap: 6,
+    borderWidth: 1,
+    borderColor: '#FEE2E2',
+  },
+  rejectButtonText: {
+    color: '#DC2626',
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  invitePhoneContent: {
+    paddingHorizontal: 20,
+    paddingTop: 16,
+    paddingBottom: 40,
+  },
+  phoneInputContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#F8FAFC',
+    borderRadius: 14,
+    paddingHorizontal: 16,
+    borderWidth: 1.5,
+    borderColor: '#E2E8F0',
+    minHeight: 56,
+  },
+  phoneInputIcon: {
+    marginRight: 12,
+  },
+  phoneInput: {
+    flex: 1,
+    fontSize: 16,
+    color: '#1C1C1E',
+    paddingVertical: 16,
+    fontWeight: '500',
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  modalKeyboardView: {
+    width: '100%',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  invitePhoneModalContent: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 24,
+    width: '90%',
+    maxWidth: 400,
+    ...Platform.select({
+      ios: {
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 10 },
+        shadowOpacity: 0.15,
+        shadowRadius: 24,
+      },
+      android: {
+        elevation: 12,
+      },
+    }),
+  },
+  invitePhoneModalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 24,
+    paddingTop: 24,
+    paddingBottom: 20,
+    borderBottomWidth: 1,
+    borderBottomColor: '#F1F5F9',
+  },
+  invitePhoneModalTitle: {
+    fontSize: 22,
+    fontWeight: '700',
+    color: '#1C1C1E',
+    letterSpacing: -0.3,
+  },
+  invitePhoneModalCloseButton: {
+    width: 32,
+    height: 32,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  invitePhoneModalBody: {
+    padding: 20,
+  },
+  invitePhoneModalButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#6366F1',
+    paddingVertical: 16,
+    paddingHorizontal: 24,
+    borderRadius: 14,
+    gap: 8,
+    marginTop: 20,
+    marginBottom: 16,
+    ...Platform.select({
+      ios: {
+        shadowColor: '#6366F1',
+        shadowOffset: { width: 0, height: 4 },
+        shadowOpacity: 0.2,
+        shadowRadius: 8,
+      },
+      android: {
+        elevation: 4,
+      },
+    }),
+  },
+  invitePhoneModalButtonDisabled: {
+    opacity: 0.5,
+    backgroundColor: '#94A3B8',
+  },
+  invitePhoneModalButtonText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  invitePhoneModalInfo: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    marginTop: 8,
+  },
+  invitePhoneModalInfoText: {
+    fontSize: 12,
+    color: '#8E8E93',
+  },
+  connectButtonsContainer: {
+    gap: 12,
+    marginTop: 12,
+  },
+  connectButtonPrimary: {
+    backgroundColor: '#007AFF',
+  },
+  connectButtonSecondary: {
+    backgroundColor: '#F0F7FF',
+    borderWidth: 1.5,
+    borderColor: '#007AFF',
+  },
+  connectButtonIconContainer: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: 'rgba(255, 255, 255, 0.2)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  connectButtonIconContainerSecondary: {
+    backgroundColor: 'transparent',
+  },
+  connectButtonText: {
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  connectButtonTextSecondary: {
+    color: '#007AFF',
+  },
+  codeDisplayContainer: {
+    backgroundColor: '#F0F7FF',
+    borderRadius: 16,
+    padding: 24,
+    alignItems: 'center',
+    marginBottom: 16,
+    borderWidth: 2,
+    borderColor: '#007AFF',
+  },
+  codeDisplayText: {
+    fontSize: 36,
+    fontWeight: 'bold',
+    color: '#007AFF',
+    letterSpacing: 8,
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+  },
+  codeDisplayHint: {
+    fontSize: 13,
+    color: '#8E8E93',
+    textAlign: 'center',
+    marginBottom: 16,
+    lineHeight: 18,
   },
 });

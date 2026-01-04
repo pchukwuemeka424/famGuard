@@ -1,8 +1,10 @@
 import * as Location from 'expo-location';
 import * as Battery from 'expo-battery';
+import * as TaskManager from 'expo-task-manager';
 import { Platform } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from '../lib/supabase';
-import { notificationService } from './notificationService';
+import { LOCATION_TASK_NAME } from '../tasks/locationBackgroundTask';
 import type { Location as LocationType } from '../types';
 
 interface LocationServiceConfig {
@@ -38,6 +40,10 @@ class LocationService {
   private readonly PROXIMITY_DISTANCE_THRESHOLD = 50; // 50 meters - proximity threshold for stationary detection
   // Track stationary location for proximity-based history insertion
   private stationaryLocation: { location: LocationType; timestamp: number } | null = null;
+  // Track stationary location for preventing database updates (1 hour + 30m threshold)
+  private readonly STATIONARY_BLOCK_THRESHOLD = 3600000; // 1 hour - block all updates if stationary for this long
+  private readonly STATIONARY_BLOCK_DISTANCE = 30; // 30 meters - proximity threshold for blocking updates
+  private stationaryBlockLocation: { location: LocationType; timestamp: number } | null = null;
   // Rate limiting for geocoding
   private lastGeocodeTime: number = 0;
   private geocodeCache: Map<string, { address: string | null; timestamp: number }> = new Map();
@@ -48,21 +54,36 @@ class LocationService {
 
   /**
    * Request location permissions
+   * @returns Object with success status and message for better error handling
    */
-  async requestPermissions(): Promise<boolean> {
+  async requestPermissions(): Promise<{ granted: boolean; message?: string; canAskAgain?: boolean }> {
     try {
       // Check if location services are enabled
       const enabled = await Location.hasServicesEnabledAsync();
       if (!enabled) {
-        console.warn('Location services are disabled');
-        return false;
+        const message = Platform.OS === 'android' 
+          ? 'Location services are disabled. Please enable location services in your device settings.'
+          : 'Location services are disabled. Please enable location services in Settings.';
+        console.warn(message);
+        return { granted: false, message };
       }
 
-      const { status: foregroundStatus } = await Location.requestForegroundPermissionsAsync();
+      // Request foreground permissions
+      const { status: foregroundStatus, canAskAgain } = await Location.requestForegroundPermissionsAsync();
       
       if (foregroundStatus !== 'granted') {
-        console.warn('Foreground location permission denied');
-        return false;
+        let message = 'Location permission denied';
+        if (foregroundStatus === 'denied' && !canAskAgain) {
+          // Permission permanently denied - user needs to go to settings
+          message = Platform.OS === 'android'
+            ? 'Location permission is permanently denied. Please enable it in App Settings > Permissions > Location.'
+            : 'Location permission is permanently denied. Please enable it in Settings > Privacy > Location Services.';
+        } else if (foregroundStatus === 'denied') {
+          message = 'Location permission was denied. Please grant permission to share your location.';
+        }
+        
+        console.warn(`Foreground location permission denied: ${foregroundStatus}`, { canAskAgain });
+        return { granted: false, message, canAskAgain };
       }
 
       // Request background permission for iOS (optional, not required for basic functionality)
@@ -78,15 +99,21 @@ class LocationService {
         }
       }
 
-      return true;
+      console.log('Location permissions granted successfully');
+      return { granted: true };
     } catch (error: any) {
       // Handle specific error about missing Info.plist keys
       if (error?.message?.includes('NSLocation') || error?.message?.includes('Info.plist')) {
-        console.error('Location permission error: Missing Info.plist configuration. Please rebuild the app.');
-        throw new Error('Location permissions not configured. Please rebuild the app with updated app.json');
+        const message = 'Location permissions not configured. Please rebuild the app with updated app.json';
+        console.error(message);
+        throw new Error(message);
       }
+      
+      const errorMessage = Platform.OS === 'android'
+        ? 'Failed to request location permission. Please check your device settings.'
+        : 'Failed to request location permission.';
       console.error('Error requesting location permissions:', error);
-      return false;
+      return { granted: false, message: errorMessage };
     }
   }
 
@@ -104,21 +131,112 @@ class LocationService {
   }
 
   /**
-   * Get current location
+   * Get last known location (cached, returns immediately)
    */
-  async getCurrentLocation(): Promise<LocationType | null> {
+  getLastKnownLocation(): LocationType | null {
+    return this.lastLocation;
+  }
+
+  /**
+   * Get current location quickly (with shorter timeout for faster response)
+   * @param requestPermissionIfNeeded - If true, will request permission if not granted. Default: false
+   * @param fastMode - If true, uses shorter timeout (2s) and allows cached location. Default: false
+   */
+  async getCurrentLocationFast(requestPermissionIfNeeded: boolean = false, fastMode: boolean = true): Promise<LocationType | null> {
     try {
       const hasPermission = await this.checkPermissions();
       if (!hasPermission) {
-        const granted = await this.requestPermissions();
-        if (!granted) {
+        if (requestPermissionIfNeeded) {
+          const permissionResult = await this.requestPermissions();
+          if (!permissionResult.granted) {
+            return this.lastLocation; // Return cached if permission denied
+          }
+        } else {
+          return this.lastLocation; // Return cached location if no permission
+        }
+      }
+
+      // Use shorter timeout for fast mode
+      const locationOptions = Platform.OS === 'ios'
+        ? {
+            accuracy: fastMode ? Location.Accuracy.Balanced : this.config.accuracy,
+            maximumAge: fastMode ? 10000 : 0, // Allow 10s old data in fast mode
+            timeout: fastMode ? 2000 : 15000, // 2s timeout in fast mode
+            distanceInterval: 0,
+          }
+        : {
+            accuracy: fastMode ? Location.Accuracy.Balanced : this.config.accuracy,
+            maximumAge: fastMode ? 10000 : 5000,
+            timeout: fastMode ? 2000 : 10000, // 2s timeout in fast mode
+          };
+      
+      const location = await Location.getCurrentPositionAsync(locationOptions);
+
+      // Skip geocoding in fast mode to save time
+      if (fastMode && this.lastLocation?.address) {
+        return {
+          latitude: location.coords.latitude,
+          longitude: location.coords.longitude,
+          address: this.lastLocation.address, // Use cached address
+        };
+      }
+
+      // Reverse geocode to get address (only if not in cache)
+      const address = await this.reverseGeocode(
+        location.coords.latitude,
+        location.coords.longitude,
+        false // Don't force - use cache and rate limiting
+      );
+
+      return {
+        latitude: location.coords.latitude,
+        longitude: location.coords.longitude,
+        address: address || undefined,
+      };
+    } catch (error) {
+      // Return cached location if fetch fails
+      if (this.lastLocation) {
+        return this.lastLocation;
+      }
+      console.error('Error getting current location:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Get current location
+   * @param requestPermissionIfNeeded - If true, will request permission if not granted. Default: false
+   */
+  async getCurrentLocation(requestPermissionIfNeeded: boolean = false): Promise<LocationType | null> {
+    try {
+      const hasPermission = await this.checkPermissions();
+      if (!hasPermission) {
+        if (requestPermissionIfNeeded) {
+          const permissionResult = await this.requestPermissions();
+          if (!permissionResult.granted) {
+            return null;
+          }
+        } else {
+          // Don't request permission automatically - return null
           return null;
         }
       }
 
-      const location = await Location.getCurrentPositionAsync({
-        accuracy: this.config.accuracy,
-      });
+      // iOS-specific options to force fresh GPS reading
+      const locationOptions = Platform.OS === 'ios'
+        ? {
+            accuracy: this.config.accuracy,
+            maximumAge: 0, // Force fresh location on iOS
+            timeout: 15000,
+            distanceInterval: 0,
+          }
+        : {
+            accuracy: this.config.accuracy,
+            maximumAge: 5000,
+            timeout: 10000,
+          };
+      
+      const location = await Location.getCurrentPositionAsync(locationOptions);
 
       // Reverse geocode to get address (only if not in cache)
       const address = await this.reverseGeocode(
@@ -140,21 +258,44 @@ class LocationService {
 
   /**
    * Get high-accuracy current location (for exact location features)
+   * @param requestPermissionIfNeeded - If true, will request permission if not granted. Default: false
    */
-  async getHighAccuracyLocation(): Promise<LocationType | null> {
+  async getHighAccuracyLocation(requestPermissionIfNeeded: boolean = false): Promise<LocationType | null> {
     try {
       const hasPermission = await this.checkPermissions();
       if (!hasPermission) {
-        const granted = await this.requestPermissions();
-        if (!granted) {
+        if (requestPermissionIfNeeded) {
+          const permissionResult = await this.requestPermissions();
+          if (!permissionResult.granted) {
+            return null;
+          }
+        } else {
+          // Don't request permission automatically - return null
           return null;
         }
       }
 
-      // Use highest accuracy for exact location
-      const location = await Location.getCurrentPositionAsync({
-        accuracy: Location.Accuracy.Highest,
-      });
+      // Use best accuracy for exact location
+      // On iOS, BestForNavigation provides the most accurate GPS positioning
+      const accuracy = Platform.OS === 'ios' 
+        ? Location.Accuracy.BestForNavigation 
+        : Location.Accuracy.Highest;
+      
+      // iOS-specific options to force fresh GPS reading and prevent cached data
+      const locationOptions = Platform.OS === 'ios'
+        ? {
+            accuracy,
+            maximumAge: 0, // Force fresh location, don't use cached data
+            timeout: 15000, // Wait up to 15 seconds for accurate GPS reading
+            distanceInterval: 0, // No distance threshold - get exact location
+          }
+        : {
+            accuracy,
+            maximumAge: 5000, // Allow 5 second old data on Android
+            timeout: 10000,
+          };
+      
+      const location = await Location.getCurrentPositionAsync(locationOptions);
 
       // Reverse geocode to get address (only if not in cache)
       const address = await this.reverseGeocode(
@@ -163,15 +304,29 @@ class LocationService {
         false // Don't force - use cache and rate limiting to prevent rate limit errors
       );
 
-      return {
+      const result = {
         latitude: location.coords.latitude,
         longitude: location.coords.longitude,
         address: address || undefined,
       };
+
+      // Log location accuracy for debugging on iOS
+      if (__DEV__ && Platform.OS === 'ios') {
+        console.log('High accuracy location fetched:', {
+          lat: result.latitude.toFixed(6),
+          lng: result.longitude.toFixed(6),
+          accuracy: location.coords.accuracy,
+          altitude: location.coords.altitude,
+          heading: location.coords.heading,
+          speed: location.coords.speed,
+        });
+      }
+
+      return result;
     } catch (error) {
       console.error('Error getting high accuracy location:', error);
-      // Fallback to regular accuracy
-      return this.getCurrentLocation();
+      // Fallback to regular accuracy (with same permission request flag)
+      return this.getCurrentLocation(requestPermissionIfNeeded);
     }
   }
 
@@ -318,17 +473,36 @@ class LocationService {
       return;
     }
 
-    const hasPermission = await this.requestPermissions();
-    if (!hasPermission) {
-      throw new Error('Location permissions not granted');
+    const permissionResult = await this.requestPermissions();
+    if (!permissionResult.granted) {
+      throw new Error(permissionResult.message || 'Location permissions not granted');
+    }
+
+    // Request background permission for Android
+    if (Platform.OS === 'android') {
+      try {
+        const { status: backgroundStatus } = await Location.requestBackgroundPermissionsAsync();
+        if (backgroundStatus !== 'granted') {
+          console.warn('Background location permission denied - location tracking may stop when app is closed');
+        } else {
+          console.log('Background location permission granted');
+        }
+      } catch (bgError) {
+        console.warn('Background permission request failed:', bgError);
+      }
     }
 
     this.userId = userId;
     this.familyGroupId = familyGroupId;
     this.isTracking = true;
 
-    // Get initial location with highest accuracy
-    const initialLocation = await this.getHighAccuracyLocation();
+    // Store userId and familyGroupId for background task
+    await AsyncStorage.setItem('location_tracking_userId', userId);
+    await AsyncStorage.setItem('location_tracking_familyGroupId', familyGroupId);
+    await AsyncStorage.setItem('location_tracking_shareLocation', shareLocation.toString());
+
+    // Get initial location with highest accuracy (permission already requested above)
+    const initialLocation = await this.getHighAccuracyLocation(true);
     if (initialLocation) {
       await this.updateLocationInDatabase(initialLocation, shareLocation);
       // Track the initial database update
@@ -339,17 +513,38 @@ class LocationService {
     }
 
     // Start watching location changes with highest accuracy
+    // Use iOS-specific settings for better accuracy
+    const watchOptions = Platform.OS === 'ios'
+      ? {
+          accuracy: Location.Accuracy.BestForNavigation, // Best accuracy for iOS
+          timeInterval: this.config.updateInterval,
+          distanceInterval: this.config.distanceThreshold,
+        }
+      : {
+          accuracy: Location.Accuracy.Highest,
+          timeInterval: this.config.updateInterval,
+          distanceInterval: this.config.distanceThreshold,
+        };
+
     this.watchSubscription = await Location.watchPositionAsync(
-      {
-        accuracy: Location.Accuracy.Highest, // Use highest accuracy for exact location
-        timeInterval: this.config.updateInterval,
-        distanceInterval: this.config.distanceThreshold,
-      },
+      watchOptions,
       async (location) => {
         const newLocation: LocationType = {
           latitude: location.coords.latitude,
           longitude: location.coords.longitude,
         };
+
+        // Log location accuracy for debugging on iOS
+        if (__DEV__ && Platform.OS === 'ios') {
+          console.log('Location watch update:', {
+            lat: newLocation.latitude.toFixed(6),
+            lng: newLocation.longitude.toFixed(6),
+            accuracy: location.coords.accuracy,
+            altitude: location.coords.altitude,
+            heading: location.coords.heading,
+            speed: location.coords.speed,
+          });
+        }
 
         // Check if we should update the database
         const shouldUpdate = this.shouldUpdateDatabase(newLocation);
@@ -384,7 +579,7 @@ class LocationService {
 
     // Also set up periodic updates every 10 minutes as backup with high accuracy
     this.updateInterval = setInterval(async () => {
-      const location = await this.getHighAccuracyLocation();
+      const location = await this.getHighAccuracyLocation(true); // Permission already granted
       if (location) {
         // Check if we should update the database
         const shouldUpdate = this.shouldUpdateDatabase(location);
@@ -410,12 +605,53 @@ class LocationService {
         };
       }
     }, this.config.updateInterval);
+
+    // Start background location tracking (Android only - iOS uses watchPositionAsync)
+    if (Platform.OS === 'android') {
+      try {
+        const hasStarted = await Location.startLocationUpdatesAsync(LOCATION_TASK_NAME, {
+          accuracy: Location.Accuracy.Highest,
+          timeInterval: this.config.updateInterval,
+          distanceInterval: this.config.distanceThreshold,
+          foregroundService: {
+            notificationTitle: 'Location Tracking',
+            notificationBody: 'FamGuard is tracking your location to share with family members.',
+            notificationColor: '#DC2626',
+          },
+          pausesUpdatesAutomatically: false,
+          showsBackgroundLocationIndicator: true,
+        });
+
+        if (hasStarted) {
+          console.log('Background location tracking started');
+        }
+      } catch (bgError) {
+        console.error('Failed to start background location tracking:', bgError);
+        // Continue with foreground tracking even if background fails
+      }
+    } else {
+      // iOS: watchPositionAsync already works in background with proper permissions
+      console.log('iOS background location tracking enabled via watchPositionAsync');
+    }
   }
 
   /**
    * Stop tracking location and set user as offline
    */
-  stopLocationSharing(): void {
+  async stopLocationSharing(): Promise<void> {
+    // Stop background location tracking (Android)
+    if (Platform.OS === 'android') {
+      try {
+        const hasStarted = await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME);
+        if (hasStarted) {
+          await Location.stopLocationUpdatesAsync(LOCATION_TASK_NAME);
+          console.log('Background location tracking stopped');
+        }
+      } catch (bgError) {
+        console.error('Error stopping background location tracking:', bgError);
+      }
+    }
+
     if (this.watchSubscription) {
       this.watchSubscription.remove();
       this.watchSubscription = null;
@@ -425,6 +661,13 @@ class LocationService {
       clearInterval(this.updateInterval);
       this.updateInterval = null;
     }
+
+    // Clear stored tracking data
+    await AsyncStorage.multiRemove([
+      'location_tracking_userId',
+      'location_tracking_familyGroupId',
+      'location_tracking_shareLocation',
+    ]);
 
     // Set user as offline when location sharing stops
     if (this.userId && this.familyGroupId) {
@@ -439,6 +682,7 @@ class LocationService {
     this.lastLocation = null;
     this.lastDatabaseUpdate = null;
     this.stationaryLocation = null; // Reset stationary location tracking
+    this.stationaryBlockLocation = null; // Reset stationary block tracking
   }
 
   /**
@@ -810,6 +1054,9 @@ class LocationService {
    * Only update if:
    * 1. User has moved significantly (more than distanceThreshold), OR
    * 2. It's been a very long time since last update (even if stationary)
+   * 
+   * BLOCKS updates if:
+   * - User has been in same location (within 30m) for more than 1 hour
    */
   private shouldUpdateDatabase(newLocation: LocationType): boolean {
     const now = Date.now();
@@ -819,14 +1066,7 @@ class LocationService {
       return true;
     }
 
-    // Check if it's been a very long time since last update (30+ minutes)
-    // Update even if stationary to keep last_seen timestamp fresh
-    const timeSinceLastUpdate = now - this.lastDatabaseUpdate.timestamp;
-    if (timeSinceLastUpdate >= this.STATIONARY_UPDATE_INTERVAL) {
-      return true;
-    }
-
-    // Check if user has moved significantly from last database update
+    // Check distance from last database update
     const distance = this.calculateDistance(
       this.lastDatabaseUpdate.location.latitude,
       this.lastDatabaseUpdate.location.longitude,
@@ -834,7 +1074,67 @@ class LocationService {
       newLocation.longitude
     );
 
-    // Only update if moved more than threshold
+    // If user moved more than 30m away from threshold, ALWAYS update location
+    if (distance > this.STATIONARY_BLOCK_DISTANCE) {
+      // User moved away from stationary location - reset tracking and allow update
+      this.stationaryBlockLocation = null;
+      if (__DEV__) {
+        console.log(`User moved ${distance.toFixed(1)}m away from threshold - allowing location update`);
+      }
+      return true;
+    }
+
+    // User is within 30m - check if they've been stationary for 1+ hour
+    if (this.stationaryBlockLocation) {
+      // Check if still in same location as tracked stationary location
+      const distanceFromStationary = this.calculateDistance(
+        this.stationaryBlockLocation.location.latitude,
+        this.stationaryBlockLocation.location.longitude,
+        newLocation.latitude,
+        newLocation.longitude
+      );
+
+      if (distanceFromStationary <= this.STATIONARY_BLOCK_DISTANCE) {
+        // Still in same stationary location - check time
+        const timeStationary = now - this.stationaryBlockLocation.timestamp;
+        
+        if (timeStationary >= this.STATIONARY_BLOCK_THRESHOLD) {
+          // User has been stationary for 1+ hour - BLOCK all updates
+          if (__DEV__) {
+            console.log(`Blocking location update - user stationary for ${Math.round(timeStationary / 60000)} minutes (${Math.round(timeStationary / 3600000)} hours) within ${distance.toFixed(1)}m`);
+          }
+          return false;
+        }
+      } else {
+        // Moved to a different location within 30m - reset tracking
+        this.stationaryBlockLocation = {
+          location: { ...newLocation },
+          timestamp: now,
+        };
+      }
+    } else {
+      // Start tracking stationary location
+      this.stationaryBlockLocation = {
+        location: { ...newLocation },
+        timestamp: now,
+      };
+    }
+
+    // Check if it's been a very long time since last update (30+ minutes)
+    // Update even if stationary to keep last_seen timestamp fresh
+    // BUT only if not blocked by 1-hour stationary rule above
+    const timeSinceLastUpdate = now - this.lastDatabaseUpdate.timestamp;
+    if (timeSinceLastUpdate >= this.STATIONARY_UPDATE_INTERVAL) {
+      // Only allow update if hasn't been stationary for 1+ hour
+      if (!this.stationaryBlockLocation || 
+          (now - this.stationaryBlockLocation.timestamp) < this.STATIONARY_BLOCK_THRESHOLD) {
+        return true;
+      }
+      // Blocked by 1-hour stationary rule
+      return false;
+    }
+
+    // Only update if moved more than threshold (50m) when within 30m zone
     return distance > this.config.distanceThreshold;
   }
 
@@ -970,6 +1270,16 @@ class LocationService {
   }
 
   /**
+   * Get address from coordinates (public method for forcing geocoding)
+   * @param latitude - Latitude coordinate
+   * @param longitude - Longitude coordinate
+   * @param force - Force geocoding even if rate limited (use with caution)
+   */
+  async getAddressFromCoordinates(latitude: number, longitude: number, force: boolean = true): Promise<string | null> {
+    return this.reverseGeocode(latitude, longitude, force);
+  }
+
+  /**
    * Get battery level (if available)
    */
   async getBatteryLevel(): Promise<number> {
@@ -999,6 +1309,90 @@ class LocationService {
   }
 
   /**
+   * Notify location service that a location update was made to the database
+   * This helps track the last database update for blocking logic
+   * @param location - The location that was updated
+   */
+  notifyLocationUpdated(location: LocationType): void {
+    this.lastDatabaseUpdate = {
+      location: { ...location },
+      timestamp: Date.now(),
+    };
+  }
+
+  /**
+   * Check if location update should be blocked due to stationary status
+   * Returns true if update should be blocked (user stationary for 1+ hour within 30m)
+   * Returns false if user moved away from 30m threshold (update should proceed)
+   * @param newLocation - The new location to check
+   * @returns true if update should be blocked, false otherwise
+   */
+  shouldBlockLocationUpdate(newLocation: LocationType): boolean {
+    const now = Date.now();
+
+    // If no previous database update, allow update
+    if (!this.lastDatabaseUpdate) {
+      return false;
+    }
+
+    // Check distance from last database update
+    const distance = this.calculateDistance(
+      this.lastDatabaseUpdate.location.latitude,
+      this.lastDatabaseUpdate.location.longitude,
+      newLocation.latitude,
+      newLocation.longitude
+    );
+
+    // If user moved more than 30m away from threshold, ALWAYS allow update
+    if (distance > this.STATIONARY_BLOCK_DISTANCE) {
+      // User moved away from stationary location - reset tracking and allow update
+      this.stationaryBlockLocation = null;
+      if (__DEV__) {
+        console.log(`User moved ${distance.toFixed(1)}m away from threshold - allowing location update`);
+      }
+      return false;
+    }
+
+    // User is within 30m - check if they've been stationary for 1+ hour
+    if (this.stationaryBlockLocation) {
+      // Check if still in same location as tracked stationary location
+      const distanceFromStationary = this.calculateDistance(
+        this.stationaryBlockLocation.location.latitude,
+        this.stationaryBlockLocation.location.longitude,
+        newLocation.latitude,
+        newLocation.longitude
+      );
+
+      if (distanceFromStationary <= this.STATIONARY_BLOCK_DISTANCE) {
+        // Still in same stationary location - check time
+        const timeStationary = now - this.stationaryBlockLocation.timestamp;
+        
+        if (timeStationary >= this.STATIONARY_BLOCK_THRESHOLD) {
+          // User has been stationary for 1+ hour - BLOCK all updates
+          if (__DEV__) {
+            console.log(`Blocking location update - user stationary for ${Math.round(timeStationary / 60000)} minutes (${Math.round(timeStationary / 3600000)} hours) within ${distance.toFixed(1)}m`);
+          }
+          return true;
+        }
+      } else {
+        // Moved to a different location within 30m - reset tracking
+        this.stationaryBlockLocation = {
+          location: { ...newLocation },
+          timestamp: now,
+        };
+      }
+    } else {
+      // Start tracking stationary location
+      this.stationaryBlockLocation = {
+        location: { ...newLocation },
+        timestamp: now,
+      };
+    }
+
+    return false;
+  }
+
+  /**
    * Start emergency location tracking - saves location to history every 1 hour
    */
   async startEmergencyLocationTracking(userId: string): Promise<void> {
@@ -1007,16 +1401,16 @@ class LocationService {
       return;
     }
 
-    const hasPermission = await this.requestPermissions();
-    if (!hasPermission) {
-      throw new Error('Location permissions not granted');
+    const permissionResult = await this.requestPermissions();
+    if (!permissionResult.granted) {
+      throw new Error(permissionResult.message || 'Location permissions not granted');
     }
 
     this.userId = userId;
     this.isEmergencyTracking = true;
 
-    // Get initial location with address and save it to history
-    const initialLocation = await this.getHighAccuracyLocation();
+    // Get initial location with address and save it to history (permission already requested)
+    const initialLocation = await this.getHighAccuracyLocation(true);
     if (initialLocation) {
       // Try to get address if not already available
       if (!initialLocation.address) {
@@ -1046,9 +1440,21 @@ class LocationService {
           return;
         }
 
-        const position = await Location.getCurrentPositionAsync({
-          accuracy: Location.Accuracy.Highest,
-        });
+        // Use iOS-specific options for fresh GPS reading
+        const positionOptions = Platform.OS === 'ios'
+          ? {
+              accuracy: Location.Accuracy.BestForNavigation,
+              maximumAge: 0, // Force fresh location
+              timeout: 15000,
+              distanceInterval: 0,
+            }
+          : {
+              accuracy: Location.Accuracy.Highest,
+              maximumAge: 5000,
+              timeout: 10000,
+            };
+
+        const position = await Location.getCurrentPositionAsync(positionOptions);
 
         const location: LocationType = {
           latitude: position.coords.latitude,
@@ -1105,6 +1511,7 @@ class LocationService {
     }
     this.isEmergencyTracking = false;
     this.stationaryLocation = null; // Reset stationary location tracking
+    this.stationaryBlockLocation = null; // Reset stationary block tracking
     console.log('Emergency location tracking stopped');
   }
 
@@ -1242,9 +1649,21 @@ class LocationService {
           return;
         }
 
-        const position = await Location.getCurrentPositionAsync({
-          accuracy: Location.Accuracy.Highest,
-        });
+        // Use iOS-specific options for fresh GPS reading
+        const positionOptions = Platform.OS === 'ios'
+          ? {
+              accuracy: Location.Accuracy.BestForNavigation,
+              maximumAge: 0, // Force fresh location
+              timeout: 15000,
+              distanceInterval: 0,
+            }
+          : {
+              accuracy: Location.Accuracy.Highest,
+              maximumAge: 5000,
+              timeout: 10000,
+            };
+
+        const position = await Location.getCurrentPositionAsync(positionOptions);
 
         const location: LocationType = {
           latitude: position.coords.latitude,
@@ -1280,9 +1699,21 @@ class LocationService {
           return;
         }
 
-        const position = await Location.getCurrentPositionAsync({
-          accuracy: Location.Accuracy.Highest,
-        });
+        // Use iOS-specific options for fresh GPS reading
+        const positionOptions = Platform.OS === 'ios'
+          ? {
+              accuracy: Location.Accuracy.BestForNavigation,
+              maximumAge: 0, // Force fresh location
+              timeout: 15000,
+              distanceInterval: 0,
+            }
+          : {
+              accuracy: Location.Accuracy.Highest,
+              maximumAge: 5000,
+              timeout: 10000,
+            };
+
+        const position = await Location.getCurrentPositionAsync(positionOptions);
 
         const location: LocationType = {
           latitude: position.coords.latitude,

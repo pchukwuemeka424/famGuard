@@ -1,6 +1,8 @@
 import React, { createContext, useState, useContext, useEffect, useRef, ReactNode } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { supabase } from '../lib/supabase';
+import { supabase, hasValidSupabaseConfig } from '../lib/supabase';
+import { logger } from '../utils/logger';
+import { pushNotificationService } from '../services/pushNotificationService';
 import type { User } from '../types';
 
 interface AuthContextType {
@@ -14,6 +16,7 @@ interface AuthContextType {
   quickLogin: (email: string) => Promise<void>;
   signup: (name: string, email: string, phone: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
+  deleteAccount: () => Promise<void>;
   completeOnboarding: () => Promise<void>;
   updateUser: (updates: Partial<User>) => Promise<void>;
   clearLastLoggedInEmail: () => Promise<void>;
@@ -85,7 +88,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         } catch (error) {
           // Silently fail - don't logout on refresh errors
           // Keep session active even if refresh fails
-          console.warn('Session refresh failed (non-critical, session remains active):', error);
+          logger.warn('Session refresh failed (non-critical, session remains active):', error);
         }
       }
     }, 5 * 60 * 1000); // Refresh every 5 minutes
@@ -135,12 +138,76 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         setHasCompletedOnboarding(true);
       }
 
-      // Load authentication state from AsyncStorage
+      // First, check Supabase Auth session
+      const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+      
+      if (session && session.user) {
+        // We have an active Supabase session
+        const userId = session.user.id;
+        
+        // Load user from database
+        const { data: dbUser, error: dbError } = await supabase
+          .from('users')
+          .select('*')
+          .eq('id', userId)
+          .single();
+
+        if (dbError || !dbUser) {
+          // User doesn't exist in database - might need to create profile
+          if (dbError?.code === 'PGRST116') {
+            // Create user profile from auth metadata
+            const { data: newUser, error: createError } = await supabase
+              .from('users')
+              .insert({
+                id: userId,
+                email: session.user.email || '',
+                name: session.user.user_metadata?.name || session.user.email?.split('@')[0] || 'User',
+                phone: session.user.user_metadata?.phone || '',
+                is_group_admin: false,
+              })
+              .select()
+              .single();
+
+            if (createError || !newUser) {
+              logger.error('Error creating user profile:', createError?.message || String(createError));
+              await clearAuthState();
+              return;
+            }
+            
+            await loadUserFromDatabase(newUser.id);
+            return;
+          } else {
+            // Network or temporary error - try to restore from stored data
+            logger.warn('Temporary error loading user, checking stored data:', dbError?.message || String(dbError));
+            const userDataString = await AsyncStorage.getItem('user');
+            if (userDataString) {
+              try {
+                const userData = JSON.parse(userDataString) as User;
+                setUser(userData);
+                setIsAuthenticated(true);
+                return;
+              } catch (parseError) {
+                logger.error('Error parsing stored user data:', parseError);
+              }
+            }
+            await clearAuthState();
+            return;
+          }
+        }
+
+        // User exists, load their data
+        await loadUserFromDatabase(dbUser.id);
+        
+        // Automatically register push token if user doesn't exist in user_push_tokens
+        registerPushTokenForUser(dbUser.id);
+        return;
+      }
+
+      // No Supabase session, check stored auth state (legacy support)
       const isAuth = await AsyncStorage.getItem('isAuthenticated');
       const userId = await AsyncStorage.getItem('userId');
       const userDataString = await AsyncStorage.getItem('user');
 
-      // If we have stored auth state, restore it
       if (isAuth === 'true' && userId && userDataString) {
         try {
           const userData = JSON.parse(userDataString) as User;
@@ -153,24 +220,20 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
             .single();
 
           if (error || !dbUser) {
-            // User doesn't exist in database
-            // Only clear if it's a permanent error (not a network issue)
             if (error?.code === 'PGRST116' || error?.code === '42P01') {
-              // User truly doesn't exist - clear auth
-              console.warn('Stored user not found in database, clearing auth state');
+              logger.warn('Stored user not found in database, clearing auth state');
               await clearAuthState();
               return;
             } else {
-              // Network or temporary error - keep session, try again later
-              console.warn('Temporary error loading user, keeping session:', error);
-              // Restore from stored data
+              // Network error - restore from stored data
+              logger.warn('Temporary error loading user, keeping session:', error?.message || String(error));
               setUser(userData);
               setIsAuthenticated(true);
               return;
             }
           }
 
-          // Update user data from database (in case it changed)
+          // Update user data from database
           const updatedUserData: User = {
             id: dbUser.id,
             name: dbUser.name,
@@ -183,24 +246,25 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
             isLocked: dbUser.is_locked || false,
           };
 
-          // Set user and authenticated state
           setUser(updatedUserData);
-        setIsAuthenticated(true);
+          setIsAuthenticated(true);
           
-          // Update stored user data
           await AsyncStorage.setItem('user', JSON.stringify(updatedUserData));
           await AsyncStorage.setItem('userId', userId);
           await AsyncStorage.setItem('isAuthenticated', 'true');
           
-          console.log('Persistent login restored for user:', updatedUserData.email);
+          // Automatically register push token if user doesn't exist in user_push_tokens
+          registerPushTokenForUser(userId);
+          
+          logger.log('Persistent login restored for user:', updatedUserData.email);
         } catch (parseError) {
-          console.error('Error parsing stored user data:', parseError);
+          logger.error('Error parsing stored user data:', parseError);
           await clearAuthState();
         }
       }
     } catch (error) {
-      console.error('Error loading auth state:', error);
-      // On error, try to restore from stored data instead of clearing
+      logger.error('Error loading auth state:', error);
+      // Try to restore from stored data
       const isAuth = await AsyncStorage.getItem('isAuthenticated');
       const userId = await AsyncStorage.getItem('userId');
       const userDataString = await AsyncStorage.getItem('user');
@@ -210,10 +274,9 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
           const userData = JSON.parse(userDataString) as User;
           setUser(userData);
           setIsAuthenticated(true);
-          console.log('Restored session from stored data after error');
+          logger.log('Restored session from stored data after error');
         } catch (parseError) {
-          // Only clear if data is corrupted
-          console.error('Corrupted stored data, clearing auth state');
+          logger.error('Corrupted stored data, clearing auth state');
           await clearAuthState();
         }
       } else {
@@ -235,7 +298,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         setLastLoggedInName(name);
       }
     } catch (error) {
-      console.error('Error loading last logged in email:', error);
+      logger.error('Error loading last logged in email:', error);
     }
   };
 
@@ -247,6 +310,104 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     await AsyncStorage.removeItem('userId');
   };
 
+  /**
+   * Automatically register push token for a user
+   * This ensures the user exists in user_push_tokens table
+   */
+  const registerPushTokenForUser = async (userId: string): Promise<void> => {
+    if (!userId) {
+      logger.warn('Cannot register push token: No user ID provided');
+      return;
+    }
+
+    // Delay slightly to ensure app is fully loaded
+    setTimeout(async () => {
+      try {
+        // Check if user already has a token
+        const { data: existingToken, error: checkError } = await supabase
+          .from('user_push_tokens')
+          .select('user_id, push_token, updated_at')
+          .eq('user_id', userId)
+          .single();
+
+        if (existingToken && !checkError) {
+          logger.log('Push token exists for user:', userId, 'Last updated:', existingToken.updated_at);
+          // Still register to update token (in case device changed or token expired)
+          logger.log('Updating push token to ensure it\'s current...');
+        } else {
+          // User doesn't have a token, register them
+          logger.log('User not found in user_push_tokens, registering new push token...');
+        }
+        
+        // First, explicitly request permission
+        logger.log('🔔 Requesting notification permission for user:', userId);
+        const hasPermission = await pushNotificationService.requestPermissionExplicitly();
+        
+        if (hasPermission) {
+          // Permission granted, proceed with registration
+          logger.log('✅ Permission granted, initializing push token registration...');
+          try {
+            await pushNotificationService.initialize(userId);
+            logger.log('✅ Push token registered successfully for user:', userId);
+            
+            // Verify token was saved
+            const { data: verifyToken, error: verifyError } = await supabase
+              .from('user_push_tokens')
+              .select('user_id, platform, device_id')
+              .eq('user_id', userId)
+              .single();
+              
+            if (verifyError || !verifyToken) {
+              logger.error('❌ CRITICAL: Token registration reported success but token not found in database!', {
+                userId,
+                verifyError,
+              });
+            } else {
+              logger.log('✅ Verified: Token exists in database for user:', userId, 'Platform:', verifyToken.platform);
+            }
+          } catch (initError: any) {
+            logger.error('❌ Error during push token initialization:', {
+              error: initError,
+              message: initError?.message,
+              userId,
+            });
+            throw initError;
+          }
+        } else {
+          logger.warn('⚠️ Notification permission not granted, will retry later');
+          // Retry after 5 seconds in case user grants permission
+          setTimeout(async () => {
+            logger.log('🔄 Retrying push token registration after permission delay...');
+            const retryPermission = await pushNotificationService.requestPermissionExplicitly();
+            if (retryPermission) {
+              try {
+                await pushNotificationService.initialize(userId);
+                logger.log('✅ Push token registered on retry for user:', userId);
+              } catch (retryError) {
+                logger.error('❌ Retry registration failed:', retryError);
+              }
+            } else {
+              logger.warn('⚠️ Permission still not granted on retry');
+            }
+          }, 5000);
+        }
+      } catch (error: any) {
+        logger.error('Error in registerPushTokenForUser:', error);
+        // Retry once after 3 seconds
+        setTimeout(async () => {
+          try {
+            const hasPermission = await pushNotificationService.requestPermissionExplicitly();
+            if (hasPermission) {
+              await pushNotificationService.initialize(userId);
+            }
+          } catch (retryError) {
+            logger.error('Push token registration retry failed:', retryError);
+          }
+        }, 3000);
+      }
+    }, 1500);
+  };
+
   const loadUserFromDatabase = async (userId: string): Promise<void> => {
     try {
       const { data, error } = await supabase
@@ -256,7 +417,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         .single();
 
       if (error) {
-        console.error('Error loading user:', error);
+        logger.error('Error loading user:', error);
         return;
       }
 
@@ -278,52 +439,125 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         await AsyncStorage.setItem('userId', userId);
         await AsyncStorage.setItem('isAuthenticated', 'true');
         await AsyncStorage.setItem('user', JSON.stringify(userData));
+        
+        // Automatically register push token if user doesn't exist in user_push_tokens
+        registerPushTokenForUser(userId);
       }
     } catch (error) {
-      console.error('Error in loadUserFromDatabase:', error);
+      logger.error('Error in loadUserFromDatabase:', error);
     }
   };
 
   const login = async (email: string, password: string): Promise<void> => {
+    // Check if Supabase is configured
+    if (!hasValidSupabaseConfig) {
+      if (__DEV__) {
+        throw new Error('App is not configured. Please create a .env file with EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY, then restart the dev server.');
+      }
+      throw new Error('Unable to connect. Please check your internet connection and try again.');
+    }
+
     try {
-      // First, verify user exists in our users table
+      // Step 1: Authenticate with Supabase Auth
+      const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
+        email: email,
+        password: password,
+      });
+
+      if (authError) {
+        logger.error('Supabase Auth login error:', authError?.message || String(authError));
+        if (authError.message?.includes('Invalid login credentials') || authError.message?.includes('invalid')) {
+          throw new Error('Invalid email or password');
+        }
+        if (authError.message?.includes('network') || authError.message?.includes('fetch') || authError.message?.includes('Network request failed')) {
+          throw new Error('Network error. Please check your internet connection and try again.');
+        }
+        throw new Error(authError.message || 'Login failed. Please try again.');
+      }
+
+      if (!authData.user) {
+        throw new Error('Login failed. No user data received.');
+      }
+
+      const userId = authData.user.id;
+
+      // Step 2: Load user data from users table
       const { data: userData, error: userError } = await supabase
         .from('users')
         .select('*')
-        .eq('email', email)
+        .eq('id', userId)
         .single();
 
       if (userError || !userData) {
-        throw new Error('User not found');
-      }
+        logger.error('Error loading user data:', userError?.message || String(userError));
+        // If user doesn't exist in users table, create it from auth metadata
+        if (userError?.code === 'PGRST116') {
+          // User doesn't exist in users table, create it
+          const { data: newUserData, error: createError } = await supabase
+            .from('users')
+            .insert({
+              id: userId,
+              email: email,
+              name: authData.user.user_metadata?.name || email.split('@')[0],
+              phone: authData.user.user_metadata?.phone || '',
+              is_group_admin: false,
+            })
+            .select()
+            .single();
 
-      // Verify password (in production, use bcrypt or similar)
-      // For now, we'll do a simple comparison (NOT SECURE - should hash passwords)
-      if (userData.password !== password) {
-        throw new Error('Invalid password');
+          if (createError || !newUserData) {
+            throw new Error('Failed to load user profile');
+          }
+          
+          await loadUserFromDatabase(newUserData.id);
+          } else {
+          if (userError?.message?.includes('network') || userError?.message?.includes('fetch') || userError?.message?.includes('Network request failed')) {
+            throw new Error('Network error. Please check your internet connection and try again.');
+          }
+          throw new Error('Failed to load user profile');
+        }
+      } else {
+        // Load user data
+        await loadUserFromDatabase(userData.id);
       }
-
-      // Load user data
-      await loadUserFromDatabase(userData.id);
       
       // Store email and name for quick login
       await AsyncStorage.setItem('lastLoggedInEmail', email);
       setLastLoggedInEmail(email);
       
-      // Get name from userData (already loaded)
-      if (userData.name) {
+      if (userData?.name) {
         await AsyncStorage.setItem('lastLoggedInName', userData.name);
         setLastLoggedInName(userData.name);
       }
+      
+      // Automatically register push token if user doesn't exist in user_push_tokens
+      registerPushTokenForUser(userId);
     } catch (error: any) {
-      console.error('Login error:', error);
-      throw new Error(error.message || 'Login failed');
+      // Don't log if it's a user-friendly error we already threw
+      if (!error.message || (!error.message.includes('Network error') && !error.message.includes('Invalid email') && !error.message.includes('Login failed'))) {
+        logger.error('Login error:', error?.message || String(error));
+      }
+      // Provide user-friendly error messages
+      if (error.message) {
+        throw error;
+      }
+      throw new Error('Login failed. Please check your internet connection and try again.');
     }
   };
 
   const quickLogin = async (email: string): Promise<void> => {
     try {
-      // Verify user exists in our users table
+      // Check if there's an existing session
+      const { data: { session } } = await supabase.auth.getSession();
+      
+      if (session && session.user) {
+        // Use existing session
+        const userId = session.user.id;
+        await loadUserFromDatabase(userId);
+        return;
+      }
+
+      // If no session, verify user exists in our users table
       const { data: userData, error: userError } = await supabase
         .from('users')
         .select('*')
@@ -331,58 +565,176 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         .single();
 
       if (userError || !userData) {
-        throw new Error('User not found');
+        throw new Error('User not found. Please sign in with your password.');
       }
 
       // Load user data without password verification (quick login)
+      // Note: This is less secure but provides convenience
       await loadUserFromDatabase(userData.id);
     } catch (error: any) {
-      console.error('Quick login error:', error);
+      // Don't log if it's a user-friendly error we already threw
+      if (!error.message || (!error.message.includes('Network error') && !error.message.includes('Invalid email') && !error.message.includes('Login failed'))) {
+        logger.error('Quick login error:', error?.message || String(error));
+      }
       throw new Error(error.message || 'Quick login failed');
     }
   };
 
   const signup = async (name: string, email: string, phone: string, password: string): Promise<void> => {
+    // Check if Supabase is configured
+    if (!hasValidSupabaseConfig) {
+      if (__DEV__) {
+        throw new Error('App is not configured. Please create a .env file with EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY, then restart the dev server.');
+      }
+      throw new Error('Unable to connect. Please check your internet connection and try again.');
+    }
+
     try {
-      // Check if user already exists
-      const { data: existingUser } = await supabase
-        .from('users')
-        .select('id')
-        .eq('email', email)
-        .single();
+      // Step 1: Sign up with Supabase Auth
+      const { data: authData, error: authError } = await supabase.auth.signUp({
+        email: email,
+        password: password,
+        options: {
+          data: {
+            name: name,
+            phone: phone,
+          },
+        },
+      });
 
-      if (existingUser) {
-        throw new Error('User with this email already exists');
+      if (authError) {
+        logger.error('Supabase Auth signup error:', authError?.message || String(authError));
+        // Handle specific error cases
+        if (authError.message?.includes('already registered') || 
+            authError.message?.includes('already exists') ||
+            authError.message?.includes('User already registered')) {
+          throw new Error('User with this email already exists');
+        }
+        if (authError.message?.includes('network') || authError.message?.includes('fetch') || authError.message?.includes('Network request failed')) {
+          throw new Error('Network error. Please check your internet connection and try again.');
+        }
+        throw new Error(authError.message || 'Signup failed. Please try again.');
       }
 
-      // Create new user (in production, hash the password)
-      const userId = Date.now().toString(); // Or use UUID
+      if (!authData.user) {
+        logger.error('Signup failed: No user returned from auth.signUp');
+        throw new Error('Failed to create user account');
+      }
+
+      const userId = authData.user.id;
+      logger.log('✅ Auth user created:', { userId, email, confirmed: authData.user.email_confirmed_at !== null });
+
+      // Step 2: Wait a moment for database trigger to fire (if it exists)
+      // Then check if user profile was created by trigger
+      await new Promise(resolve => setTimeout(resolve, 500));
       
-      const { data, error } = await supabase
+      // Step 3: Check if user profile exists (created by trigger or manually)
+      let userData;
+      
+      // Try to get the user profile
+      logger.log('🔍 Checking for user profile in public.users table...', { userId });
+      const { data: existingUser, error: fetchError } = await supabase
         .from('users')
-        .insert({
-          id: userId,
-          email: email,
-      name: name,
-      phone: phone,
-          password: password, // In production, hash this password
-          is_group_admin: false,
-        })
-        .select()
+        .select('*')
+        .eq('id', userId)
         .single();
 
-      if (error) {
-        console.error('Signup error:', error);
-        throw new Error(error.message || 'Signup failed');
+      if (fetchError && fetchError.code === 'PGRST116') {
+        // User doesn't exist, create it manually (trigger might not be set up)
+        logger.log('⚠️ User profile not found in public.users, creating manually...');
+        logger.log('💡 Tip: Install the database trigger from supabase/migrations/20250119000000_sync_auth_users.sql');
+        const { data: newUser, error: createError } = await supabase
+          .from('users')
+          .insert({
+            id: userId,
+            email: email,
+            name: name,
+            phone: phone,
+            is_group_admin: false,
+          })
+          .select()
+          .single();
+
+        if (createError) {
+          logger.error('❌ Error creating user record:', createError?.message || String(createError));
+          if (createError.message?.includes('network') || createError.message?.includes('fetch') || createError.message?.includes('Network request failed')) {
+            throw new Error('Network error. Please check your internet connection and try again.');
+          }
+          if (createError.code === '23505') { // Unique constraint violation
+            throw new Error('User with this email already exists');
+          }
+          throw new Error(createError.message || 'Failed to create user profile');
+        }
+        logger.log('✅ User profile created manually:', newUser.id);
+        userData = newUser;
+      } else if (fetchError) {
+        logger.error('❌ Error fetching user profile:', fetchError?.message || String(fetchError));
+        if (fetchError.message?.includes('network') || fetchError.message?.includes('fetch') || fetchError.message?.includes('Network request failed')) {
+          throw new Error('Network error. Please check your internet connection and try again.');
+        }
+        throw new Error('Failed to load user profile');
+      } else {
+        logger.log('✅ User profile found (created by trigger):', existingUser.id);
+        userData = existingUser;
       }
 
-      if (data) {
-        // Load user data
-        await loadUserFromDatabase(data.id);
+      // Step 4: Create default user settings if they don't exist
+      try {
+        const { data: existingSettings } = await supabase
+          .from('user_settings')
+          .select('id')
+          .eq('user_id', userId)
+          .single();
+
+        if (!existingSettings) {
+          await supabase
+            .from('user_settings')
+            .insert({
+              user_id: userId,
+              location_sharing_enabled: false, // Location sharing disabled by default until user enables it
+            });
+        }
+      } catch (settingsError) {
+        logger.warn('Error creating user settings (non-critical):', settingsError);
+        // Non-critical, continue with signup
+      }
+
+      // Step 5: If email confirmation is required, user might not have a session yet
+      // Check if we have a session, if not, sign in after signup
+      const { data: { session } } = await supabase.auth.getSession();
+      
+      if (!session && authData.user) {
+        // Try to sign in immediately (works if email confirmation is disabled)
+        const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({
+          email: email,
+          password: password,
+        });
+        
+        if (signInError) {
+          logger.warn('Could not sign in immediately after signup:', signInError?.message || String(signInError));
+          // This is okay if email confirmation is required
+        }
+      }
+
+      // Step 6: Load user data
+      if (userData) {
+        await loadUserFromDatabase(userData.id);
+        
+        // Automatically register push token if user doesn't exist in user_push_tokens
+        registerPushTokenForUser(userData.id);
+      } else {
+        throw new Error('Failed to create user profile');
       }
     } catch (error: any) {
-      console.error('Signup error:', error);
-      throw new Error(error.message || 'Signup failed');
+      // Don't log if it's a user-friendly error we already threw
+      if (!error.message || (!error.message.includes('Network error') && !error.message.includes('already exists') && !error.message.includes('Failed to'))) {
+        logger.error('Signup error:', error?.message || String(error));
+      }
+      // Provide user-friendly error messages
+      if (error.message) {
+        throw error;
+      }
+      throw new Error('Signup failed. Please check your internet connection and try again.');
     }
   };
 
@@ -395,7 +747,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
       
       // Stop all location services if active
       const { locationService } = await import('../services/locationService');
-      locationService.stopLocationSharing();
+      await locationService.stopLocationSharing();
       locationService.stopEmergencyLocationTracking();
       locationService.stopSOSLocationTracking();
       
@@ -431,8 +783,15 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
             .eq('user_id', currentUserId);
         } catch (dbError) {
           // Log but don't fail logout if database operations fail
-          console.warn('Error updating location sharing status on logout:', dbError);
+          logger.warn('Error updating location sharing status on logout:', dbError?.message || String(dbError));
         }
+      }
+      
+      // Remove push token
+      try {
+        await pushNotificationService.removePushToken();
+      } catch (pushError) {
+        logger.warn('Error removing push token:', pushError);
       }
       
       // Clear Supabase session if any
@@ -455,9 +814,9 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         setLastLoggedInName(currentName);
       }
       
-      console.log('User logged out successfully - location sharing stopped');
+      logger.log('User logged out successfully - location sharing stopped');
     } catch (error) {
-      console.error('Logout error:', error);
+      logger.error('Logout error:', error);
       // Still clear state even if there's an error
       await clearAuthState();
     }
@@ -507,6 +866,146 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     }
   };
 
+  const deleteAccount = async (): Promise<void> => {
+    if (!user?.id) {
+      throw new Error('No user to delete');
+    }
+
+    try {
+      const userId = user.id;
+
+      // Stop all location services
+      try {
+        const { locationService } = await import('../services/locationService');
+        await locationService.stopLocationSharing();
+        locationService.stopEmergencyLocationTracking();
+        locationService.stopSOSLocationTracking();
+      } catch (error) {
+        console.warn('Error stopping location services:', error);
+      }
+
+      // Delete all user-related data in order (respecting foreign key constraints)
+      // 1. Delete connections where user is the owner
+      await supabase
+        .from('connections')
+        .delete()
+        .eq('user_id', userId);
+      
+      // 2. Delete connections where user is the connected user
+      await supabase
+        .from('connections')
+        .delete()
+        .eq('connected_user_id', userId);
+
+      // 3. Delete connection codes
+      await supabase
+        .from('connection_codes')
+        .delete()
+        .eq('user_id', userId);
+
+      // 4. Delete notifications
+      await supabase
+        .from('notifications')
+        .delete()
+        .eq('user_id', userId);
+
+      // 5. Delete location history
+      await supabase
+        .from('location_history')
+        .delete()
+        .eq('user_id', userId);
+
+      // 6. Delete incidents created by user
+      await supabase
+        .from('incidents')
+        .delete()
+        .eq('user_id', userId);
+
+      // 7. Delete user settings (CASCADE should handle this, but being explicit)
+      await supabase
+        .from('user_settings')
+        .delete()
+        .eq('user_id', userId);
+
+      // 8. Delete push tokens
+      await supabase
+        .from('user_push_tokens')
+        .delete()
+        .eq('user_id', userId);
+
+      // 9. Delete family member entries
+      await supabase
+        .from('family_members')
+        .delete()
+        .eq('user_id', userId);
+
+      // 10. Delete family member requests
+      await supabase
+        .from('family_member_requests')
+        .delete()
+        .eq('requester_user_id', userId);
+
+      // 11. Delete user check-ins
+      await supabase
+        .from('user_check_ins')
+        .delete()
+        .eq('user_id', userId);
+
+      // 12. Delete check-in settings
+      await supabase
+        .from('check_in_settings')
+        .delete()
+        .eq('user_id', userId);
+
+      // 13. Delete travel advisories created by user (if any)
+      await supabase
+        .from('travel_advisories')
+        .delete()
+        .eq('created_by_user_id', userId);
+
+      // 14. If user is admin, delete family group and all members (CASCADE will handle members)
+      const { data: familyGroups } = await supabase
+        .from('family_groups')
+        .select('id')
+        .eq('admin_id', userId);
+
+      if (familyGroups && familyGroups.length > 0) {
+        for (const group of familyGroups) {
+          await supabase
+            .from('family_groups')
+            .delete()
+            .eq('id', group.id);
+        }
+      }
+
+      // 15. Finally, delete the user (this should cascade to user_settings)
+      const { error: deleteUserError } = await supabase
+        .from('users')
+        .delete()
+        .eq('id', userId);
+
+      if (deleteUserError) {
+        console.error('Error deleting user:', deleteUserError);
+        throw deleteUserError;
+      }
+
+      // Clear Supabase session if any
+      try {
+        await supabase.auth.signOut();
+      } catch (supabaseError) {
+        // Ignore if not using Supabase Auth
+      }
+
+      // Clear all auth state
+      await clearAuthState();
+
+      console.log('User account deleted successfully');
+    } catch (error) {
+      console.error('Error deleting account:', error);
+      throw error;
+    }
+  };
+
   return (
     <AuthContext.Provider
       value={{
@@ -520,6 +1019,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         quickLogin,
         signup,
         logout,
+        deleteAccount,
         completeOnboarding,
         updateUser,
         clearLastLoggedInEmail,

@@ -1,7 +1,9 @@
 import React, { createContext, useState, useContext, useEffect, ReactNode } from 'react';
-import { supabase } from '../lib/supabase';
+import { supabase, hasValidSupabaseConfig } from '../lib/supabase';
 import { useAuth } from './AuthContext';
 import { locationService } from '../services/locationService';
+import { incidentProximityService } from '../services/incidentProximityService';
+import { logger } from '../utils/logger';
 import type { Incident, Location } from '../types';
 
 interface IncidentContextType {
@@ -108,6 +110,13 @@ export const IncidentProvider: React.FC<IncidentProviderProps> = ({ children }) 
     try {
       setLoading(true);
       
+      // Check if Supabase is configured
+      if (!hasValidSupabaseConfig) {
+        // Silently skip - warning already shown in supabase.ts
+        setIncidents([]);
+        return;
+      }
+      
       // Convert time filter to hours
       const timeFilters: Record<TimeFilterKey, number> = {
         '5min': 5 / 60, // 5 minutes = 0.083 hours
@@ -134,7 +143,8 @@ export const IncidentProvider: React.FC<IncidentProviderProps> = ({ children }) 
       const { data, error } = await query;
 
       if (error) {
-        console.error('Error fetching nearby incidents:', error);
+        logger.error('Error fetching nearby incidents:', error?.message || error?.code || String(error));
+        setIncidents([]);
         return;
       }
 
@@ -163,33 +173,14 @@ export const IncidentProvider: React.FC<IncidentProviderProps> = ({ children }) 
     }
   };
 
-  // Fetch user location on mount
+  // Removed automatic location loading on mount
+  // Location will only be requested when user explicitly enables location sharing
+  // Fetch incidents without location (will use default location if needed)
   useEffect(() => {
-    const loadUserLocation = async (): Promise<void> => {
-      try {
-        const hasPermission = await locationService.checkPermissions();
-        if (!hasPermission) {
-          const granted = await locationService.requestPermissions();
-          if (!granted) {
-            console.warn('Location permission not granted, using default location');
-            return;
-          }
-        }
-
-        const location = await locationService.getCurrentLocation();
-        if (location) {
-          setUserLocation(location);
-          // Fetch nearby incidents with default filters
-          await fetchNearbyIncidents('1hr', 5);
-        }
-      } catch (error) {
-        console.error('Error loading user location:', error);
-        // Still fetch incidents with default location
-        await fetchNearbyIncidents('1hr', 5);
-      }
-    };
-
-    loadUserLocation();
+    // Fetch nearby incidents with default filters (without requesting location)
+    fetchNearbyIncidents('1hr', 5).catch((error) => {
+      console.error('Error fetching incidents:', error);
+    });
 
     // Subscribe to real-time changes
     const subscription = supabase
@@ -268,6 +259,12 @@ export const IncidentProvider: React.FC<IncidentProviderProps> = ({ children }) 
         });
         const newIncident = mapDbRowToIncident(data);
         setIncidents([newIncident, ...incidents]);
+
+        // Immediately trigger proximity check to notify nearby users
+        console.log('🚨 Triggering immediate proximity check for new incident...');
+        incidentProximityService.triggerCheck().catch((error) => {
+          console.error('Error triggering proximity check after incident creation:', error);
+        });
       }
     } catch (error) {
       console.error('Error in addIncident:', error);

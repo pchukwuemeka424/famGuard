@@ -19,7 +19,7 @@ interface TermsOfServiceScreenProps {
 
 export default function TermsOfServiceScreen({ navigation }: TermsOfServiceScreenProps) {
   return (
-    <SafeAreaView style={styles.container} edges={['top']}>
+    <SafeAreaView style={styles.container} edges={['top', 'bottom']}>
       <View style={styles.header}>
         <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backButton}>
           <Ionicons name="arrow-back" size={24} color="#000000" />
@@ -28,13 +28,17 @@ export default function TermsOfServiceScreen({ navigation }: TermsOfServiceScree
         <View style={styles.placeholder} />
       </View>
 
-      <ScrollView style={styles.content}>
+      <ScrollView 
+        style={styles.content}
+        contentContainerStyle={styles.scrollContent}
+        showsVerticalScrollIndicator={false}
+      >
         <Text style={styles.sectionTitle}>Last Updated: January 2025</Text>
         
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>1. Acceptance of Terms</Text>
           <Text style={styles.text}>
-            By accessing and using SafeZone, you accept and agree to be bound by the terms and 
+            By accessing and using FamGuard, you accept and agree to be bound by the terms and 
             provision of this agreement.
           </Text>
         </View>
@@ -42,7 +46,7 @@ export default function TermsOfServiceScreen({ navigation }: TermsOfServiceScree
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>2. Use License</Text>
           <Text style={styles.text}>
-            Permission is granted to temporarily use SafeZone for personal, non-commercial use only. 
+            Permission is granted to temporarily use FamGuard for personal, non-commercial use only. 
             This is the grant of a license, not a transfer of title.
           </Text>
         </View>
@@ -66,7 +70,7 @@ export default function TermsOfServiceScreen({ navigation }: TermsOfServiceScree
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>5. Prohibited Uses</Text>
           <Text style={styles.text}>
-            You may not use SafeZone to harass, abuse, or harm others, or to violate any laws. 
+            You may not use FamGuard to harass, abuse, or harm others, or to violate any laws. 
             False incident reports are strictly prohibited.
           </Text>
         </View>
@@ -74,7 +78,7 @@ export default function TermsOfServiceScreen({ navigation }: TermsOfServiceScree
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>6. Limitation of Liability</Text>
           <Text style={styles.text}>
-            SafeZone is provided "as is" without warranties. We are not liable for any damages 
+            FamGuard is provided "as is" without warranties. We are not liable for any damages 
             arising from your use of the service.
           </Text>
         </View>
@@ -90,7 +94,7 @@ export default function TermsOfServiceScreen({ navigation }: TermsOfServiceScree
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>8. Contact Information</Text>
           <Text style={styles.text}>
-            For questions about these Terms of Service, please contact us at legal@safezone.app
+            For questions about these Terms of Service, please contact us at info@acehubtechnologiesltd.co.uk
           </Text>
         </View>
       </ScrollView>
@@ -124,7 +128,10 @@ const styles = StyleSheet.create({
   },
   content: {
     flex: 1,
+  },
+  scrollContent: {
     padding: 16,
+    paddingBottom: 24,
   },
   section: {
     marginBottom: 24,

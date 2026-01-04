@@ -94,17 +94,42 @@ export default function LocationAccuracyScreen({ navigation }: LocationAccuracyS
 
       if (error) {
         if (error.code === 'PGRST116') {
+          // No settings found - create with 'exact' as default
           await createDefaultSettings();
           setAccuracyMode('exact');
         } else {
           console.error('Error loading accuracy mode:', error);
+          // Default to 'exact' on error
           setAccuracyMode('exact');
         }
       } else if (data) {
-        setAccuracyMode((data.location_accuracy as AccuracyMode) || 'exact');
+        // If location_accuracy is null, undefined, or empty, default to 'exact'
+        const savedMode = data.location_accuracy as AccuracyMode;
+        if (!savedMode || (savedMode !== 'exact' && savedMode !== 'approximate')) {
+          // Invalid or missing value - save 'exact' as default
+          setAccuracyMode('exact');
+          await supabase
+            .from('user_settings')
+            .upsert(
+              {
+                user_id: user.id,
+                location_accuracy: 'exact',
+              },
+              {
+                onConflict: 'user_id',
+              }
+            );
+        } else {
+          setAccuracyMode(savedMode);
+        }
+      } else {
+        // No data returned - default to 'exact'
+        setAccuracyMode('exact');
+        await createDefaultSettings();
       }
     } catch (error) {
       console.error('Error loading accuracy mode:', error);
+      // Always default to 'exact' on any error
       setAccuracyMode('exact');
     } finally {
       setLoading(false);

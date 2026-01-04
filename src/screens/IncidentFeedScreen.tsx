@@ -16,6 +16,9 @@ import type { BottomTabNavigationProp } from '@react-navigation/bottom-tabs';
 import type { StackNavigationProp } from '@react-navigation/stack';
 import { useIncidents } from '../context/IncidentContext';
 import { useAppSetting } from '../context/AppSettingContext';
+import { locationService } from '../services/locationService';
+import { incidentProximityService } from '../services/incidentProximityService';
+import { supabase } from '../lib/supabase';
 import type { MainTabParamList, RootStackParamList, Incident, TimeFilter, DistanceFilter } from '../types';
 
 type IncidentFeedScreenNavigationProp = CompositeNavigationProp<
@@ -46,19 +49,124 @@ const distanceFilters: DistanceFilter[] = [
 ];
 
 export default function IncidentFeedScreen({ navigation }: IncidentFeedScreenProps) {
-  const { incidents, fetchNearbyIncidents, userLocation, calculateDistance, loading } = useIncidents();
+  const { incidents, fetchNearbyIncidents, userLocation, setUserLocation, calculateDistance, loading } = useIncidents();
   const { hideReportIncident } = useAppSetting();
   const [timeFilter, setTimeFilter] = useState<string>('1hr');
   const [distanceFilter, setDistanceFilter] = useState<number>(5);
   const [viewMode, setViewMode] = useState<ViewMode>('list');
+  const [locationFetched, setLocationFetched] = useState<boolean>(false);
+
+  // Fetch user's actual location when screen loads
+  useEffect(() => {
+    const loadUserLocation = async () => {
+      try {
+        // Check if we have permission
+        const hasPermission = await locationService.checkPermissions();
+        if (hasPermission) {
+          // Get current location (don't request permission if not granted)
+          const location = await locationService.getCurrentLocation(false);
+          if (location) {
+            setUserLocation(location);
+            setLocationFetched(true);
+            console.log('User location loaded for incident feed:', location);
+          } else {
+            // If location unavailable, still try to fetch with default location
+            setLocationFetched(true);
+            console.log('Location unavailable, using default location');
+          }
+        } else {
+          // No permission, use default location but still fetch
+          setLocationFetched(true);
+          console.log('Location permission not granted, using default location');
+        }
+      } catch (error) {
+        console.error('Error loading user location:', error);
+        setLocationFetched(true); // Still try to fetch with default location
+      }
+    };
+
+    loadUserLocation();
+  }, [setUserLocation]);
 
   // Fetch incidents when filters or user location changes
   useEffect(() => {
-    if (userLocation.latitude && userLocation.longitude) {
+    // Only fetch if location has been checked (either fetched or determined unavailable)
+    if (locationFetched && userLocation.latitude && userLocation.longitude) {
+      console.log(`Fetching incidents: timeFilter=${timeFilter}, distanceFilter=${distanceFilter}km`);
       fetchNearbyIncidents(timeFilter, distanceFilter);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [timeFilter, distanceFilter, userLocation.latitude, userLocation.longitude]);
+  }, [timeFilter, distanceFilter, userLocation.latitude, userLocation.longitude, locationFetched]);
+
+  // Start incident proximity checking service
+  useEffect(() => {
+    // Start periodic checking for incident proximity (checks every 15 minutes)
+    incidentProximityService.startPeriodicChecking();
+
+    return () => {
+      // Stop periodic checking when component unmounts
+      incidentProximityService.stopPeriodicChecking();
+    };
+  }, []);
+
+  // Set up real-time subscription for incidents
+  useEffect(() => {
+    if (!locationFetched) return; // Wait for location to be fetched first
+
+    console.log('Setting up real-time subscription for incidents');
+
+    // Create a unique channel name for this screen instance
+    const channelName = `incident_feed_${Date.now()}`;
+    
+    const channel = supabase
+      .channel(channelName)
+      .on(
+        'postgres_changes',
+        {
+          event: '*', // Listen to INSERT, UPDATE, DELETE
+          schema: 'public',
+          table: 'incidents',
+        },
+        async (payload) => {
+          const incidentId = (payload.new as any)?.id || (payload.old as any)?.id;
+          const eventType = payload.eventType;
+          console.log('Real-time incident change detected:', eventType, incidentId);
+          
+          // Refresh incidents when changes occur (with current filters)
+          if (locationFetched && userLocation.latitude && userLocation.longitude) {
+            console.log('Refreshing incidents due to real-time update');
+            fetchNearbyIncidents(timeFilter, distanceFilter);
+          }
+
+          // Trigger proximity check when a new incident is created
+          // This ensures users get notified immediately if they're near the new incident
+          if (eventType === 'INSERT' && payload.new) {
+            console.log('New incident created, triggering proximity check...');
+            // Trigger proximity check to notify nearby users
+            incidentProximityService.triggerCheck().catch((error) => {
+              console.error('Error triggering incident proximity check:', error);
+            });
+          }
+        }
+      )
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') {
+          console.log('✅ Successfully subscribed to incidents real-time updates');
+        } else if (status === 'CHANNEL_ERROR') {
+          console.error('❌ Error subscribing to incidents real-time updates');
+        } else if (status === 'TIMED_OUT') {
+          console.warn('⚠️ Incidents real-time subscription timed out');
+        } else if (status === 'CLOSED') {
+          console.log('Incidents real-time subscription closed');
+        }
+      });
+
+    return () => {
+      console.log('Cleaning up real-time subscription for incidents');
+      supabase.removeChannel(channel);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [locationFetched, timeFilter, distanceFilter, userLocation.latitude, userLocation.longitude]);
 
   // Use incidents directly from context (already filtered by proximity and time)
   const nearbyIncidents = incidents;
