@@ -1,111 +1,99 @@
-# FamGuard
+# FamGuard (SafeZone)
 
-**Your Family's Safety Network**
+A comprehensive family safety and location sharing mobile application built with React Native and Expo. FamGuard helps families stay connected and informed about each other's safety through real-time location sharing, incident reporting, travel advisories, and emergency features.
 
-FamGuard is a comprehensive mobile safety application built with React Native and Expo that enables families to stay connected, share locations in real-time, and receive community safety alerts.
+## 📱 Features
 
-## 🎯 Features
+### Core Features
+- **Real-time Location Sharing**: Share your location with family members and view their locations on an interactive map
+- **Incident Reporting**: Report and view safety incidents in your area with filtering by distance and time
+- **Travel Advisories**: Get notified about security and weather advisories for specific regions
+- **Check-in System**: Manual and automatic check-ins to let family know you're safe
+- **Offline Maps**: Download maps for offline use when traveling
+- **Push Notifications**: Receive alerts for nearby incidents, check-in reminders, and connection updates
+- **Emergency Features**: SOS lock functionality and emergency notes for first responders
+- **Connection Management**: Connect with family members and manage location sharing permissions
 
-### Core Functionality
-- **Real-time Location Sharing**: Share your location with trusted family members and connections
-- **Incident Reporting**: Report and view community safety incidents in your area
-- **Travel Advisories**: Receive safety alerts and advisories for your travel destinations
-- **Check-in System**: Scheduled check-ins to let your family know you're safe
-- **Connection Management**: Connect with family members and manage your safety network
-- **Offline Maps**: Access maps even when offline
-- **Push Notifications**: Real-time notifications for incidents, check-ins, and safety alerts
-
-### Privacy & Security
-- **App Lock**: Secure your app with lock functionality
-- **Privacy Controls**: Granular control over location sharing and data visibility
-- **Emergency Notes**: Store important emergency information
-- **Battery Optimization**: Smart battery-saving modes
-
-### Customization
-- **Location Accuracy Settings**: Adjust location update frequency and accuracy
-- **Notification Filters**: Customize which notifications you receive
-- **Language & Region**: Multi-language support
-- **Units**: Metric/Imperial unit preferences
-- **Sleep Mode**: Configure quiet hours for notifications
+### Additional Features
+- **Battery Optimization**: Configurable location update frequency and battery-saving modes
+- **Sleep Mode**: Pause location sharing during sleep hours
+- **Profile Management**: Customize profile with emergency information, blood group, and notes
+- **Multi-language Support**: Language and region settings
+- **Units Configuration**: Choose between metric and imperial units
+- **Privacy Controls**: Granular control over location sharing and incident visibility
 
 ## 🛠 Tech Stack
 
 - **Framework**: React Native with Expo SDK 54
 - **Navigation**: React Navigation (Stack & Bottom Tabs)
-- **Backend**: Supabase (Authentication, Database, Real-time)
+- **Backend**: Supabase (Authentication, Database, Realtime)
 - **Maps**: React Native Maps with Google Maps integration
-- **Notifications**: Expo Notifications
-- **Location**: Expo Location
 - **State Management**: React Context API
+- **Background Tasks**: Expo Task Manager & Background Fetch
+- **Notifications**: Expo Notifications
+- **Location Services**: Expo Location
+- **Storage**: AsyncStorage
 - **Language**: TypeScript
 
-## 📋 Prerequisites
+## 🚀 Quick Start
+
+### Prerequisites
 
 - Node.js (v18 or higher)
 - npm or yarn
 - Expo CLI (`npm install -g expo-cli`)
-- EAS CLI for builds (`npm install -g eas-cli`)
-- iOS Simulator (for iOS development) or Android Studio (for Android development)
-- Supabase account and project
-- Google Maps API key
+- EAS CLI (`npm install -g eas-cli`) - for building
 
-## 🚀 Getting Started
+### Installation
 
-### 1. Clone the Repository
+1. **Clone the repository**
+   ```bash
+   git clone <repository-url>
+   cd safezone
+   ```
 
-```bash
-git clone <repository-url>
-cd safezone
-```
+2. **Install dependencies**
+   ```bash
+   npm install
+   ```
 
-### 2. Install Dependencies
+3. **Set up environment variables**
+   
+   Create a `.env` file in the root directory:
+   ```env
+   EXPO_PUBLIC_SUPABASE_URL=your_supabase_url
+   EXPO_PUBLIC_SUPABASE_ANON_KEY=your_supabase_anon_key
+   EXPO_PUBLIC_GOOGLE_MAPS_API_KEY=your_google_maps_api_key
+   EXPO_PUBLIC_EXPO_PROJECT_ID=your_expo_project_id
+   EXPO_PUBLIC_DELETE_ACCOUNT_URL=https://safezone.app/delete-account
+   ```
 
-```bash
-npm install
-```
+4. **Start development server**
+   ```bash
+   npm start
+   ```
 
-### 3. Environment Setup
+For detailed installation instructions, see [Installation Guide](./docs/INSTALLATION.md).
 
-Set up your environment variables using EAS secrets or create a `.env` file (for local development):
+## 📚 Documentation
 
-```bash
-# Required environment variables
-EXPO_PUBLIC_SUPABASE_URL=your_supabase_url
-EXPO_PUBLIC_SUPABASE_ANON_KEY=your_supabase_anon_key
-EXPO_PUBLIC_EXPO_PROJECT_ID=your_expo_project_id
-EXPO_PUBLIC_GOOGLE_MAPS_API_KEY=your_google_maps_api_key
-EXPO_PUBLIC_DELETE_ACCOUNT_URL=https://safezone.app/delete-account
-```
+Comprehensive documentation is available in the [`docs/`](./docs/) directory:
 
-For production builds, set these as EAS secrets:
+- **[Installation Guide](./docs/INSTALLATION.md)** - Complete setup instructions
+- **[Development Guide](./docs/DEVELOPMENT.md)** - How to develop and contribute
+- **[Building Guide](./docs/BUILDING.md)** - Building and deployment instructions
+- **[Architecture Documentation](./docs/ARCHITECTURE.md)** - System architecture and design
+- **[Configuration Guide](./docs/CONFIGURATION.md)** - Configuration options and settings
+- **[API Documentation](./docs/API.md)** - API services and endpoints
+- **[Features Documentation](./docs/FEATURES.md)** - Detailed feature descriptions
+- **[Troubleshooting Guide](./docs/TROUBLESHOOTING.md)** - Common issues and solutions
 
-```bash
-eas secret:create --scope project --name EXPO_PUBLIC_SUPABASE_URL --value your_value
-eas secret:create --scope project --name EXPO_PUBLIC_SUPABASE_ANON_KEY --value your_value
-eas secret:create --scope project --name EXPO_PUBLIC_EXPO_PROJECT_ID --value your_value
-eas secret:create --scope project --name EXPO_PUBLIC_GOOGLE_MAPS_API_KEY --value your_value
-```
+## 🏃 Development
 
-See `EAS_ENV_SETUP.md` and `ENV_SETUP.md` for detailed setup instructions.
-
-### 4. Database Setup
-
-Run the Supabase migrations:
-
-```bash
-# Apply migrations in order
-cd supabase/migrations
-# Run migrations using Supabase CLI or your database management tool
-```
-
-See `CHECK_AUTH_SETUP.md` for authentication setup details.
-
-### 5. Run the App
-
-#### Development Mode
+### Running the App
 
 ```bash
-# Start Expo development server
+# Start development server
 npm start
 
 # Run on iOS
@@ -118,131 +106,73 @@ npm run android
 npm run web
 ```
 
-#### Production Build
+See [Development Guide](./docs/DEVELOPMENT.md) for more details.
+
+## 🏗 Building
+
+This project uses EAS Build for creating production builds.
 
 ```bash
-# Build for Android (APK)
+# Build Android APK
 npm run build:android:apk
 
-# Build for Android (Production)
+# Build Android Production (AAB)
 npm run build:android
 
-# Build for iOS
+# Build iOS Production
 npm run build:ios
 
-# Build for all platforms
+# Build for both platforms
 npm run build:all
 ```
+
+See [Building Guide](./docs/BUILDING.md) for detailed instructions.
 
 ## 📁 Project Structure
 
 ```
 safezone/
+├── docs/                  # Documentation
 ├── src/
-│   ├── components/          # Reusable components
-│   │   └── ErrorBoundary.tsx
-│   ├── context/             # React Context providers
-│   │   ├── AuthContext.tsx
-│   │   ├── ConnectionContext.tsx
-│   │   ├── IncidentContext.tsx
-│   │   ├── TravelAdvisoryContext.tsx
-│   │   ├── CheckInContext.tsx
-│   │   └── AppSettingContext.tsx
-│   ├── screens/             # App screens
-│   │   ├── HomeScreen.tsx
-│   │   ├── MapScreen.tsx
-│   │   ├── IncidentFeedScreen.tsx
-│   │   ├── ConnectionScreen.tsx
-│   │   └── ...
-│   ├── services/            # Business logic services
-│   │   ├── locationService.ts
-│   │   ├── notificationService.ts
-│   │   ├── checkInService.ts
-│   │   ├── travelAdvisoryService.ts
-│   │   └── offlineMapsService.ts
-│   ├── lib/                 # Third-party integrations
-│   │   └── supabase.ts
-│   ├── types/               # TypeScript type definitions
-│   │   └── index.ts
-│   └── utils/               # Utility functions
-│       ├── logger.ts
-│       ├── envValidation.ts
-│       └── warningSuppression.ts
-├── assets/                  # Images, icons, sounds
-├── plugins/                 # Expo config plugins
-├── scripts/                 # Build and setup scripts
-├── supabase/                # Supabase functions and migrations
-│   ├── functions/
-│   └── migrations/
-├── App.tsx                  # Main app entry point
-├── app.config.js           # Expo configuration
-└── package.json
+│   ├── components/        # Reusable React components
+│   ├── context/           # React Context providers
+│   ├── screens/           # Screen components
+│   ├── services/          # Business logic and API services
+│   ├── tasks/             # Background tasks
+│   ├── types/             # TypeScript definitions
+│   └── utils/             # Utility functions
+├── supabase/              # Backend configuration
+│   ├── functions/         # Edge Functions
+│   └── migrations/       # Database migrations
+├── assets/                # Static assets
+└── plugins/               # Expo config plugins
 ```
+
+See [Architecture Documentation](./docs/ARCHITECTURE.md) for detailed structure.
 
 ## 🔧 Configuration
 
-### App Configuration
+Key configuration files:
+- `app.json` - Static Expo configuration
+- `app.config.js` - Dynamic configuration
+- `eas.json` - EAS Build configuration
+- `.env` - Environment variables (not committed)
 
-The app configuration is managed in `app.config.js` and includes:
-- App name, version, and bundle identifiers
-- Platform-specific settings (iOS/Android)
-- Plugin configurations
-- Environment variable injection
+See [Configuration Guide](./docs/CONFIGURATION.md) for all configuration options.
 
-### Build Configuration
+## 🔐 Security & Privacy
 
-Build profiles are defined in `eas.json`:
-- **Development**: For testing builds
-- **Production**: For app store releases
-- **APK**: For direct Android distribution
+- **Authentication**: Handled by Supabase Auth
+- **Location Data**: Encrypted in transit and at rest
+- **API Keys**: Stored as EAS secrets, never committed
+- **Permissions**: Minimal required permissions
+- **Data Privacy**: User data only shared with connected family members
 
-## 📱 Platform-Specific Setup
+## 📱 Platform Support
 
-### iOS
-
-- Bundle Identifier: `com.safezone.app`
-- Requires location permissions configuration in `Info.plist`
-- Google Maps API key must be configured
-
-### Android
-
-- Package Name: `com.safezone.app`
-- Requires location and network permissions
-- Google Maps API key must be configured
-- Network security config for API access
-
-## 🔐 Security
-
-- Authentication handled by Supabase
-- Row-level security policies in database
-- Secure credential storage
-- App lock functionality
-- Encrypted location data transmission
-
-## 📚 Documentation
-
-Additional documentation files:
-- `CHECK_AUTH_SETUP.md` - Authentication setup guide
-- `EAS_ENV_SETUP.md` - EAS environment variables setup
-- `ENV_SETUP.md` - General environment setup
-- `SETUP_CREDENTIALS.md` - Credential configuration
-- `FIX_NETWORK_CONNECTION.md` - Network troubleshooting
-- `NOTIFICATION_SOUND_SETUP.md` - Notification configuration
-- `PUSH_NOTIFICATION_FIX.md` - Push notification troubleshooting
-- `PRODUCTION_OPTIMIZATIONS.md` - Production build optimizations
-
-## 🐛 Troubleshooting
-
-### Common Issues
-
-1. **Network Connection Errors**: See `FIX_NETWORK_CONNECTION.md`
-2. **Push Notification Issues**: See `PUSH_NOTIFICATION_FIX.md`
-3. **Build Failures**: Check EAS secrets are properly configured
-4. **Maps Not Loading**: Verify Google Maps API key is set correctly
-
-### Debug Mode
-
-The app includes comprehensive logging. Check console output for detailed error messages.
+- **iOS**: 13.0+
+- **Android**: API level 21+ (Android 5.0+)
+- **Web**: Supported (limited functionality)
 
 ## 🤝 Contributing
 
@@ -252,25 +182,33 @@ The app includes comprehensive logging. Check console output for detailed error 
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
 
+See [Development Guide](./docs/DEVELOPMENT.md) for coding standards and best practices.
+
 ## 📄 License
 
-This project is private and proprietary.
+This project is private and proprietary. All rights reserved.
 
-## 📞 Support
+## 👥 Support
 
-For support, email support@famguard.app or visit the Help & Support section in the app.
+For support, please contact the development team or open an issue in the repository.
 
 ## 🔄 Version History
 
-- **1.0.0** - Initial release
-  - Core location sharing
+- **v1.0.1** - Current version
+  - Initial release with core features
+  - Location sharing
   - Incident reporting
-  - Connection management
   - Travel advisories
   - Check-in system
+  - Offline maps support
+
+## 📚 Additional Resources
+
+- [Google Play Location Declaration](./GOOGLE_PLAY_LOCATION_DECLARATION.md)
+- [Expo Documentation](https://docs.expo.dev/)
+- [React Native Documentation](https://reactnative.dev/)
+- [Supabase Documentation](https://supabase.com/docs)
 
 ---
 
-**Built with ❤️ for keeping families safe**
-
-# famGuard
+**Built with ❤️ by AceHub Technologies Ltd UK**
