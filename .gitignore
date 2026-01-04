@@ -59,6 +59,7 @@ web-build/
 
 # Environment variables
 .env
+.env.example
 .env.local
 .env.*.local
 
