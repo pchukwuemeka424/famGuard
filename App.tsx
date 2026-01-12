@@ -17,6 +17,7 @@ import type { RouteProp } from '@react-navigation/native';
 import type { BottomTabNavigationProp } from '@react-navigation/bottom-tabs';
 import { ErrorBoundary } from './src/components/ErrorBoundary';
 import { logger } from './src/utils/logger';
+import { updateService } from './src/services/updateService';
 
 
 // Screens
@@ -49,6 +50,7 @@ import CheckInScreen from './src/screens/CheckInScreen';
 import CheckInSettingsScreen from './src/screens/CheckInSettingsScreen';
 import OfflineMapsScreen from './src/screens/OfflineMapsScreen';
 import NotificationsScreen from './src/screens/NotificationsScreen';
+import UpdateScreen from './src/screens/UpdateScreen';
 
 // Context
 import { AuthProvider, useAuth } from './src/context/AuthContext';
@@ -114,7 +116,37 @@ function MainTabs() {
 
 function AppNavigator() {
   const { isAuthenticated, loading, user } = useAuth();
-  const { hideReportIncident, hideIncident } = useAppSetting();
+  const { hideReportIncident, hideIncident, forceUpdateRequired, loading: appSettingLoading } = useAppSetting();
+  const [showUpdate, setShowUpdate] = React.useState(false);
+
+  // Check if update is required from app_setting table
+  React.useEffect(() => {
+    // If force_update_required is true, show update screen and lock the app
+    if (forceUpdateRequired) {
+      setShowUpdate(true);
+      return;
+    }
+
+    // Otherwise, check for version-based update requirement
+    const checkUpdateRequired = async () => {
+      try {
+        const updateRequired = await updateService.checkUpdateRequired();
+        setShowUpdate(updateRequired);
+      } catch (error) {
+        logger.error('Error checking for app update:', error);
+      }
+    };
+    
+    // Only check if app settings are loaded
+    if (!appSettingLoading) {
+      checkUpdateRequired();
+    }
+  }, [forceUpdateRequired, appSettingLoading]);
+
+  // Show update screen if update is required (this locks the app)
+  if (showUpdate) {
+    return <UpdateScreen />;
+  }
 
   return (
     <NavigationContainer>
@@ -135,6 +167,7 @@ function AppNavigator() {
           <>
             <Stack.Screen name="MainTabs" component={MainTabs} />
             <Stack.Screen name="Locked" component={LockedScreen} />
+            <Stack.Screen name="Update" component={UpdateScreen} />
             {!hideReportIncident && <Stack.Screen name="ReportIncident" component={ReportIncidentScreen} />}
             {!hideIncident && <Stack.Screen name="IncidentDetail" component={IncidentDetailScreen} />}
             <Stack.Screen name="Connections" component={ConnectionScreen} />

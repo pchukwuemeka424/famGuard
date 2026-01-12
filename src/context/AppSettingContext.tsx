@@ -9,6 +9,7 @@ interface AppSettingContextType {
   hideReportIncident: boolean;
   hideIncident: boolean;
   sosLock: boolean;
+  forceUpdateRequired: boolean;
   refreshSettings: () => Promise<void>;
 }
 
@@ -42,6 +43,7 @@ export const AppSettingProvider: React.FC<AppSettingProviderProps> = ({ children
           hide_report_incident: false,
           hide_incident: false,
           sos_lock: false,
+          force_update_required: false,
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         });
@@ -51,7 +53,7 @@ export const AppSettingProvider: React.FC<AppSettingProviderProps> = ({ children
       // Explicitly select the status fields from app_setting table
       const { data, error } = await supabase
         .from('app_setting')
-        .select('id, hide_report_incident, hide_incident, sos_lock, created_at, updated_at')
+        .select('id, hide_report_incident, hide_incident, sos_lock, force_update_required, created_at, updated_at')
         .eq('id', '00000000-0000-0000-0000-000000000000')
         .single();
 
@@ -63,6 +65,7 @@ export const AppSettingProvider: React.FC<AppSettingProviderProps> = ({ children
           hide_report_incident: false,
           hide_incident: false,
           sos_lock: false,
+          force_update_required: false,
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         });
@@ -77,6 +80,7 @@ export const AppSettingProvider: React.FC<AppSettingProviderProps> = ({ children
           hide_report_incident: false,
           hide_incident: false,
           sos_lock: false,
+          force_update_required: false,
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         });
@@ -142,6 +146,7 @@ export const AppSettingProvider: React.FC<AppSettingProviderProps> = ({ children
   const hideReportIncident = appSetting?.hide_report_incident === true;
   const hideIncident = appSetting?.hide_incident === true;
   const sosLock = appSetting?.sos_lock === true;
+  const forceUpdateRequired = appSetting?.force_update_required === true;
 
   // Debug logging removed to reduce console noise
   // Uncomment if needed for debugging:
@@ -164,6 +169,7 @@ export const AppSettingProvider: React.FC<AppSettingProviderProps> = ({ children
         hideReportIncident,
         hideIncident,
         sosLock,
+        forceUpdateRequired,
         refreshSettings,
       }}
     >

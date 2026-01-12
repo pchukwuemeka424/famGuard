@@ -42,6 +42,8 @@ const getNotificationIcon = (type: string): keyof typeof Ionicons.glyphMap => {
       return 'person-add';
     case 'location_updated':
       return 'location';
+    case 'location_reminder':
+      return 'location-outline';
     case 'incident':
     case 'incident_proximity':
       return 'alert-circle';
@@ -86,6 +88,8 @@ const getNotificationColor = (type: string, data?: any): string => {
       return '#F59E0B';
     case 'connection_added':
       return '#10B981';
+    case 'location_reminder':
+      return '#3B82F6';
     case 'incident':
     case 'incident_proximity':
       return '#EF4444';
@@ -162,6 +166,12 @@ export default function NotificationsScreen({ navigation }: NotificationsScreenP
 
   const markAsRead = async (notificationId: string) => {
     try {
+      // Get notification data before marking as read
+      const notification = notifications.find((n) => n.id === notificationId);
+      const notificationData = notification?.data as any;
+      const requiresLocationUpdate = notificationData?.requiresLocationUpdate === true;
+      const notificationType = notificationData?.type;
+
       const { error } = await supabase
         .from('notifications')
         .update({ read: true })
@@ -177,6 +187,63 @@ export default function NotificationsScreen({ navigation }: NotificationsScreenP
         prev.map((n) => (n.id === notificationId ? { ...n, read: true } : n))
       );
       setUnreadCount((prev) => Math.max(0, prev - 1));
+
+      // If this is a quick message notification that requires location update, trigger it
+      if (requiresLocationUpdate && notificationType === 'quick_message') {
+        try {
+          const { locationService } = await import('../services/locationService');
+          
+          // Request permission if needed
+          const hasPermission = await locationService.checkPermissions();
+          if (!hasPermission) {
+            const permissionResult = await locationService.requestPermissions();
+            if (!permissionResult.granted) {
+              console.warn('Location permission denied when updating from quick message notification');
+              Alert.alert(
+                'Location Permission Required',
+                'To update your location, please grant location permission in Settings.',
+                [{ text: 'OK' }]
+              );
+              return;
+            }
+          }
+
+          // Get current location and update
+          const currentLocation = await locationService.getHighAccuracyLocation(true);
+          if (currentLocation) {
+            // Save location to history
+            if (user?.id) {
+              await locationService.saveLocationToHistory(user.id, currentLocation);
+              
+              // Also update connections table if location sharing is enabled
+              const { data: userSettings } = await supabase
+                .from('user_settings')
+                .select('location_sharing_enabled')
+                .eq('user_id', user.id)
+                .single();
+
+              if (userSettings?.location_sharing_enabled) {
+                // Update location in connections table
+                await supabase
+                  .from('connections')
+                  .update({
+                    location_latitude: currentLocation.latitude,
+                    location_longitude: currentLocation.longitude,
+                    location_address: currentLocation.address || null,
+                    location_updated_at: new Date().toISOString(),
+                  })
+                  .eq('connected_user_id', user.id)
+                  .eq('status', 'connected');
+              }
+
+              console.log('✅ Location updated after reading quick message notification');
+            }
+          }
+        } catch (locationError) {
+          console.error('Error updating location from quick message notification:', locationError);
+          // Don't show error to user - location update is optional
+        }
+      }
     } catch (error) {
       console.error('Error marking notification as read:', error);
     }
@@ -256,16 +323,99 @@ export default function NotificationsScreen({ navigation }: NotificationsScreenP
     const isEmergencyAlert = item.type === 'sos_alert' || item.type === 'check_in_emergency';
     const isConnectionRequest = item.type === 'connection_added';
     const isIncidentProximity = item.type === 'incident_proximity';
+    const isLocationReminder = item.type === 'location_reminder';
     
     // Get alert level for proximity incidents
     const alertLevel = item.data?.alertLevel || null;
     const isDanger = alertLevel === 'danger';
     const isWarning = alertLevel === 'warning';
 
-    const handleNotificationPress = () => {
+    const handleNotificationPress = async () => {
       // Mark as read if unread
       if (!item.read) {
         markAsRead(item.id);
+      }
+
+      // Handle location reminder - update user's location when notification is opened
+      if (isLocationReminder) {
+        try {
+          // Import locationService dynamically to avoid circular dependencies
+          const { locationService } = await import('../services/locationService');
+          
+          // Request permission if needed
+          const hasPermission = await locationService.checkPermissions();
+          if (!hasPermission) {
+            const permissionResult = await locationService.requestPermissions();
+            if (!permissionResult.granted) {
+              Alert.alert(
+                'Permission Required',
+                'Location permission is required to update your location.',
+                [{ text: 'OK' }]
+              );
+              return;
+            }
+          }
+
+          // Get current location
+          const currentLocation = await locationService.getHighAccuracyLocation(true);
+          if (currentLocation && user?.id) {
+            // Save location to history (this will insert a new row)
+            await locationService.saveLocationToHistory(user.id, currentLocation, true);
+            
+            // Also update family_members if location sharing is enabled
+            const { data: userSettings } = await supabase
+              .from('user_settings')
+              .select('location_sharing_enabled')
+              .eq('user_id', user.id)
+              .single();
+
+            const shareLocation = userSettings?.location_sharing_enabled ?? false;
+            
+            if (shareLocation) {
+              // Get family group ID if available
+              const { data: familyMember } = await supabase
+                .from('family_members')
+                .select('family_group_id')
+                .eq('user_id', user.id)
+                .limit(1)
+                .maybeSingle();
+
+              if (familyMember?.family_group_id) {
+                // Update location in family_members table
+                await supabase
+                  .from('family_members')
+                  .update({
+                    location_latitude: currentLocation.latitude,
+                    location_longitude: currentLocation.longitude,
+                    location_address: currentLocation.address || null,
+                    last_seen: new Date().toISOString(),
+                  })
+                  .eq('user_id', user.id)
+                  .eq('family_group_id', familyMember.family_group_id);
+              }
+            }
+
+            Alert.alert(
+              'Location Updated',
+              'Your location has been updated successfully.',
+              [{ text: 'OK' }]
+            );
+          } else {
+            Alert.alert(
+              'Location Error',
+              'Unable to get your current location. Please check your location settings.',
+              [{ text: 'OK' }]
+            );
+          }
+        } catch (error) {
+          console.error('Error updating location from notification:', error);
+          Alert.alert(
+            'Error',
+            'Failed to update location. Please try again.',
+            [{ text: 'OK' }]
+          );
+        }
+        return;
       }
 
       // Navigate to MapScreen for emergency alerts with location data

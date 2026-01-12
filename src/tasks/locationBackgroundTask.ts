@@ -80,6 +80,59 @@ TaskManager.defineTask(LOCATION_TASK_NAME, async ({ data, error }) => {
 
         const member = members && members.length > 0 ? members[0] : null;
 
+        // Save to location_history based on user's frequency setting
+        // This ensures we have complete location tracking even if family_members update fails
+        try {
+          // Load user's location update frequency setting
+          let locationUpdateFrequencyMinutes = 60; // Default 60 minutes
+          const { data: settingsData, error: settingsError } = await supabase
+            .from('user_settings')
+            .select('location_update_frequency_minutes')
+            .eq('user_id', userId)
+            .single();
+
+          if (!settingsError && settingsData) {
+            locationUpdateFrequencyMinutes = settingsData.location_update_frequency_minutes || 60;
+          }
+
+          // Check if enough time has passed since last insert
+          const lastInsertKey = `location_history_last_insert_${userId}`;
+          const lastInsertTimeStr = await AsyncStorage.getItem(lastInsertKey);
+          const lastInsertTime = lastInsertTimeStr ? parseInt(lastInsertTimeStr, 10) : 0;
+          const now = Date.now();
+          const frequencyMs = locationUpdateFrequencyMinutes * 60 * 1000; // Convert minutes to milliseconds
+          const timeSinceLastInsert = now - lastInsertTime;
+
+          if (lastInsertTime > 0 && timeSinceLastInsert < frequencyMs) {
+            // Not enough time has passed, skip insert
+            const minutesRemaining = Math.ceil((frequencyMs - timeSinceLastInsert) / (60 * 1000));
+            if (__DEV__) {
+              console.log(`Skipping background location history insert - ${minutesRemaining} minutes remaining (frequency: ${locationUpdateFrequencyMinutes} minutes)`);
+            }
+          } else {
+            // Insert into location_history
+            const { error: historyError } = await supabase
+              .from('location_history')
+              .insert({
+                user_id: userId,
+                latitude: locationData.latitude,
+                longitude: locationData.longitude,
+                address: locationData.address || null,
+              });
+
+            if (historyError) {
+              console.warn('Error saving location history in background:', historyError);
+            } else {
+              // Update last insert timestamp
+              await AsyncStorage.setItem(lastInsertKey, now.toString());
+              console.log(`Background location saved to history (frequency: ${locationUpdateFrequencyMinutes} minutes)`);
+            }
+          }
+        } catch (historyErr) {
+          console.warn('Error in saveLocationHistory (background):', historyErr);
+        }
+
+        // Update family_members table (if member exists)
         if (member) {
           // Update location in database
           const { error: updateError } = await supabase
@@ -104,7 +157,7 @@ TaskManager.defineTask(LOCATION_TASK_NAME, async ({ data, error }) => {
             });
           }
         } else {
-          console.warn('Background location update: Family member not found');
+          console.warn('Background location update: Family member not found (but history was saved)');
         }
       } catch (dbError) {
         console.error('Error updating location in background:', dbError);

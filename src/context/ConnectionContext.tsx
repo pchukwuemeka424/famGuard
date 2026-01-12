@@ -357,6 +357,12 @@ export const ConnectionProvider: React.FC<ConnectionProviderProps> = ({ children
         const isOnline = hasLocation && locationUpdatedAt > fiveMinutesAgo;
         const shareLocation = hasLocation || false;
 
+        const lastSeenLocation = hasLocation ? {
+          latitude: conn.location_latitude,
+          longitude: conn.location_longitude,
+          address: conn.location_address || undefined,
+        } : undefined;
+
         return {
           id: conn.id,
           userId: conn.connected_user_id,
@@ -376,6 +382,9 @@ export const ConnectionProvider: React.FC<ConnectionProviderProps> = ({ children
           isOnline: isOnline,
           shareLocation: shareLocation,
           batteryLevel: conn.battery_level ?? 100, // Get from database or default to 100
+          // Enhanced last seen information
+          lastSeenLocation: lastSeenLocation,
+          lastSeenAddress: conn.location_address || undefined,
         };
       });
 

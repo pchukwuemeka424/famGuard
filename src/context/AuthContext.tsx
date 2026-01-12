@@ -98,6 +98,139 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     };
   }, []);
 
+  // Set up notification response handler for push notifications (when user is authenticated)
+  useEffect(() => {
+    if (!user?.id) return;
+
+    // Handle when user taps a push notification
+    const notificationSubscription = pushNotificationService.addNotificationResponseReceivedListener(
+      async (response) => {
+        const notificationData = response.notification.request.content.data;
+        const notificationType = notificationData?.type;
+        
+        // Handle location_reminder notification tap
+        if (notificationType === 'location_reminder') {
+          try {
+            const { locationService } = await import('../services/locationService');
+            
+            // Request permission if needed
+            const hasPermission = await locationService.checkPermissions();
+            if (!hasPermission) {
+              const permissionResult = await locationService.requestPermissions();
+              if (!permissionResult.granted) {
+                logger.warn('Location permission denied when updating from notification');
+                return;
+              }
+            }
+
+            // Get current location and save to history
+            const currentLocation = await locationService.getHighAccuracyLocation(true);
+            if (currentLocation) {
+              // Save location to history
+              await locationService.saveLocationToHistory(user.id, currentLocation, true);
+              
+              // Also update family_members if location sharing is enabled
+              const { data: userSettings } = await supabase
+                .from('user_settings')
+                .select('location_sharing_enabled')
+                .eq('user_id', user.id)
+                .single();
+
+              const shareLocation = userSettings?.location_sharing_enabled ?? false;
+              
+              if (shareLocation) {
+                const { data: familyMember } = await supabase
+                  .from('family_members')
+                  .select('family_group_id')
+                  .eq('user_id', user.id)
+                  .limit(1)
+                  .maybeSingle();
+
+                if (familyMember?.family_group_id) {
+                  await supabase
+                    .from('family_members')
+                    .update({
+                      location_latitude: currentLocation.latitude,
+                      location_longitude: currentLocation.longitude,
+                      location_address: currentLocation.address || null,
+                      last_seen: new Date().toISOString(),
+                    })
+                    .eq('user_id', user.id)
+                    .eq('family_group_id', familyMember.family_group_id);
+                }
+              }
+
+              logger.log('Location updated from push notification tap');
+            }
+          } catch (error) {
+            logger.error('Error updating location from push notification:', error);
+          }
+        }
+        
+        // Handle quick_message notification tap
+        if (notificationType === 'quick_message' && notificationData?.requiresLocationUpdate) {
+          try {
+            const { locationService } = await import('../services/locationService');
+            
+            // Request permission if needed
+            const hasPermission = await locationService.checkPermissions();
+            if (!hasPermission) {
+              const permissionResult = await locationService.requestPermissions();
+              if (!permissionResult.granted) {
+                logger.warn('Location permission denied when updating from quick message');
+                return;
+              }
+            }
+
+            // Get current location and update
+            const currentLocation = await locationService.getHighAccuracyLocation(true);
+            if (currentLocation) {
+              // Save location to history
+              await locationService.saveLocationToHistory(user.id, currentLocation);
+              
+              // Update connections table if location sharing is enabled
+              const { data: userSettings } = await supabase
+                .from('user_settings')
+                .select('location_sharing_enabled')
+                .eq('user_id', user.id)
+                .single();
+
+              if (userSettings?.location_sharing_enabled) {
+                // Update location in connections table
+                await supabase
+                  .from('connections')
+                  .update({
+                    location_latitude: currentLocation.latitude,
+                    location_longitude: currentLocation.longitude,
+                    location_address: currentLocation.address || null,
+                    location_updated_at: new Date().toISOString(),
+                  })
+                  .eq('connected_user_id', user.id)
+                  .eq('status', 'connected');
+              }
+
+              // Mark notification as read if notificationId is provided
+              if (notificationData?.notificationId) {
+                await supabase
+                  .from('notifications')
+                  .update({ read: true })
+                  .eq('id', notificationData.notificationId);
+              }
+
+              logger.log('Location updated from quick message push notification tap');
+            }
+          } catch (error) {
+            logger.error('Error updating location from quick message notification:', error);
+          }
+        }
+      }
+    );
+
+    return () => {
+      notificationSubscription.remove();
+    };
+  }, [user?.id]);
+
   // Set up real-time subscription for lock status changes
   useEffect(() => {
     const currentUserId = userIdRef.current;

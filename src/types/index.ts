@@ -28,6 +28,9 @@ export interface FamilyMember {
   isOnline: boolean;
   shareLocation: boolean;
   batteryLevel: number;
+  // Enhanced last seen information
+  lastSeenLocation?: Location; // Location where they were last seen
+  lastSeenAddress?: string; // Address where they were last seen
 }
 
 export interface IncidentReporter {
@@ -80,6 +83,7 @@ export interface AppSetting {
   hide_report_incident: boolean;
   hide_incident: boolean;
   sos_lock: boolean;
+  force_update_required: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -112,6 +116,7 @@ export type RootStackParamList = {
   CheckIn: undefined;
   CheckInSettings: undefined;
   OfflineMaps: undefined;
+  Update: undefined;
 };
 
 export type MainTabParamList = {

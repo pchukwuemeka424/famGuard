@@ -51,6 +51,9 @@ class LocationService {
   private readonly GEOCODE_CACHE_DURATION = 600000; // 10 minutes cache duration (increased)
   private readonly GEOCODE_DISTANCE_THRESHOLD = 500; // Only geocode if moved more than 500m (increased to reduce calls)
   private rateLimitWarningShown: boolean = false; // Track if we've shown the warning to avoid spam
+  // Location history frequency tracking
+  private locationUpdateFrequencyMinutes: number = 60; // Default 60 minutes
+  private lastLocationHistoryInsert: number = 0; // Timestamp of last location history insert
 
   /**
    * Request location permissions
@@ -139,6 +142,7 @@ class LocationService {
 
   /**
    * Get current location quickly (with shorter timeout for faster response)
+   * Falls back to last location from location_history if offline
    * @param requestPermissionIfNeeded - If true, will request permission if not granted. Default: false
    * @param fastMode - If true, uses shorter timeout (2s) and allows cached location. Default: false
    */
@@ -149,11 +153,43 @@ class LocationService {
         if (requestPermissionIfNeeded) {
           const permissionResult = await this.requestPermissions();
           if (!permissionResult.granted) {
+            // Try to get last location from history if we have userId
+            if (this.userId) {
+              const lastLocation = await this.getLastLocationFromHistory(this.userId);
+              if (lastLocation) {
+                return lastLocation;
+              }
+            }
             return this.lastLocation; // Return cached if permission denied
           }
         } else {
+          // Try to get last location from history if we have userId
+          if (this.userId) {
+            const lastLocation = await this.getLastLocationFromHistory(this.userId);
+            if (lastLocation) {
+              return lastLocation;
+            }
+          }
           return this.lastLocation; // Return cached location if no permission
         }
+      }
+
+      // Check if we're online (skip check in fast mode to save time, but still check if no cached location)
+      let online = true;
+      if (!fastMode || !this.lastLocation) {
+        online = await this.isOnline();
+      }
+
+      if (!online && this.userId) {
+        // Offline - get last location from history
+        const lastLocation = await this.getLastLocationFromHistory(this.userId);
+        if (lastLocation) {
+          if (__DEV__) {
+            console.log('No internet connection (fast mode), using last location from history');
+          }
+          return lastLocation;
+        }
+        // If no history, still try GPS (GPS works offline)
       }
 
       // Use shorter timeout for fast mode
@@ -170,30 +206,66 @@ class LocationService {
             timeout: fastMode ? 2000 : 10000, // 2s timeout in fast mode
           };
       
-      const location = await Location.getCurrentPositionAsync(locationOptions);
+      try {
+        const location = await Location.getCurrentPositionAsync(locationOptions);
 
-      // Skip geocoding in fast mode to save time
-      if (fastMode && this.lastLocation?.address) {
+        // Skip geocoding in fast mode to save time
+        if (fastMode && this.lastLocation?.address) {
+          return {
+            latitude: location.coords.latitude,
+            longitude: location.coords.longitude,
+            address: this.lastLocation.address, // Use cached address
+          };
+        }
+
+        // Reverse geocode to get address (only if online and not in cache)
+        let address: string | null = null;
+        if (online) {
+          address = await this.reverseGeocode(
+            location.coords.latitude,
+            location.coords.longitude,
+            false // Don't force - use cache and rate limiting
+          );
+        } else {
+          // Offline - try to get address from last location in history
+          if (this.userId) {
+            const lastLocation = await this.getLastLocationFromHistory(this.userId);
+            if (lastLocation?.address) {
+              address = lastLocation.address;
+            }
+          }
+        }
+
         return {
           latitude: location.coords.latitude,
           longitude: location.coords.longitude,
-          address: this.lastLocation.address, // Use cached address
+          address: address || undefined,
         };
+      } catch (gpsError) {
+        // GPS failed - try to get last location from history if offline
+        if (!online && this.userId) {
+          const lastLocation = await this.getLastLocationFromHistory(this.userId);
+          if (lastLocation) {
+            if (__DEV__) {
+              console.log('GPS failed (fast mode), using last location from history');
+            }
+            return lastLocation;
+          }
+        }
+        throw gpsError;
       }
-
-      // Reverse geocode to get address (only if not in cache)
-      const address = await this.reverseGeocode(
-        location.coords.latitude,
-        location.coords.longitude,
-        false // Don't force - use cache and rate limiting
-      );
-
-      return {
-        latitude: location.coords.latitude,
-        longitude: location.coords.longitude,
-        address: address || undefined,
-      };
     } catch (error) {
+      // Try to get last location from history as fallback
+      if (this.userId) {
+        const lastLocation = await this.getLastLocationFromHistory(this.userId);
+        if (lastLocation) {
+          if (__DEV__) {
+            console.log('Error getting location (fast mode), using last location from history as fallback');
+          }
+          return lastLocation;
+        }
+      }
+      
       // Return cached location if fetch fails
       if (this.lastLocation) {
         return this.lastLocation;
@@ -205,6 +277,7 @@ class LocationService {
 
   /**
    * Get current location
+   * Falls back to last location from location_history if offline
    * @param requestPermissionIfNeeded - If true, will request permission if not granted. Default: false
    */
   async getCurrentLocation(requestPermissionIfNeeded: boolean = false): Promise<LocationType | null> {
@@ -214,12 +287,46 @@ class LocationService {
         if (requestPermissionIfNeeded) {
           const permissionResult = await this.requestPermissions();
           if (!permissionResult.granted) {
+            // If no permission, try to get last location from history if we have userId
+            if (this.userId) {
+              const lastLocation = await this.getLastLocationFromHistory(this.userId);
+              if (lastLocation) {
+                if (__DEV__) {
+                  console.log('No location permission, using last location from history');
+                }
+                return lastLocation;
+              }
+            }
             return null;
           }
         } else {
-          // Don't request permission automatically - return null
+          // Don't request permission automatically - try to get last location from history
+          if (this.userId) {
+            const lastLocation = await this.getLastLocationFromHistory(this.userId);
+            if (lastLocation) {
+              if (__DEV__) {
+                console.log('No location permission, using last location from history');
+              }
+              return lastLocation;
+            }
+          }
           return null;
         }
+      }
+
+      // Check if we're online before attempting to get GPS location
+      const online = await this.isOnline();
+      
+      if (!online && this.userId) {
+        // Offline - get last location from history
+        if (__DEV__) {
+          console.log('No internet connection, fetching last location from history');
+        }
+        const lastLocation = await this.getLastLocationFromHistory(this.userId);
+        if (lastLocation) {
+          return lastLocation;
+        }
+        // If no history, still try GPS (GPS works offline)
       }
 
       // iOS-specific options to force fresh GPS reading
@@ -236,28 +343,66 @@ class LocationService {
             timeout: 10000,
           };
       
-      const location = await Location.getCurrentPositionAsync(locationOptions);
+      try {
+        const location = await Location.getCurrentPositionAsync(locationOptions);
 
-      // Reverse geocode to get address (only if not in cache)
-      const address = await this.reverseGeocode(
-        location.coords.latitude,
-        location.coords.longitude,
-        false // Don't force - use cache and rate limiting
-      );
+        // Reverse geocode to get address (only if not in cache and online)
+        let address: string | null = null;
+        if (online) {
+          address = await this.reverseGeocode(
+            location.coords.latitude,
+            location.coords.longitude,
+            false // Don't force - use cache and rate limiting
+          );
+        } else {
+          // Offline - try to get address from last location in history
+          if (this.userId) {
+            const lastLocation = await this.getLastLocationFromHistory(this.userId);
+            if (lastLocation?.address) {
+              address = lastLocation.address;
+            }
+          }
+        }
 
-      return {
-        latitude: location.coords.latitude,
-        longitude: location.coords.longitude,
-        address: address || undefined,
-      };
+        return {
+          latitude: location.coords.latitude,
+          longitude: location.coords.longitude,
+          address: address || undefined,
+        };
+      } catch (gpsError) {
+        // GPS failed - try to get last location from history if offline
+        if (!online && this.userId) {
+          const lastLocation = await this.getLastLocationFromHistory(this.userId);
+          if (lastLocation) {
+            if (__DEV__) {
+              console.log('GPS failed, using last location from history');
+            }
+            return lastLocation;
+          }
+        }
+        throw gpsError;
+      }
     } catch (error) {
       console.error('Error getting current location:', error);
+      
+      // Last resort: try to get last location from history
+      if (this.userId) {
+        const lastLocation = await this.getLastLocationFromHistory(this.userId);
+        if (lastLocation) {
+          if (__DEV__) {
+            console.log('Error getting location, using last location from history as fallback');
+          }
+          return lastLocation;
+        }
+      }
+      
       return null;
     }
   }
 
   /**
    * Get high-accuracy current location (for exact location features)
+   * Falls back to last location from location_history if offline
    * @param requestPermissionIfNeeded - If true, will request permission if not granted. Default: false
    */
   async getHighAccuracyLocation(requestPermissionIfNeeded: boolean = false): Promise<LocationType | null> {
@@ -267,12 +412,46 @@ class LocationService {
         if (requestPermissionIfNeeded) {
           const permissionResult = await this.requestPermissions();
           if (!permissionResult.granted) {
+            // If no permission, try to get last location from history if we have userId
+            if (this.userId) {
+              const lastLocation = await this.getLastLocationFromHistory(this.userId);
+              if (lastLocation) {
+                if (__DEV__) {
+                  console.log('No location permission, using last location from history');
+                }
+                return lastLocation;
+              }
+            }
             return null;
           }
         } else {
-          // Don't request permission automatically - return null
+          // Don't request permission automatically - try to get last location from history
+          if (this.userId) {
+            const lastLocation = await this.getLastLocationFromHistory(this.userId);
+            if (lastLocation) {
+              if (__DEV__) {
+                console.log('No location permission, using last location from history');
+              }
+              return lastLocation;
+            }
+          }
           return null;
         }
+      }
+
+      // Check if we're online before attempting to get GPS location
+      const online = await this.isOnline();
+      
+      if (!online && this.userId) {
+        // Offline - get last location from history
+        if (__DEV__) {
+          console.log('No internet connection, fetching last location from history for high accuracy');
+        }
+        const lastLocation = await this.getLastLocationFromHistory(this.userId);
+        if (lastLocation) {
+          return lastLocation;
+        }
+        // If no history, still try GPS (GPS works offline)
       }
 
       // Use best accuracy for exact location
@@ -295,36 +474,74 @@ class LocationService {
             timeout: 10000,
           };
       
-      const location = await Location.getCurrentPositionAsync(locationOptions);
+      try {
+        const location = await Location.getCurrentPositionAsync(locationOptions);
 
-      // Reverse geocode to get address (only if not in cache)
-      const address = await this.reverseGeocode(
-        location.coords.latitude,
-        location.coords.longitude,
-        false // Don't force - use cache and rate limiting to prevent rate limit errors
-      );
+        // Reverse geocode to get address (only if online and not in cache)
+        let address: string | null = null;
+        if (online) {
+          address = await this.reverseGeocode(
+            location.coords.latitude,
+            location.coords.longitude,
+            false // Don't force - use cache and rate limiting to prevent rate limit errors
+          );
+        } else {
+          // Offline - try to get address from last location in history
+          if (this.userId) {
+            const lastLocation = await this.getLastLocationFromHistory(this.userId);
+            if (lastLocation?.address) {
+              address = lastLocation.address;
+            }
+          }
+        }
 
-      const result = {
-        latitude: location.coords.latitude,
-        longitude: location.coords.longitude,
-        address: address || undefined,
-      };
+        const result = {
+          latitude: location.coords.latitude,
+          longitude: location.coords.longitude,
+          address: address || undefined,
+        };
 
-      // Log location accuracy for debugging on iOS
-      if (__DEV__ && Platform.OS === 'ios') {
-        console.log('High accuracy location fetched:', {
-          lat: result.latitude.toFixed(6),
-          lng: result.longitude.toFixed(6),
-          accuracy: location.coords.accuracy,
-          altitude: location.coords.altitude,
-          heading: location.coords.heading,
-          speed: location.coords.speed,
-        });
+        // Log location accuracy for debugging on iOS
+        if (__DEV__ && Platform.OS === 'ios') {
+          console.log('High accuracy location fetched:', {
+            lat: result.latitude.toFixed(6),
+            lng: result.longitude.toFixed(6),
+            accuracy: location.coords.accuracy,
+            altitude: location.coords.altitude,
+            heading: location.coords.heading,
+            speed: location.coords.speed,
+            online,
+          });
+        }
+
+        return result;
+      } catch (gpsError) {
+        // GPS failed - try to get last location from history if offline
+        if (!online && this.userId) {
+          const lastLocation = await this.getLastLocationFromHistory(this.userId);
+          if (lastLocation) {
+            if (__DEV__) {
+              console.log('GPS failed, using last location from history');
+            }
+            return lastLocation;
+          }
+        }
+        throw gpsError;
       }
-
-      return result;
     } catch (error) {
       console.error('Error getting high accuracy location:', error);
+      
+      // Last resort: try to get last location from history
+      if (this.userId) {
+        const lastLocation = await this.getLastLocationFromHistory(this.userId);
+        if (lastLocation) {
+          if (__DEV__) {
+            console.log('Error getting high accuracy location, using last location from history as fallback');
+          }
+          return lastLocation;
+        }
+      }
+      
       // Fallback to regular accuracy (with same permission request flag)
       return this.getCurrentLocation(requestPermissionIfNeeded);
     }
@@ -496,6 +713,19 @@ class LocationService {
     this.familyGroupId = familyGroupId;
     this.isTracking = true;
 
+    // Load user settings for location update frequency
+    await this.loadLocationUpdateFrequency();
+    
+    // Load last insert time from AsyncStorage (for consistency with background task)
+    try {
+      const lastInsertTimeStr = await AsyncStorage.getItem(`location_history_last_insert_${userId}`);
+      if (lastInsertTimeStr) {
+        this.lastLocationHistoryInsert = parseInt(lastInsertTimeStr, 10);
+      }
+    } catch (error) {
+      // Ignore error, will start fresh
+    }
+
     // Store userId and familyGroupId for background task
     await AsyncStorage.setItem('location_tracking_userId', userId);
     await AsyncStorage.setItem('location_tracking_familyGroupId', familyGroupId);
@@ -510,6 +740,10 @@ class LocationService {
         location: { ...initialLocation },
         timestamp: Date.now(),
       };
+      // Always save initial location to history (bypass frequency check for first location)
+      // Reset last insert time to ensure initial location is saved
+      this.lastLocationHistoryInsert = 0;
+      await this.saveLocationHistory(initialLocation);
     }
 
     // Start watching location changes with highest accuracy
@@ -549,9 +783,17 @@ class LocationService {
         // Check if we should update the database
         const shouldUpdate = this.shouldUpdateDatabase(newLocation);
         
+        // Always update lastLocation for tracking
+        this.lastLocation = newLocation;
+        
         if (!shouldUpdate) {
           // User hasn't moved significantly and recent update exists, skip database update
-          this.lastLocation = newLocation; // Still update lastLocation for tracking
+          // BUT still save to location history to ensure complete tracking
+          // Use previous address if available, otherwise location will be geocoded in saveLocationHistory
+          if (this.lastLocation?.address && !newLocation.address) {
+            newLocation.address = this.lastLocation.address;
+          }
+          await this.saveLocationHistory(newLocation);
           return;
         }
 
@@ -567,13 +809,18 @@ class LocationService {
         newLocation.address = address || this.lastLocation?.address || undefined;
 
         // Update location in database only if user moved significantly or it's been a long time
+        // Note: saveLocationHistory is called separately to ensure it always runs
+        // even if updateLocationInDatabase fails or returns early
         await this.updateLocationInDatabase(newLocation, shareLocation);
-        this.lastLocation = newLocation;
         // Track the last database update
         this.lastDatabaseUpdate = {
           location: { ...newLocation },
           timestamp: Date.now(),
         };
+        
+        // ALWAYS save to location history (independent of database update success)
+        // This ensures we have complete location tracking regardless of family_members update status
+        await this.saveLocationHistory(newLocation);
       }
     );
 
@@ -584,9 +831,13 @@ class LocationService {
         // Check if we should update the database
         const shouldUpdate = this.shouldUpdateDatabase(location);
         
+        // Always update lastLocation for tracking
+        this.lastLocation = location;
+        
         if (!shouldUpdate) {
           // User hasn't moved significantly and recent update exists, skip database update
-          this.lastLocation = location; // Still update lastLocation for tracking
+          // BUT still save to location history to ensure complete tracking
+          await this.saveLocationHistory(location);
           return;
         }
 
@@ -596,13 +847,19 @@ class LocationService {
           location.address = this.lastLocation.address;
         }
         
+        // Update location in database
+        // Note: saveLocationHistory is called separately to ensure it always runs
+        // even if updateLocationInDatabase fails or returns early
         await this.updateLocationInDatabase(location, shareLocation);
-        this.lastLocation = location;
         // Track the last database update
         this.lastDatabaseUpdate = {
           location: { ...location },
           timestamp: Date.now(),
         };
+        
+        // ALWAYS save to location history (independent of database update success)
+        // This ensures we have complete location tracking regardless of family_members update status
+        await this.saveLocationHistory(location);
       }
     }, this.config.updateInterval);
 
@@ -872,8 +1129,8 @@ class LocationService {
         console.error('Error updating location in database:', error);
       } else {
         console.log(`Location updated: ${location.latitude.toFixed(6)}, ${location.longitude.toFixed(6)}`);
-        // Save to location history
-        await this.saveLocationHistory(location);
+        // Note: saveLocationHistory is now called separately to ensure it always runs
+        // even if updateLocationInDatabase is skipped due to stationary detection
       }
     } catch (error) {
       console.error('Error in updateLocationInDatabase:', error);
@@ -881,86 +1138,108 @@ class LocationService {
   }
 
   /**
-   * Save location to history
-   * Implements proximity-based insertion:
-   * - If user is in same proximity for 40+ minutes, skip insertion
-   * - When user moves away from 40-minute proximity, insert current location
+   * Load location update frequency from user settings
    */
-  private async saveLocationHistory(location: LocationType): Promise<void> {
+  private async loadLocationUpdateFrequency(): Promise<void> {
     if (!this.userId) {
       return;
     }
 
+    try {
+      const { data, error } = await supabase
+        .from('user_settings')
+        .select('location_update_frequency_minutes')
+        .eq('user_id', this.userId)
+        .single();
+
+      if (error) {
+        if (error.code === 'PGRST116') {
+          // Settings don't exist, use default
+          this.locationUpdateFrequencyMinutes = 60;
+          if (__DEV__) {
+            console.log('User settings not found, using default frequency: 60 minutes');
+          }
+        } else {
+          console.error('Error loading location update frequency:', error);
+          // Use default on error
+          this.locationUpdateFrequencyMinutes = 60;
+        }
+      } else if (data) {
+        const newFrequency = data.location_update_frequency_minutes || 60;
+        if (newFrequency !== this.locationUpdateFrequencyMinutes) {
+          this.locationUpdateFrequencyMinutes = newFrequency;
+          if (__DEV__) {
+            console.log(`Location update frequency updated: ${this.locationUpdateFrequencyMinutes} minutes`);
+          }
+        } else {
+          this.locationUpdateFrequencyMinutes = newFrequency;
+        }
+      }
+    } catch (error) {
+      console.error('Error loading location update frequency:', error);
+      // Use default on error
+      this.locationUpdateFrequencyMinutes = 60;
+    }
+  }
+
+  /**
+   * Refresh location update frequency from user settings
+   * Call this when user changes their frequency setting
+   */
+  async refreshLocationUpdateFrequency(): Promise<void> {
+    await this.loadLocationUpdateFrequency();
+  }
+
+  /**
+   * Save location to history
+   * Inserts a new row into location_history table based on user's frequency setting
+   * Respects location_update_frequency_minutes from user_settings
+   * The only requirement is that userId must be set
+   */
+  private async saveLocationHistory(location: LocationType): Promise<void> {
+    // Only requirement: userId must be set
+    if (!this.userId) {
+      if (__DEV__) {
+        console.warn('Cannot save location history: userId not set');
+      }
+      return;
+    }
+
+    // Check if enough time has passed since last insert based on frequency setting
     const now = Date.now();
+    const frequencyMs = this.locationUpdateFrequencyMinutes * 60 * 1000; // Convert minutes to milliseconds
+    const timeSinceLastInsert = now - this.lastLocationHistoryInsert;
 
-    // Check if user is in proximity of a stationary location
-    if (this.stationaryLocation) {
-      const distance = this.calculateDistance(
-        this.stationaryLocation.location.latitude,
-        this.stationaryLocation.location.longitude,
-        location.latitude,
-        location.longitude
-      );
-
-      // If still within proximity threshold
-      if (distance <= this.PROXIMITY_DISTANCE_THRESHOLD) {
-        const timeInProximity = now - this.stationaryLocation.timestamp;
-
-        // If been in proximity for 40+ minutes, skip insertion
-        if (timeInProximity >= this.PROXIMITY_STATIONARY_THRESHOLD) {
-          if (__DEV__) {
-            console.log(`Skipping location history insertion - user stationary for ${Math.round(timeInProximity / 60000)} minutes`);
-          }
-          return;
-        }
-
-        // Still in proximity but less than 40 minutes - insert location and continue tracking
-        // This allows recording locations during the first 40 minutes in proximity
-        // Continue to insert location below
-      } else {
-        // User moved away from stationary location
-        // Insert the current location (they've left the proximity zone)
-        if (__DEV__) {
-          const timeInProximity = now - this.stationaryLocation.timestamp;
-          console.log(`User moved away from stationary location after ${Math.round(timeInProximity / 60000)} minutes - inserting location history`);
-        }
-        // Reset stationary location tracking
-        this.stationaryLocation = null;
-        // Continue to insert location below
+    if (this.lastLocationHistoryInsert > 0 && timeSinceLastInsert < frequencyMs) {
+      // Not enough time has passed, skip insert
+      if (__DEV__) {
+        const minutesRemaining = Math.ceil((frequencyMs - timeSinceLastInsert) / (60 * 1000));
+        console.log(`Skipping location history insert - ${minutesRemaining} minutes remaining until next insert (frequency: ${this.locationUpdateFrequencyMinutes} minutes)`);
       }
+      return;
     }
 
-    // Check if user entered a new proximity zone
-    // If no stationary location is tracked, or user moved away, check if they're now stationary
-    if (!this.stationaryLocation) {
-      // Check if this location is close to the last inserted location
-      // We'll use the last database update as reference if available
-      if (this.lastDatabaseUpdate) {
-        const distance = this.calculateDistance(
-          this.lastDatabaseUpdate.location.latitude,
-          this.lastDatabaseUpdate.location.longitude,
+    // Try to get address if not already available
+    let addressToSave = location.address;
+    if (!addressToSave) {
+      // Attempt to geocode the address (with rate limiting)
+      try {
+        addressToSave = await this.reverseGeocode(
           location.latitude,
-          location.longitude
+          location.longitude,
+          false, // Don't force - respect rate limits
+          false // Not emergency mode
         );
-
-        // If within proximity threshold, start tracking stationary location
-        if (distance <= this.PROXIMITY_DISTANCE_THRESHOLD) {
-          this.stationaryLocation = {
-            location: { ...location },
-            timestamp: now,
-          };
-          if (__DEV__) {
-            console.log('User entered proximity zone - tracking stationary location');
-          }
+      } catch (error) {
+        // If geocoding fails, continue without address
+        if (__DEV__) {
+          console.warn('Geocoding failed for location history, saving without address:', error);
         }
       }
     }
 
-    // Insert location history
-    // This happens when:
-    // 1. User is not in a proximity zone
-    // 2. User is in proximity but less than 40 minutes (first 40 minutes)
-    // 3. User moved away from a proximity zone
+    // Insert location history as a new row
+    // This respects the user's frequency setting
     try {
       const { error } = await supabase
         .from('location_history')
@@ -968,24 +1247,147 @@ class LocationService {
           user_id: this.userId,
           latitude: location.latitude,
           longitude: location.longitude,
-          address: location.address || null,
+          address: addressToSave || null,
         });
 
       if (error) {
-        // Silently fail - don't log errors for history (table might not exist yet)
-        if (__DEV__) {
-          console.warn('Error saving location history:', error);
-        }
+        console.error('Error saving location history:', error);
       } else {
+        // Update last insert timestamp (both in memory and AsyncStorage for background task)
+        this.lastLocationHistoryInsert = now;
+        if (this.userId) {
+          try {
+            await AsyncStorage.setItem(`location_history_last_insert_${this.userId}`, now.toString());
+          } catch (storageError) {
+            // Silently fail - memory tracking is sufficient
+          }
+        }
         if (__DEV__) {
-          console.log('Location history inserted successfully');
+          console.log('Location history inserted successfully', {
+            lat: location.latitude.toFixed(6),
+            lng: location.longitude.toFixed(6),
+            hasAddress: !!addressToSave,
+            frequency: `${this.locationUpdateFrequencyMinutes} minutes`,
+          });
         }
       }
     } catch (error) {
-      // Silently fail - history is optional
-      if (__DEV__) {
-        console.warn('Error in saveLocationHistory:', error);
+      console.error('Error in saveLocationHistory:', error);
+    }
+  }
+
+  /**
+   * Check if device has internet connectivity
+   * Attempts a simple Supabase query to verify connectivity
+   */
+  private async isOnline(): Promise<boolean> {
+    try {
+      // Try a simple query to check connectivity
+      // Use a lightweight query that should work even if table is empty
+      const { error } = await supabase
+        .from('location_history')
+        .select('id')
+        .limit(1)
+        .maybeSingle();
+
+      // If we get an error, check if it's a network error
+      if (error) {
+        const errorMessage = error.message?.toLowerCase() || '';
+        const isNetworkError = 
+          errorMessage.includes('network') ||
+          errorMessage.includes('fetch') ||
+          errorMessage.includes('failed to fetch') ||
+          errorMessage.includes('network request failed') ||
+          error.code === 'PGRST301' || // Connection error
+          error.code === 'PGRST302';    // Timeout
+
+        if (isNetworkError) {
+          if (__DEV__) {
+            console.log('No internet connection detected');
+          }
+          return false;
+        }
       }
+
+      // If no error or non-network error, assume online
+      return true;
+    } catch (error: any) {
+      // Catch network errors in the catch block
+      const errorMessage = error?.message?.toLowerCase() || '';
+      const isNetworkError = 
+        errorMessage.includes('network') ||
+        errorMessage.includes('fetch') ||
+        errorMessage.includes('failed to fetch') ||
+        errorMessage.includes('network request failed');
+
+      if (isNetworkError) {
+        if (__DEV__) {
+          console.log('No internet connection detected (catch block)');
+        }
+        return false;
+      }
+
+      // Unknown error, assume online (let the caller handle it)
+      return true;
+    }
+  }
+
+  /**
+   * Get the last location from location_history for a user
+   * Used as fallback when offline
+   * @param userId - User ID to fetch last location for (optional, uses this.userId if not provided)
+   */
+  async getLastLocationFromHistory(userId?: string): Promise<LocationType | null> {
+    const targetUserId = userId || this.userId;
+    if (!targetUserId) {
+      return null;
+    }
+    try {
+      const { data, error } = await supabase
+        .from('location_history')
+        .select('latitude, longitude, address, created_at')
+        .eq('user_id', targetUserId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (error) {
+        // If it's a network error, that's expected when offline
+        const errorMessage = error.message?.toLowerCase() || '';
+        const isNetworkError = 
+          errorMessage.includes('network') ||
+          errorMessage.includes('fetch') ||
+          errorMessage.includes('failed to fetch') ||
+          errorMessage.includes('network request failed');
+
+        if (!isNetworkError) {
+          console.error('Error fetching last location from history:', error);
+        }
+        return null;
+      }
+
+      if (data) {
+        return {
+          latitude: data.latitude,
+          longitude: data.longitude,
+          address: data.address || undefined,
+        };
+      }
+
+      return null;
+    } catch (error: any) {
+      // Network errors are expected when offline
+      const errorMessage = error?.message?.toLowerCase() || '';
+      const isNetworkError = 
+        errorMessage.includes('network') ||
+        errorMessage.includes('fetch') ||
+        errorMessage.includes('failed to fetch') ||
+        errorMessage.includes('network request failed');
+
+      if (!isNetworkError) {
+        console.error('Error in getLastLocationFromHistory:', error);
+      }
+      return null;
     }
   }
 
