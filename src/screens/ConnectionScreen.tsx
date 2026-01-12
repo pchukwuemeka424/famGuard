@@ -29,6 +29,7 @@ import { useAuth } from '../context/AuthContext';
 import { useConnection } from '../context/ConnectionContext';
 import { supabase } from '../lib/supabase';
 import { locationService } from '../services/locationService';
+import { formatLastSeen, getStatusColor, getStatusIcon, type LastSeenInfo } from '../utils/lastSeenFormatter';
 import type { MainTabParamList, RootStackParamList, Connection, ConnectionInvitation } from '../types';
 
 type ConnectionScreenNavigationProp = CompositeNavigationProp<
@@ -1271,7 +1272,7 @@ export default function ConnectionScreen({ navigation }: ConnectionScreenProps) 
           is_used: true,
           used_by_user_id: user.id,
         })
-        .eq('id', codeData.id);
+        .eq('id', (codeData as any).id);
 
       // Create connection (bidirectional connection will be created automatically by trigger)
       const { error: connectionError } = await supabase
@@ -1521,6 +1522,106 @@ export default function ConnectionScreen({ navigation }: ConnectionScreenProps) 
       isOnline, 
       statusText: isOnline ? 'Online' : 'Offline' 
     };
+  };
+
+  const getLastSeenInfo = (connection: Connection) => {
+    const lastSeenTimestamp = connection.locationUpdatedAt || connection.updatedAt || connection.createdAt;
+    const lastSeenInfo: LastSeenInfo = {
+      timestamp: lastSeenTimestamp,
+      location: connection.location ? {
+        latitude: connection.location.latitude,
+        longitude: connection.location.longitude,
+        address: connection.location.address,
+      } : undefined,
+      isOnline: getConnectionStatus(connection).isOnline,
+      batteryLevel: undefined, // Battery level not available in Connection type
+    };
+    return formatLastSeen(lastSeenInfo);
+  };
+
+  const isOfflineMoreThan3Days = (connection: Connection): boolean => {
+    const lastSeenTimestamp = connection.locationUpdatedAt || connection.updatedAt || connection.createdAt;
+    const lastSeenTime = new Date(lastSeenTimestamp).getTime();
+    const now = Date.now();
+    const threeDaysInMs = 3 * 24 * 60 * 60 * 1000; // 3 days in milliseconds
+    return (now - lastSeenTime) > threeDaysInMs;
+  };
+
+  const sendQuickMessage = async (connection: Connection): Promise<void> => {
+    if (!user?.id) return;
+
+    try {
+      const senderName = user.name || 'Someone';
+      const recipientName = connection.connectedUserName || 'Friend';
+      const message = `Hi ${recipientName}, I haven't seen you online in a while. Are you okay? Please update your location when you see this.`;
+
+      // Create notification
+      const { data: notification, error: notificationError } = await supabase
+        .from('notifications')
+        .insert({
+          user_id: connection.connectedUserId,
+          title: `💬 Quick Message from ${senderName}`,
+          body: message,
+          type: 'general',
+          data: {
+            type: 'quick_message',
+            senderId: user.id,
+            senderName: senderName,
+            connectionId: connection.id,
+            requiresLocationUpdate: true, // Flag to trigger location update when read
+          },
+          read: false,
+        })
+        .select()
+        .single();
+
+      if (notificationError) {
+        console.error('Error creating notification:', notificationError);
+        Alert.alert('Error', 'Failed to send message. Please try again.');
+        return;
+      }
+
+      // Send push notification
+      try {
+        const { data: pushResult, error: pushError } = await supabase.functions.invoke(
+          'send-push-notification',
+          {
+            body: {
+              user_ids: [connection.connectedUserId],
+              title: `💬 Quick Message from ${senderName}`,
+              body: message,
+              data: {
+                type: 'quick_message',
+                notificationId: notification.id,
+                senderId: user.id,
+                senderName: senderName,
+                connectionId: connection.id,
+                requiresLocationUpdate: true,
+              },
+            },
+          }
+        );
+
+        if (pushError) {
+          console.error('Error sending push notification:', pushError);
+          // Still show success since notification was created
+        } else {
+          console.log('Push notification sent:', pushResult);
+        }
+      } catch (pushError) {
+        console.error('Exception sending push notification:', pushError);
+        // Still show success since notification was created
+      }
+
+      Alert.alert(
+        'Message Sent',
+        `Your message has been sent to ${recipientName}. They will receive a notification and their location will be updated when they read it.`,
+        [{ text: 'OK' }]
+      );
+    } catch (error) {
+      console.error('Error sending quick message:', error);
+      Alert.alert('Error', 'Failed to send message. Please try again.');
+    }
   };
 
   const toggleLocationSharing = async (connectionId: string, connectedUserId: string, connectedUserName: string, currentValue: boolean): Promise<void> => {
@@ -1835,15 +1936,15 @@ export default function ConnectionScreen({ navigation }: ConnectionScreenProps) 
                 }
                 
                 const displayName = connection.connectedUserName || 'Unknown User';
+                const lastSeenData = getLastSeenInfo(connection);
                 
                 return (
-                  <TouchableOpacity
+                  <View
                     key={connection.id} 
                     style={[
                       styles.connectionCard,
                       connection.isLocked && styles.connectionCardEmergency
                     ]}
-                    activeOpacity={0.95}
                   >
                     {/* Emergency Banner */}
                     {connection.isLocked && (
@@ -1855,16 +1956,16 @@ export default function ConnectionScreen({ navigation }: ConnectionScreenProps) 
 
                     {/* Main Card Content */}
                     <View style={styles.connectionCardContent}>
-                      {/* Avatar Section */}
+                      {/* Avatar Section - Simplified */}
                       <View style={styles.avatarSection}>
-                      <View style={[
-                        styles.connectionAvatar,
-                        connection.isLocked && styles.connectionAvatarEmergency
-                      ]}>
-                        <Text style={styles.connectionAvatarText}>
-                          {displayName.charAt(0).toUpperCase()}
-                        </Text>
-                      </View>
+                        <View style={[
+                          styles.connectionAvatar,
+                          connection.isLocked && styles.connectionAvatarEmergency
+                        ]}>
+                          <Text style={styles.connectionAvatarText}>
+                            {displayName.charAt(0).toUpperCase()}
+                          </Text>
+                        </View>
                         {connection.isLocked && (
                           <View style={styles.lockIconContainer}>
                             <Ionicons name="lock-closed" size={14} color="#DC2626" />
@@ -1872,16 +1973,15 @@ export default function ConnectionScreen({ navigation }: ConnectionScreenProps) 
                         )}
                       </View>
 
-                      {/* Info Section */}
+                      {/* Info Section - Full Width */}
                       <View style={styles.infoSection}>
-                        <View style={styles.nameRow}>
-                          <Text style={[
-                            styles.connectionName,
-                            connection.isLocked && styles.connectionNameEmergency
-                          ]} numberOfLines={1}>
-                            {displayName}
-                          </Text>
-                        </View>
+                        {/* Full Name - Prominent */}
+                        <Text style={[
+                          styles.connectionName,
+                          connection.isLocked && styles.connectionNameEmergency
+                        ]} numberOfLines={2}>
+                          {displayName}
+                        </Text>
 
                         {/* Status Messages */}
                         {connection.isLocked && (
@@ -1900,13 +2000,46 @@ export default function ConnectionScreen({ navigation }: ConnectionScreenProps) 
                             </Text>
                           </View>
                         )}
+                        
+                        {/* Last Seen Information - Below Name */}
+                        <View style={styles.lastSeenContainer}>
+                          <View style={styles.lastSeenRow}>
+                            <View style={[styles.lastSeenStatusIndicator, { backgroundColor: getStatusColor(lastSeenData.status) }]} />
+                            <Text style={[
+                              styles.lastSeenText,
+                              lastSeenData.isUrgent && styles.lastSeenTextUrgent
+                            ]}>
+                              {lastSeenData.primaryText}
+                            </Text>
+                          </View>
+                          {lastSeenData.secondaryText && (
+                            <Text style={styles.lastSeenSecondary} numberOfLines={1}>
+                              {lastSeenData.secondaryText}
+                            </Text>
+                          )}
+                          <TouchableOpacity
+                            onPress={() => {
+                              Alert.alert(
+                                'Last Seen Details',
+                                `${lastSeenData.fullDateTime}\n\n${lastSeenData.exactTime}\n${lastSeenData.relativeTime}`,
+                                [{ text: 'OK' }]
+                              );
+                            }}
+                            activeOpacity={0.7}
+                          >
+                            <Text style={styles.lastSeenDetailLink}>
+                              {lastSeenData.exactTime}
+                            </Text>
+                          </TouchableOpacity>
+                        </View>
                       </View>
+                    </View>
 
-                      {/* Action Buttons */}
-                      <View style={styles.actionButtonsContainer}>
-                        {connection.locationSharingEnabled && connection.location && (
+                    {/* Action Buttons - Full Width */}
+                    <View style={styles.actionButtonsContainer}>
+                      {connection.locationSharingEnabled && connection.location && (
                         <TouchableOpacity
-                            style={styles.mapButton}
+                          style={styles.mapButtonFullWidth}
                           onPress={() => {
                             if (connection.location) {
                               navigation.navigate('MapView', {
@@ -1917,43 +2050,70 @@ export default function ConnectionScreen({ navigation }: ConnectionScreenProps) 
                               });
                             }
                           }}
-                            activeOpacity={0.7}
+                          activeOpacity={0.7}
                         >
-                            <Ionicons name="map" size={16} color="#6366F1" />
-                            <Text style={styles.mapButtonText}>Map</Text>
+                          <Ionicons name="map" size={18} color="#FFFFFF" />
+                          <Text style={styles.mapButtonFullWidthText}>View on Map</Text>
                         </TouchableOpacity>
                       )}
+                      
+                      {/* Quick Message Button for 3+ days offline - Full Width */}
+                      {isOfflineMoreThan3Days(connection) && (
+                        <TouchableOpacity
+                          style={styles.quickMessageButtonFullWidth}
+                          onPress={() => {
+                            Alert.alert(
+                              'Send Quick Message?',
+                              `Send a message to ${connection.connectedUserName}? They haven't been seen in over 3 days. When they read the message, their location will be updated.`,
+                              [
+                                { text: 'Cancel', style: 'cancel' },
+                                {
+                                  text: 'Send Message',
+                                  onPress: () => sendQuickMessage(connection),
+                                  style: 'default',
+                                },
+                              ]
+                            );
+                          }}
+                          activeOpacity={0.7}
+                        >
+                          <Ionicons name="chatbubble-ellipses" size={18} color="#FFFFFF" />
+                          <Text style={styles.quickMessageButtonFullWidthText}>Send Quick Message</Text>
+                        </TouchableOpacity>
+                      )}
+                      
+                      {/* Menu Button - Full Width */}
                       <TouchableOpacity
-                          style={styles.menuButton}
+                        style={styles.menuButtonFullWidth}
                         onPress={() => {
                           Alert.alert(
-                              connection.connectedUserName,
-                              'Choose an action',
-                              [
-                                {
-                                  text: connection.isLocked ? 'Unlock Account' : 'Lock Account',
-                                  onPress: () => {
-                                    if (connection.isLocked) {
-                                      unlockUser(connection.connectedUserId, connection.connectedUserName);
-                                    }
-                                  },
-                                  style: connection.isLocked ? 'default' : 'cancel',
-                                },
+                            connection.connectedUserName,
+                            'Choose an action',
+                            [
                               {
-                                  text: 'Remove Connection',
-                                onPress: () => removeConnection(connection.id, connection.connectedUserName),
-                                  style: 'destructive',
+                                text: connection.isLocked ? 'Unlock Account' : 'Lock Account',
+                                onPress: () => {
+                                  if (connection.isLocked) {
+                                    unlockUser(connection.connectedUserId, connection.connectedUserName);
+                                  }
+                                },
+                                style: connection.isLocked ? 'default' : 'cancel',
                               },
-                                { text: 'Cancel', style: 'cancel' },
+                              {
+                                text: 'Remove Connection',
+                                onPress: () => removeConnection(connection.id, connection.connectedUserName),
+                                style: 'destructive',
+                              },
+                              { text: 'Cancel', style: 'cancel' },
                             ]
                           );
                         }}
-                          activeOpacity={0.7}
+                        activeOpacity={0.7}
                       >
-                          <Ionicons name="ellipsis-vertical" size={20} color="#94A3B8" />
+                        <Ionicons name="ellipsis-horizontal" size={18} color="#64748B" />
+                        <Text style={styles.menuButtonFullWidthText}>More Options</Text>
                       </TouchableOpacity>
                     </View>
-                  </View>
 
                     {/* Location Sharing Toggle */}
                     <View style={styles.toggleSection}>
@@ -1983,7 +2143,7 @@ export default function ConnectionScreen({ navigation }: ConnectionScreenProps) 
                         ios_backgroundColor="#E2E8F0"
                       />
                     </View>
-                  </TouchableOpacity>
+                  </View>
                 );
               })}
               </View>
@@ -2290,13 +2450,14 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    marginBottom: 16,
+    marginBottom: 20,
+    paddingHorizontal: 4,
   },
   sectionTitle: {
-    fontSize: 20,
+    fontSize: 22,
     fontWeight: '700',
     color: '#1C1C1E',
-    letterSpacing: -0.3,
+    letterSpacing: -0.4,
   },
   badge: {
     backgroundColor: '#E0E7FF',
@@ -2365,7 +2526,7 @@ const styles = StyleSheet.create({
     color: '#6B7280',
     textAlign: 'center',
   },
-  actionButtonsContainer: {
+  quickActionButtonsContainer: {
     flexDirection: 'row',
     gap: 12,
   },
@@ -2467,7 +2628,7 @@ const styles = StyleSheet.create({
   connectionsSection: {
     paddingHorizontal: 20,
     paddingTop: 24,
-    paddingBottom: 20,
+    paddingBottom: 24,
   },
   invitationsSection: {
     paddingHorizontal: 20,
@@ -2788,41 +2949,41 @@ const styles = StyleSheet.create({
   },
   connectionCard: {
     backgroundColor: '#FFFFFF',
-    borderRadius: 16,
+    borderRadius: 20,
     overflow: 'hidden',
-    marginBottom: 12,
+    marginBottom: 16,
     ...Platform.select({
       ios: {
         shadowColor: '#000',
-        shadowOffset: { width: 0, height: 1 },
-        shadowOpacity: 0.06,
-        shadowRadius: 8,
+        shadowOffset: { width: 0, height: 2 },
+        shadowOpacity: 0.08,
+        shadowRadius: 12,
       },
       android: {
-        elevation: 2,
+        elevation: 4,
       },
     }),
     borderWidth: 1,
-    borderColor: '#F1F5F9',
+    borderColor: '#E2E8F0',
   },
   connectionCardEmergency: {
-    borderWidth: 1.5,
+    borderWidth: 2,
     borderColor: '#FCA5A5',
     backgroundColor: '#FEF2F2',
   },
   connectionCardContent: {
     flexDirection: 'row',
-    alignItems: 'center',
-    padding: 16,
-    gap: 12,
+    alignItems: 'flex-start',
+    padding: 20,
+    gap: 16,
   },
   avatarSection: {
     position: 'relative',
   },
   connectionAvatar: {
-    width: 56,
-    height: 56,
-    borderRadius: 16,
+    width: 48,
+    height: 48,
+    borderRadius: 12,
     backgroundColor: '#E0E7FF',
     justifyContent: 'center',
     alignItems: 'center',
@@ -2835,7 +2996,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#D1FAE5',
   },
   connectionAvatarText: {
-    fontSize: 24,
+    fontSize: 20,
     fontWeight: '700',
     color: '#6366F1',
   },
@@ -2879,21 +3040,23 @@ const styles = StyleSheet.create({
   },
   infoSection: {
     flex: 1,
-    marginLeft: 4,
+    marginLeft: 0,
   },
   nameRow: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    marginBottom: 6,
+    marginBottom: 8,
     gap: 8,
   },
   connectionName: {
-    fontSize: 17,
+    fontSize: 20,
     fontWeight: '700',
     color: '#1C1C1E',
     flex: 1,
-    letterSpacing: -0.2,
+    letterSpacing: -0.3,
+    lineHeight: 26,
+    marginBottom: 8,
   },
   connectionNameEmergency: {
     color: '#DC2626',
@@ -2970,40 +3133,104 @@ const styles = StyleSheet.create({
     color: '#64748B',
     fontWeight: '500',
   },
-  actionButtonsContainer: {
+  lastSeenContainer: {
+    marginTop: 12,
+  },
+  lastSeenRow: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
+    marginBottom: 6,
   },
-  mapButton: {
+  lastSeenStatusIndicator: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+  },
+  lastSeenText: {
+    fontSize: 14,
+    fontWeight: '500',
+    color: '#64748B',
+    flex: 1,
+  },
+  lastSeenTextUrgent: {
+    color: '#DC2626',
+    fontWeight: '600',
+  },
+  lastSeenSecondary: {
+    fontSize: 12,
+    color: '#94A3B8',
+    marginTop: 2,
+    marginBottom: 4,
+  },
+  lastSeenDetailLink: {
+    fontSize: 11,
+    color: '#6366F1',
+    fontWeight: '500',
+    textDecorationLine: 'underline',
+  },
+  actionButtonsContainer: {
+    flexDirection: 'column',
+    gap: 10,
+    paddingHorizontal: 20,
+    paddingBottom: 16,
+  },
+  mapButtonFullWidth: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 8,
-    backgroundColor: '#EEF2FF',
-    gap: 6,
+    paddingVertical: 14,
+    paddingHorizontal: 20,
+    borderRadius: 12,
+    backgroundColor: '#6366F1',
+    gap: 8,
+    width: '100%',
   },
-  mapButtonText: {
-    fontSize: 14,
+  mapButtonFullWidthText: {
+    fontSize: 16,
     fontWeight: '600',
-    color: '#6366F1',
+    color: '#FFFFFF',
   },
-  menuButton: {
-    width: 36,
-    height: 36,
-    justifyContent: 'center',
+  quickMessageButtonFullWidth: {
+    flexDirection: 'row',
     alignItems: 'center',
-    borderRadius: 8,
+    justifyContent: 'center',
+    paddingVertical: 14,
+    paddingHorizontal: 20,
+    borderRadius: 12,
+    backgroundColor: '#DC2626',
+    gap: 8,
+    width: '100%',
+  },
+  quickMessageButtonFullWidthText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#FFFFFF',
+  },
+  menuButtonFullWidth: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 14,
+    paddingHorizontal: 20,
+    borderRadius: 12,
     backgroundColor: '#F8FAFC',
+    gap: 8,
+    width: '100%',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+  },
+  menuButtonFullWidthText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#64748B',
   },
   toggleSection: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 16,
-    paddingVertical: 14,
+    paddingHorizontal: 20,
+    paddingVertical: 16,
     borderTopWidth: 1,
     borderTopColor: '#F1F5F9',
     backgroundColor: '#FAFBFC',
@@ -3241,7 +3468,7 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '600',
   },
-  invitationsSection: {
+  invitationsSectionDuplicate: {
     paddingHorizontal: 16,
     paddingTop: 16,
     paddingBottom: 8,
@@ -3371,7 +3598,7 @@ const styles = StyleSheet.create({
     paddingVertical: 16,
     fontWeight: '500',
   },
-  modalOverlay: {
+  modalOverlayDuplicate2: {
     flex: 1,
     backgroundColor: 'rgba(0, 0, 0, 0.5)',
     justifyContent: 'center',
