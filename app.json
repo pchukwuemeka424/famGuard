@@ -49,7 +49,7 @@
         "android.permission.VIBRATE",
         "android.permission.RECEIVE_BOOT_COMPLETED"
       ],
-      "versionCode": 11
+      "versionCode": 13
     },
     "web": {},
     "plugins": [

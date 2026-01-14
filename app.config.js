@@ -94,7 +94,7 @@ module.exports = ({ config }) => {
         "android.permission.RECEIVE_BOOT_COMPLETED",
         "android.permission.POST_NOTIFICATIONS"
       ],
-      versionCode: 10
+      versionCode: 13
     },
     web: {},
     plugins: [
