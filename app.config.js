@@ -37,7 +37,7 @@ module.exports = ({ config }) => {
 
   return {
     ...config,
-    name: "FamGuard",
+    name: "FamGuards",
     slug: "famguard",
     version: "1.0.1",
     sdkVersion: "54.0.0",
@@ -59,9 +59,10 @@ module.exports = ({ config }) => {
         googleMapsApiKey: EXPO_PUBLIC_GOOGLE_MAPS_API_KEY
       },
       infoPlist: {
-        NSLocationWhenInUseUsageDescription: "FamGuard needs your location to share it with family members and show nearby safety incidents.",
-        NSLocationAlwaysAndWhenInUseUsageDescription: "FamGuard needs your location to share it with family members even when the app is in the background.",
-        NSLocationAlwaysUsageDescription: "FamGuard needs your location to share it with family members and keep them updated about your safety."
+        NSLocationWhenInUseUsageDescription: "FamGuards needs your location to share it with family members and show nearby safety incidents.",
+        NSLocationAlwaysAndWhenInUseUsageDescription: "FamGuards needs your location to share it with family members even when the app is in the background.",
+        NSLocationAlwaysUsageDescription: "FamGuards needs your location to share it with family members and keep them updated about your safety.",
+        ITSAppUsesNonExemptEncryption: false
       }
     },
     android: {
@@ -101,8 +102,8 @@ module.exports = ({ config }) => {
       [
         "expo-location",
         {
-          locationAlwaysAndWhenInUseUsageDescription: "FamGuard needs your location to share it with family members and show nearby safety incidents.",
-          locationWhenInUsePermission: "FamGuard needs your location to share it with family members and show nearby safety incidents."
+          locationAlwaysAndWhenInUseUsageDescription: "FamGuards needs your location to share it with family members and show nearby safety incidents.",
+          locationWhenInUsePermission: "FamGuards needs your location to share it with family members and show nearby safety incidents."
         }
       ],
       [

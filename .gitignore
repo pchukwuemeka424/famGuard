@@ -78,3 +78,4 @@ logs/
 # Note: google-services.json is safe to commit - it's a public config file
 *-firebase-adminsdk-*.json
 firebase-service-account.json
+.credentials/
