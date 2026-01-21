@@ -2,7 +2,7 @@
   "expo": {
     "name": "FamGuards",
     "slug": "famguard",
-    "version": "1.0.1",
+    "version": "1.0.5",
     "sdkVersion": "54.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
@@ -50,7 +50,7 @@
         "android.permission.VIBRATE",
         "android.permission.RECEIVE_BOOT_COMPLETED"
       ],
-      "versionCode": 13
+      "versionCode": 14
     },
     "web": {},
     "plugins": [

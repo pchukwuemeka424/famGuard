@@ -34,6 +34,8 @@ class PushNotificationService {
         // Save token to database
         await this.savePushToken(token);
         console.log('✅ Push notification token registered:', token.substring(0, 30) + '...');
+        // Note: Morning greetings are sent via server-side Edge Function scheduled at 8am
+        // No need to schedule local notifications
       } else {
         const errorMsg = 'Push notification token registration returned null';
         console.error('❌ Push notification token is null - registration failed');

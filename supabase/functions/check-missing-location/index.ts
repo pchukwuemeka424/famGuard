@@ -1,4 +1,8 @@
 // Supabase Edge Function: Check Missing Location History
+// 
+// This function checks for users who haven't shared their location recently
+// and sends a friendly reminder notification to encourage them to stay active.
+//
 // Deploy with: supabase functions deploy check-missing-location
 // Schedule with: Supabase Dashboard > Database > Cron Jobs
 // Or use external cron service to call this function every 12 hours
@@ -38,15 +42,17 @@ serve(async (req) => {
     console.log('This will send ONE TIME push notification to users who need location updates...')
 
     // First, verify background location inserts are working
+    // Note: This is optional verification - the main check uses find_users_without_location_history()
     const { data: backgroundStatus, error: statusError } = await supabaseClient
       .rpc('verify_background_location_inserts')
-      .limit(10) // Check first 10 users as sample
 
     if (!statusError && backgroundStatus) {
-      console.log('Background location status sample:', backgroundStatus)
-      const inactiveUsers = backgroundStatus.filter((s: any) => s.status !== 'Background location active')
+      // Limit to first 10 for logging purposes only
+      const statusSample = Array.isArray(backgroundStatus) ? backgroundStatus.slice(0, 10) : []
+      console.log('Background location status sample:', statusSample)
+      const inactiveUsers = statusSample.filter((s: any) => s.status !== 'Background location active')
       if (inactiveUsers.length > 0) {
-        console.log(`Found ${inactiveUsers.length} users with inactive background location`)
+        console.log(`Found ${inactiveUsers.length} users with inactive background location in sample`)
       }
     }
 
@@ -62,7 +68,7 @@ serve(async (req) => {
       console.error('Error finding users without location history:', findError)
       return new Response(
         JSON.stringify({ 
-          error: 'Failed to find users without location history',
+          error: 'Unable to check for users who need location reminders',
           details: findError.message 
         }),
         { 
@@ -79,7 +85,7 @@ serve(async (req) => {
           success: true,
           notifications_inserted: 0,
           push_notifications_sent: 0,
-          message: 'All users have location_history and location inserted in last 28 hours, or already received one-time push notification - no notifications sent'
+          message: 'All users are active with recent location updates, or have already received a reminder notification recently. No notifications needed at this time.'
         }),
         { 
           status: 200, 
@@ -105,7 +111,7 @@ serve(async (req) => {
           success: true,
           notifications_inserted: 0,
           push_notifications_sent: 0,
-          message: 'No users found without location history'
+          message: 'No users found who need location reminders at this time'
         }),
         { 
           status: 200, 
@@ -118,8 +124,8 @@ serve(async (req) => {
     // - Do NOT have location_history at all
     // - OR do NOT have location history inserted in the last 28 hours
     // The database function already ensures one-time (checks if notification sent in last 28 hours)
-    const notificationTitle = "Are you safe?"
-    const notificationBody = "Reminder: Your location sharing is not active. Please update your location so your trusted family can be aware of your safety. We care about you! 💙"
+    const notificationTitle = "We Miss You!"
+    const notificationBody = "You haven't visited famGuard for a while. We miss you and want to make sure you're safe. Please stay active and keep your location updated so your loved ones can stay connected with you."
     
     // First, insert notifications into the notifications table
     // This ensures one-time notification (database function already checks for existing notifications)
@@ -138,15 +144,23 @@ serve(async (req) => {
     }))
 
     // Insert notifications into database
-    const { error: notificationError } = await supabaseClient
+    // This ensures notifications are stored in the database for users to see in-app
+    const { data: insertedNotifications, error: notificationError } = await supabaseClient
       .from('notifications')
       .insert(notificationsToInsert)
+      .select()
 
     if (notificationError) {
-      console.error('Error inserting notifications:', notificationError)
-      // Continue with push notifications even if database insert fails
+      console.error('Error inserting notifications into database:', notificationError)
+      console.error('Notification error details:', JSON.stringify(notificationError, null, 2))
+      // Log but continue with push notifications - users will still get push notification
+      // even if database insert fails (though they won't see it in-app)
     } else {
-      console.log(`Inserted ${notificationsToInsert.length} notifications into database`)
+      const insertedCount = insertedNotifications?.length || 0
+      console.log(`Successfully inserted ${insertedCount} notifications into the notifications table`)
+      if (insertedCount !== notificationsToInsert.length) {
+        console.warn(`Expected to insert ${notificationsToInsert.length} notifications, but only ${insertedCount} were inserted`)
+      }
     }
     
     // Send ONE TIME push notification
@@ -175,7 +189,7 @@ serve(async (req) => {
       console.error('Error calling send-push-notification:', errorText)
       return new Response(
         JSON.stringify({ 
-          error: 'Failed to send push notifications',
+          error: 'Unable to send reminder notifications at this time',
           details: errorText 
         }),
         { 
@@ -189,14 +203,18 @@ serve(async (req) => {
     console.log('Push notification result:', pushResult)
     console.log(`Sent ONE TIME push notification to ${pushResult.sent || 0} users`)
 
+    const insertedCount = insertedNotifications?.length || 0
+    const notificationInsertSuccess = !notificationError && insertedCount > 0
+
     return new Response(
       JSON.stringify({ 
         success: true,
         users_checked: userIds.length,
-        notifications_inserted: notificationsToInsert.length,
+        notifications_inserted: insertedCount,
+        notifications_inserted_successfully: notificationInsertSuccess,
         push_notifications_sent: pushResult.sent || 0,
         push_notifications_failed: pushResult.failed || 0,
-        message: `Checked ${userIds.length} users, sent ${pushResult.sent || 0} ONE TIME push notifications to users without location_history or location in last 28 hours`
+        message: `Successfully checked ${userIds.length} users, inserted ${insertedCount} notifications into database, and sent ${pushResult.sent || 0} friendly reminder notifications to encourage activity and safety`
       }),
       { 
         status: 200, 
@@ -207,7 +225,7 @@ serve(async (req) => {
     console.error('Unexpected error:', error)
     return new Response(
       JSON.stringify({ 
-        error: 'Unexpected error during check',
+        error: 'An unexpected error occurred while checking for users who need reminders',
         details: error instanceof Error ? error.message : String(error)
       }),
       { 

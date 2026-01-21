@@ -250,20 +250,21 @@ class CheckInService {
     if (!this.userId) return null;
 
     try {
-      // Optimize location fetching: Use fast mode for quick check-ins
-      // Fast mode uses shorter timeout (2s) and allows cached location
-      // For emergency, we wait a bit longer (5s) but still use fast mode
+      // For emergency check-ins, use HIGH-ACCURACY GPS to ensure precise location
+      // For regular check-ins, use fast mode for quick response
       const locationPromise = isEmergency 
-        ? locationService.getCurrentLocationFast(false, true) // Fast mode for emergency too
+        ? locationService.getHighAccuracyLocation(true) // High-accuracy GPS for emergency - most precise location
         : locationService.getCurrentLocationFast(false, true); // Fast mode for regular check-ins
       
-      // Additional timeout as fallback (shouldn't be needed with fast mode, but safety net)
-      const locationTimeout = new Promise<null>((resolve) => 
+      // Additional timeout as fallback for emergency (high-accuracy can take longer)
+      // For emergency, allow up to 20 seconds for high-accuracy GPS lock
+      const locationTimeout = new Promise<LocationType | null>((resolve) => 
         setTimeout(() => {
-          // Return cached location if timeout, or null
+          // For emergency, try to get cached location as fallback
+          // For regular check-ins, return cached location immediately
           const cached = locationService.getLastKnownLocation();
           resolve(cached);
-        }, isEmergency ? 3000 : 2000)
+        }, isEmergency ? 20000 : 2000) // 20 seconds for emergency high-accuracy, 2 seconds for regular
       );
       
       const location = await Promise.race([locationPromise, locationTimeout]);

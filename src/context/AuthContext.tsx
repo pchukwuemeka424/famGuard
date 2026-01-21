@@ -15,6 +15,7 @@ interface AuthContextType {
   login: (email: string, password: string) => Promise<void>;
   quickLogin: (email: string) => Promise<void>;
   signup: (name: string, email: string, phone: string, password: string) => Promise<void>;
+  resetPassword: (email: string) => Promise<void>;
   logout: () => Promise<void>;
   deleteAccount: () => Promise<void>;
   completeOnboarding: () => Promise<void>;
@@ -271,19 +272,62 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         setHasCompletedOnboarding(true);
       }
 
+      // Guard: Check if Supabase is configured before making any calls
+      if (!hasValidSupabaseConfig) {
+        logger.warn('Supabase not configured, skipping auth state load');
+        // Try to restore from stored data
+        const isAuth = await AsyncStorage.getItem('isAuthenticated');
+        const userId = await AsyncStorage.getItem('userId');
+        const userDataString = await AsyncStorage.getItem('user');
+        
+        if (isAuth === 'true' && userId && userDataString) {
+          try {
+            const userData = JSON.parse(userDataString) as User;
+            setUser(userData);
+            setIsAuthenticated(true);
+            logger.log('Restored session from stored data (Supabase not configured)');
+          } catch (parseError) {
+            logger.error('Error parsing stored user data:', parseError);
+            await clearAuthState();
+          }
+        } else {
+          await clearAuthState();
+        }
+        setLoading(false);
+        return;
+      }
+
       // First, check Supabase Auth session
-      const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+      let session, sessionError;
+      try {
+        const result = await supabase.auth.getSession();
+        session = result.data?.session;
+        sessionError = result.error;
+      } catch (error) {
+        logger.error('Error getting Supabase session:', error);
+        sessionError = error as any;
+        session = null;
+      }
       
       if (session && session.user) {
         // We have an active Supabase session
         const userId = session.user.id;
         
-        // Load user from database
-        const { data: dbUser, error: dbError } = await supabase
-          .from('users')
-          .select('*')
-          .eq('id', userId)
-          .single();
+        // Load user from database with error handling
+        let dbUser, dbError;
+        try {
+          const result = await supabase
+            .from('users')
+            .select('*')
+            .eq('id', userId)
+            .single();
+          dbUser = result.data;
+          dbError = result.error;
+        } catch (error) {
+          logger.error('Error loading user from database:', error);
+          dbError = error as any;
+          dbUser = null;
+        }
 
         if (dbError || !dbUser) {
           // User doesn't exist in database - might need to create profile
@@ -871,6 +915,55 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     }
   };
 
+  const resetPassword = async (email: string): Promise<void> => {
+    // Check if Supabase is configured
+    if (!hasValidSupabaseConfig) {
+      if (__DEV__) {
+        throw new Error('App is not configured. Please create a .env file with EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY, then restart the dev server.');
+      }
+      throw new Error('Unable to connect. Please check your internet connection and try again.');
+    }
+
+    if (!email || !email.trim()) {
+      throw new Error('Please enter your email address');
+    }
+
+    // Basic email validation
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email.trim())) {
+      throw new Error('Please enter a valid email address');
+    }
+
+    try {
+      const { error } = await supabase.auth.resetPasswordForEmail(email.trim(), {
+        redirectTo: undefined, // For mobile apps, we don't need a redirect URL
+      });
+
+      if (error) {
+        logger.error('Password reset error:', error?.message || String(error));
+        if (error.message?.includes('network') || error.message?.includes('fetch') || error.message?.includes('Network request failed')) {
+          throw new Error('Network error. Please check your internet connection and try again.');
+        }
+        // Don't reveal if email exists or not for security reasons
+        // Always show success message even if email doesn't exist
+        // This prevents email enumeration attacks
+      }
+
+      // Always return success to prevent email enumeration
+      // The user will receive an email if the account exists
+    } catch (error: any) {
+      // Don't log if it's a user-friendly error we already threw
+      if (!error.message || (!error.message.includes('Network error') && !error.message.includes('Please enter'))) {
+        logger.error('Reset password error:', error?.message || String(error));
+      }
+      // Provide user-friendly error messages
+      if (error.message) {
+        throw error;
+      }
+      throw new Error('Failed to send password reset email. Please try again.');
+    }
+  };
+
   const logout = async (): Promise<void> => {
     try {
       // Store email and name before clearing auth state for quick login
@@ -882,6 +975,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
       const { locationService } = await import('../services/locationService');
       await locationService.stopLocationSharing();
       locationService.stopEmergencyLocationTracking();
+      locationService.stopEmergencyHighAccuracyTracking();
       locationService.stopSOSLocationTracking();
       
       // Disable location sharing in database and clear location data
@@ -1151,6 +1245,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         login,
         quickLogin,
         signup,
+        resetPassword,
         logout,
         deleteAccount,
         completeOnboarding,

@@ -24,6 +24,9 @@ class LocationService {
   // Emergency location tracking
   private emergencyTrackingInterval: NodeJS.Timeout | null = null;
   private isEmergencyTracking: boolean = false;
+  // Emergency high-accuracy GPS tracking (every 15 minutes, stops when unlocked)
+  private emergencyHighAccuracyTrackingInterval: NodeJS.Timeout | null = null;
+  private isEmergencyHighAccuracyTracking: boolean = false;
   // SOS location tracking (every 3 seconds, circular buffer of 5 rows)
   private sosLocationTrackingInterval: NodeJS.Timeout | null = null;
   private isSosLocationTracking: boolean = false;
@@ -32,7 +35,7 @@ class LocationService {
   private sosLocationUpdateIndex: number = 0; // Current index for circular updates (0-4)
   private config: LocationServiceConfig = {
     accuracy: Location.Accuracy.Highest, // Use highest accuracy for exact location
-    updateInterval: 600000, // 10 minutes (600000 ms) for location updates
+    updateInterval: 1800000, // 30 minutes (1800000 ms) for location updates - works in foreground and background
     distanceThreshold: 50, // 50 meters - only update if moved significantly
   };
   private readonly STATIONARY_UPDATE_INTERVAL = 1800000; // 30 minutes - update even if stationary after this time
@@ -54,6 +57,11 @@ class LocationService {
   // Location history frequency tracking
   private locationUpdateFrequencyMinutes: number = 60; // Default 60 minutes
   private lastLocationHistoryInsert: number = 0; // Timestamp of last location history insert
+  
+  // iOS concurrency guard: Prevent multiple simultaneous location requests
+  // On iOS, concurrent location requests can crash the app
+  private isGettingLocation: boolean = false;
+  private pendingLocationRequest: Promise<LocationType | null> | null = null;
 
   /**
    * Request location permissions
@@ -209,6 +217,25 @@ class LocationService {
       try {
         const location = await Location.getCurrentPositionAsync(locationOptions);
 
+        // Validate coordinates before returning (backend filtering for iOS and Android)
+        if (!this.isValidCoordinate(location.coords.latitude, location.coords.longitude)) {
+          console.warn('Invalid GPS coordinates received in getCurrentLocationFast, retrying...', {
+            lat: location.coords.latitude,
+            lng: location.coords.longitude,
+            accuracy: location.coords.accuracy,
+            platform: Platform.OS,
+          });
+          // Retry once with longer timeout if coordinates are invalid
+          const retryOptions = Platform.OS === 'ios'
+            ? { accuracy: fastMode ? Location.Accuracy.Balanced : this.config.accuracy, maximumAge: 0, timeout: 15000, distanceInterval: 0 }
+            : { accuracy: fastMode ? Location.Accuracy.Balanced : this.config.accuracy, maximumAge: 0, timeout: 15000, distanceInterval: 0 };
+          const retryLocation = await Location.getCurrentPositionAsync(retryOptions);
+          if (!this.isValidCoordinate(retryLocation.coords.latitude, retryLocation.coords.longitude)) {
+            throw new Error('Invalid GPS coordinates after retry');
+          }
+          location = retryLocation;
+        }
+
         // Skip geocoding in fast mode to save time
         if (fastMode && this.lastLocation?.address) {
           return {
@@ -281,6 +308,43 @@ class LocationService {
    * @param requestPermissionIfNeeded - If true, will request permission if not granted. Default: false
    */
   async getCurrentLocation(requestPermissionIfNeeded: boolean = false): Promise<LocationType | null> {
+    // iOS concurrency guard: If a location request is already in progress, wait for it
+    // This prevents crashes from multiple simultaneous location requests on iOS
+    if (Platform.OS === 'ios' && this.isGettingLocation && this.pendingLocationRequest) {
+      console.log('iOS: Location request already in progress, waiting for result...');
+      try {
+        return await this.pendingLocationRequest;
+      } catch (error) {
+        console.warn('iOS: Error waiting for pending location request:', error);
+        return this.lastLocation;
+      }
+    }
+
+    // Set concurrency guard
+    if (Platform.OS === 'ios') {
+      this.isGettingLocation = true;
+    }
+
+    // Create the actual location request
+    const locationRequest = this.doGetCurrentLocation(requestPermissionIfNeeded);
+    
+    if (Platform.OS === 'ios') {
+      this.pendingLocationRequest = locationRequest;
+    }
+
+    try {
+      const result = await locationRequest;
+      return result;
+    } finally {
+      if (Platform.OS === 'ios') {
+        this.isGettingLocation = false;
+        this.pendingLocationRequest = null;
+      }
+    }
+  }
+
+  // Internal method that actually gets the current location
+  private async doGetCurrentLocation(requestPermissionIfNeeded: boolean): Promise<LocationType | null> {
     try {
       const hasPermission = await this.checkPermissions();
       if (!hasPermission) {
@@ -329,22 +393,43 @@ class LocationService {
         // If no history, still try GPS (GPS works offline)
       }
 
-      // iOS-specific options to force fresh GPS reading
+      // High-accuracy GPS settings for both iOS and Android
+      // Force fresh location, longer timeout for better GPS satellite lock
       const locationOptions = Platform.OS === 'ios'
         ? {
             accuracy: this.config.accuracy,
             maximumAge: 0, // Force fresh location on iOS
-            timeout: 15000,
+            timeout: 20000, // Increased to 20 seconds for better GPS lock
             distanceInterval: 0,
           }
         : {
             accuracy: this.config.accuracy,
-            maximumAge: 5000,
-            timeout: 10000,
+            maximumAge: 0, // Force fresh location on Android too (was 5000ms, now 0 for better accuracy)
+            timeout: 20000, // Increased to 20 seconds for better GPS satellite lock
+            distanceInterval: 0,
           };
       
       try {
         const location = await Location.getCurrentPositionAsync(locationOptions);
+
+        // Validate coordinates before returning (backend filtering for iOS and Android)
+        if (!this.isValidCoordinate(location.coords.latitude, location.coords.longitude)) {
+          console.warn('Invalid GPS coordinates received in getCurrentLocation, retrying...', {
+            lat: location.coords.latitude,
+            lng: location.coords.longitude,
+            accuracy: location.coords.accuracy,
+            platform: Platform.OS,
+          });
+          // Retry once with longer timeout if coordinates are invalid
+          const retryOptions = Platform.OS === 'ios'
+            ? { accuracy: this.config.accuracy, maximumAge: 0, timeout: 20000, distanceInterval: 0 }
+            : { accuracy: this.config.accuracy, maximumAge: 0, timeout: 20000, distanceInterval: 0 };
+          const retryLocation = await Location.getCurrentPositionAsync(retryOptions);
+          if (!this.isValidCoordinate(retryLocation.coords.latitude, retryLocation.coords.longitude)) {
+            throw new Error('Invalid GPS coordinates after retry');
+          }
+          location = retryLocation;
+        }
 
         // Reverse geocode to get address (only if not in cache and online)
         let address: string | null = null;
@@ -406,6 +491,43 @@ class LocationService {
    * @param requestPermissionIfNeeded - If true, will request permission if not granted. Default: false
    */
   async getHighAccuracyLocation(requestPermissionIfNeeded: boolean = false): Promise<LocationType | null> {
+    // iOS concurrency guard: If a location request is already in progress, wait for it
+    // This prevents crashes from multiple simultaneous location requests on iOS
+    if (Platform.OS === 'ios' && this.isGettingLocation && this.pendingLocationRequest) {
+      console.log('iOS: Location request already in progress, waiting for result...');
+      try {
+        return await this.pendingLocationRequest;
+      } catch (error) {
+        console.warn('iOS: Error waiting for pending location request:', error);
+        return this.lastLocation;
+      }
+    }
+
+    // Set concurrency guard
+    if (Platform.OS === 'ios') {
+      this.isGettingLocation = true;
+    }
+
+    // Create the actual location request
+    const locationRequest = this.doGetHighAccuracyLocation(requestPermissionIfNeeded);
+    
+    if (Platform.OS === 'ios') {
+      this.pendingLocationRequest = locationRequest;
+    }
+
+    try {
+      const result = await locationRequest;
+      return result;
+    } finally {
+      if (Platform.OS === 'ios') {
+        this.isGettingLocation = false;
+        this.pendingLocationRequest = null;
+      }
+    }
+  }
+
+  // Internal method that actually gets the location
+  private async doGetHighAccuracyLocation(requestPermissionIfNeeded: boolean): Promise<LocationType | null> {
     try {
       const hasPermission = await this.checkPermissions();
       if (!hasPermission) {
@@ -456,22 +578,25 @@ class LocationService {
 
       // Use best accuracy for exact location
       // On iOS, BestForNavigation provides the most accurate GPS positioning
+      // On Android, Highest accuracy with longer timeout for better GPS lock (especially important in Nigeria)
       const accuracy = Platform.OS === 'ios' 
         ? Location.Accuracy.BestForNavigation 
         : Location.Accuracy.Highest;
       
-      // iOS-specific options to force fresh GPS reading and prevent cached data
+      // High-accuracy GPS settings optimized for Nigeria and regions with GPS challenges
+      // Force fresh location, longer timeout for better GPS satellite lock
       const locationOptions = Platform.OS === 'ios'
         ? {
             accuracy,
             maximumAge: 0, // Force fresh location, don't use cached data
-            timeout: 15000, // Wait up to 15 seconds for accurate GPS reading
+            timeout: 20000, // Increased to 20 seconds for better GPS lock
             distanceInterval: 0, // No distance threshold - get exact location
           }
         : {
             accuracy,
-            maximumAge: 5000, // Allow 5 second old data on Android
-            timeout: 10000,
+            maximumAge: 0, // Force fresh location on Android too (was 5000ms, now 0 for better accuracy)
+            timeout: 20000, // Increased to 20 seconds for better GPS satellite lock (especially in Nigeria)
+            distanceInterval: 0, // No distance threshold - get exact location
           };
       
       try {
@@ -495,14 +620,32 @@ class LocationService {
           }
         }
 
+        // Validate coordinates before returning
+        if (!this.isValidCoordinate(location.coords.latitude, location.coords.longitude)) {
+          console.warn('Invalid GPS coordinates received, retrying...', {
+            lat: location.coords.latitude,
+            lng: location.coords.longitude,
+            accuracy: location.coords.accuracy,
+          });
+          // Retry once with longer timeout if coordinates are invalid
+          const retryOptions = Platform.OS === 'ios'
+            ? { accuracy, maximumAge: 0, timeout: 30000, distanceInterval: 0 }
+            : { accuracy, maximumAge: 0, timeout: 30000, distanceInterval: 0 };
+          const retryLocation = await Location.getCurrentPositionAsync(retryOptions);
+          if (!this.isValidCoordinate(retryLocation.coords.latitude, retryLocation.coords.longitude)) {
+            throw new Error('Invalid GPS coordinates after retry');
+          }
+          location = retryLocation;
+        }
+
         const result = {
           latitude: location.coords.latitude,
           longitude: location.coords.longitude,
           address: address || undefined,
         };
 
-        // Log location accuracy for debugging on iOS
-        if (__DEV__ && Platform.OS === 'ios') {
+        // Log location accuracy for debugging (both iOS and Android)
+        if (__DEV__) {
           console.log('High accuracy location fetched:', {
             lat: result.latitude.toFixed(6),
             lng: result.longitude.toFixed(6),
@@ -510,6 +653,7 @@ class LocationService {
             altitude: location.coords.altitude,
             heading: location.coords.heading,
             speed: location.coords.speed,
+            platform: Platform.OS,
             online,
           });
         }
@@ -685,9 +829,33 @@ class LocationService {
     familyGroupId: string,
     shareLocation: boolean = true
   ): Promise<void> {
+    // Check if already tracking - if so, just update the sharing status
     if (this.isTracking) {
-      console.log('Location tracking already started');
+      console.log('Location tracking already started, updating sharing status only');
+      // Update sharing status in AsyncStorage
+      await AsyncStorage.setItem('location_tracking_shareLocation', shareLocation.toString());
+      // Update database if needed
+      if (this.userId && this.familyGroupId) {
+        try {
+          await this.updateSharingStatus(shareLocation);
+        } catch (error) {
+          console.warn('Error updating location sharing status:', error);
+        }
+      }
       return;
+    }
+
+    // On iOS, check if there's already a watch subscription active
+    // This can happen if the app was closed while location was tracking
+    if (Platform.OS === 'ios' && this.watchSubscription) {
+      console.log('iOS: Found existing watch subscription, cleaning up first');
+      try {
+        this.watchSubscription.remove();
+        this.watchSubscription = null;
+      } catch (error) {
+        console.warn('Error removing existing watch subscription:', error);
+        // Continue anyway
+      }
     }
 
     const permissionResult = await this.requestPermissions();
@@ -734,6 +902,17 @@ class LocationService {
     // Get initial location with highest accuracy (permission already requested above)
     const initialLocation = await this.getHighAccuracyLocation(true);
     if (initialLocation) {
+      // Get accuracy from the location object if available
+      // 0 is a valid accuracy value, only use null if undefined
+      const initialLocationWithAccuracy = await Location.getCurrentPositionAsync({
+        accuracy: Platform.OS === 'ios' ? Location.Accuracy.BestForNavigation : Location.Accuracy.Highest,
+        maximumAge: 0,
+        timeout: 20000,
+      });
+      const initialAccuracy = initialLocationWithAccuracy?.coords?.accuracy !== undefined && initialLocationWithAccuracy?.coords?.accuracy !== null
+        ? initialLocationWithAccuracy.coords.accuracy
+        : null;
+      
       await this.updateLocationInDatabase(initialLocation, shareLocation);
       // Track the initial database update
       this.lastDatabaseUpdate = {
@@ -743,33 +922,62 @@ class LocationService {
       // Always save initial location to history (bypass frequency check for first location)
       // Reset last insert time to ensure initial location is saved
       this.lastLocationHistoryInsert = 0;
-      await this.saveLocationHistory(initialLocation);
+      await this.saveLocationHistory(initialLocation, initialAccuracy);
     }
 
     // Start watching location changes with highest accuracy
-    // Use iOS-specific settings for better accuracy
+    // Use shorter timeInterval for foreground updates (30 seconds) to ensure responsive updates
+    // The distanceInterval and database update logic will still control when we actually save to DB
+    const FOREGROUND_UPDATE_INTERVAL = 30000; // 30 seconds for foreground updates
     const watchOptions = Platform.OS === 'ios'
       ? {
           accuracy: Location.Accuracy.BestForNavigation, // Best accuracy for iOS
-          timeInterval: this.config.updateInterval,
+          timeInterval: FOREGROUND_UPDATE_INTERVAL, // 30 seconds for responsive foreground updates
           distanceInterval: this.config.distanceThreshold,
         }
       : {
           accuracy: Location.Accuracy.Highest,
-          timeInterval: this.config.updateInterval,
+          timeInterval: FOREGROUND_UPDATE_INTERVAL, // 30 seconds for responsive foreground updates
           distanceInterval: this.config.distanceThreshold,
         };
 
-    this.watchSubscription = await Location.watchPositionAsync(
-      watchOptions,
-      async (location) => {
+    console.log('Starting foreground location watch with interval:', FOREGROUND_UPDATE_INTERVAL, 'ms');
+    try {
+      // On iOS, ensure we don't have a duplicate subscription
+      // This is critical to prevent crashes when app reopens
+      if (Platform.OS === 'ios' && this.watchSubscription) {
+        console.warn('iOS: Removing existing watch subscription before starting new one');
+        try {
+          this.watchSubscription.remove();
+        } catch (error) {
+          console.warn('Error removing existing subscription:', error);
+        }
+        this.watchSubscription = null;
+      }
+
+      this.watchSubscription = await Location.watchPositionAsync(
+        watchOptions,
+        async (location) => {
+          // Validate coordinates before processing (backend filtering for iOS and Android)
+          if (!this.isValidCoordinate(location.coords.latitude, location.coords.longitude)) {
+            if (__DEV__) {
+              console.warn('Invalid GPS coordinates in watchPositionAsync, skipping update:', {
+                lat: location.coords.latitude,
+                lng: location.coords.longitude,
+                accuracy: location.coords.accuracy,
+                platform: Platform.OS,
+              });
+            }
+            return; // Skip invalid coordinates
+          }
+
         const newLocation: LocationType = {
           latitude: location.coords.latitude,
           longitude: location.coords.longitude,
         };
 
-        // Log location accuracy for debugging on iOS
-        if (__DEV__ && Platform.OS === 'ios') {
+        // Log location accuracy for debugging (both iOS and Android)
+        if (__DEV__) {
           console.log('Location watch update:', {
             lat: newLocation.latitude.toFixed(6),
             lng: newLocation.longitude.toFixed(6),
@@ -777,6 +985,7 @@ class LocationService {
             altitude: location.coords.altitude,
             heading: location.coords.heading,
             speed: location.coords.speed,
+            platform: Platform.OS,
           });
         }
 
@@ -786,6 +995,11 @@ class LocationService {
         // Always update lastLocation for tracking
         this.lastLocation = newLocation;
         
+        // Get accuracy from location object - 0 is a valid value, only use null if undefined
+        const locationAccuracy = location.coords?.accuracy !== undefined && location.coords?.accuracy !== null
+          ? location.coords.accuracy
+          : null;
+        
         if (!shouldUpdate) {
           // User hasn't moved significantly and recent update exists, skip database update
           // BUT still save to location history to ensure complete tracking
@@ -793,7 +1007,7 @@ class LocationService {
           if (this.lastLocation?.address && !newLocation.address) {
             newLocation.address = this.lastLocation.address;
           }
-          await this.saveLocationHistory(newLocation);
+          await this.saveLocationHistory(newLocation, locationAccuracy);
           return;
         }
 
@@ -805,7 +1019,7 @@ class LocationService {
           newLocation.longitude,
           false // Don't force, let rate limiting handle it
         );
-        // Use new address if available, otherwise keep previous address
+        // Use new address if available, otherwise keep previous address (don't update to empty)
         newLocation.address = address || this.lastLocation?.address || undefined;
 
         // Update location in database only if user moved significantly or it's been a long time
@@ -818,16 +1032,38 @@ class LocationService {
           timestamp: Date.now(),
         };
         
-        // ALWAYS save to location history (independent of database update success)
+        // ALWAYS insert new row to location history (independent of database update success)
         // This ensures we have complete location tracking regardless of family_members update status
-        await this.saveLocationHistory(newLocation);
+        await this.saveLocationHistory(newLocation, locationAccuracy);
       }
-    );
+      );
+      console.log('Foreground location watch subscription started successfully');
+    } catch (watchError) {
+      console.error('Failed to start foreground location watch:', watchError);
+      // Continue with periodic updates even if watch fails
+      this.watchSubscription = null;
+    }
 
-    // Also set up periodic updates every 10 minutes as backup with high accuracy
+    // Set up periodic updates every 30 minutes with high accuracy (works in foreground and background)
+    // This ensures location is saved even if watchPositionAsync doesn't trigger
     this.updateInterval = setInterval(async () => {
-      const location = await this.getHighAccuracyLocation(true); // Permission already granted
-      if (location) {
+      // Get location with accuracy
+      const locationWithAccuracy = await Location.getCurrentPositionAsync({
+        accuracy: Platform.OS === 'ios' ? Location.Accuracy.BestForNavigation : Location.Accuracy.Highest,
+        maximumAge: 0,
+        timeout: 20000,
+      });
+      
+      if (locationWithAccuracy) {
+        const location: LocationType = {
+          latitude: locationWithAccuracy.coords.latitude,
+          longitude: locationWithAccuracy.coords.longitude,
+        };
+        // 0 is a valid accuracy value, only use null if undefined
+        const locationAccuracy = locationWithAccuracy.coords?.accuracy !== undefined && locationWithAccuracy.coords?.accuracy !== null
+          ? locationWithAccuracy.coords.accuracy
+          : null;
+        
         // Check if we should update the database
         const shouldUpdate = this.shouldUpdateDatabase(location);
         
@@ -837,13 +1073,13 @@ class LocationService {
         if (!shouldUpdate) {
           // User hasn't moved significantly and recent update exists, skip database update
           // BUT still save to location history to ensure complete tracking
-          await this.saveLocationHistory(location);
+          await this.saveLocationHistory(location, locationAccuracy);
           return;
         }
 
         // Don't geocode in periodic updates - use cached address or skip
-        // This prevents hitting rate limits
-        if (this.lastLocation) {
+        // This prevents hitting rate limits and preserves existing addresses
+        if (this.lastLocation?.address) {
           location.address = this.lastLocation.address;
         }
         
@@ -857,22 +1093,27 @@ class LocationService {
           timestamp: Date.now(),
         };
         
-        // ALWAYS save to location history (independent of database update success)
+        // ALWAYS insert new row to location history (independent of database update success)
         // This ensures we have complete location tracking regardless of family_members update status
-        await this.saveLocationHistory(location);
+        await this.saveLocationHistory(location, locationAccuracy);
       }
     }, this.config.updateInterval);
 
-    // Start background location tracking (Android only - iOS uses watchPositionAsync)
+    // Start location updates (Android uses startLocationUpdatesAsync for both foreground and background)
+    // iOS uses watchPositionAsync which works in both foreground and background
     if (Platform.OS === 'android') {
       try {
+        // On Android, startLocationUpdatesAsync with foregroundService works in both foreground and background
+        // timeInterval controls how often location is checked, but background task handles 30-minute saves
+        // Use 30 seconds for location checks, but background task will save every 30 minutes
+        const BACKGROUND_LOCATION_CHECK_INTERVAL = 30000; // 30 seconds - how often to check location
         const hasStarted = await Location.startLocationUpdatesAsync(LOCATION_TASK_NAME, {
           accuracy: Location.Accuracy.Highest,
-          timeInterval: this.config.updateInterval,
+          timeInterval: BACKGROUND_LOCATION_CHECK_INTERVAL, // Check location every 30 seconds
           distanceInterval: this.config.distanceThreshold,
           foregroundService: {
             notificationTitle: 'Location Tracking',
-            notificationBody: 'FamGuard is tracking your location to share with family members.',
+            notificationBody: 'FamGuard is tracking your location every 30 minutes to share with family members.',
             notificationColor: '#DC2626',
           },
           pausesUpdatesAutomatically: false,
@@ -880,15 +1121,15 @@ class LocationService {
         });
 
         if (hasStarted) {
-          console.log('Background location tracking started');
+          console.log('Android location tracking started (foreground and background)');
         }
       } catch (bgError) {
-        console.error('Failed to start background location tracking:', bgError);
-        // Continue with foreground tracking even if background fails
+        console.error('Failed to start Android location tracking:', bgError);
+        // Continue with watchPositionAsync even if startLocationUpdatesAsync fails
       }
     } else {
       // iOS: watchPositionAsync already works in background with proper permissions
-      console.log('iOS background location tracking enabled via watchPositionAsync');
+      console.log('iOS location tracking enabled via watchPositionAsync (foreground and background)');
     }
   }
 
@@ -984,6 +1225,17 @@ class LocationService {
   ): Promise<void> {
     if (!this.userId || !this.familyGroupId) {
       return;
+    }
+
+    // Validate coordinates before updating (backend filtering)
+    if (!this.isValidCoordinate(location.latitude, location.longitude)) {
+      if (__DEV__) {
+        console.warn('Invalid coordinates detected, skipping location update:', {
+          lat: location.latitude,
+          lng: location.longitude,
+        });
+      }
+      return; // Don't update with invalid coordinates
     }
 
     try {
@@ -1196,13 +1448,24 @@ class LocationService {
    * Respects location_update_frequency_minutes from user_settings
    * The only requirement is that userId must be set
    */
-  private async saveLocationHistory(location: LocationType): Promise<void> {
+  private async saveLocationHistory(location: LocationType, accuracy?: number | null): Promise<void> {
     // Only requirement: userId must be set
     if (!this.userId) {
       if (__DEV__) {
         console.warn('Cannot save location history: userId not set');
       }
       return;
+    }
+
+    // Validate coordinates before saving (backend filtering)
+    if (!this.isValidCoordinate(location.latitude, location.longitude)) {
+      if (__DEV__) {
+        console.warn('Invalid coordinates detected, skipping location history save:', {
+          lat: location.latitude,
+          lng: location.longitude,
+        });
+      }
+      return; // Don't save invalid coordinates
     }
 
     // Check if enough time has passed since last insert based on frequency setting
@@ -1220,6 +1483,8 @@ class LocationService {
     }
 
     // Try to get address if not already available
+    // IMPORTANT: Do not update address to empty - if geocoding fails, keep it as null
+    // Only attempt geocoding if address is not already set
     let addressToSave = location.address;
     if (!addressToSave) {
       // Attempt to geocode the address (with rate limiting)
@@ -1230,24 +1495,33 @@ class LocationService {
           false, // Don't force - respect rate limits
           false // Not emergency mode
         );
+        // If geocoding returns null or empty, keep it as null (don't overwrite)
+        if (!addressToSave || addressToSave.trim() === '') {
+          addressToSave = null;
+        }
       } catch (error) {
-        // If geocoding fails, continue without address
+        // If geocoding fails, keep address as null (don't overwrite existing)
         if (__DEV__) {
           console.warn('Geocoding failed for location history, saving without address:', error);
         }
+        addressToSave = null;
       }
     }
 
-    // Insert location history as a new row
-    // This respects the user's frequency setting
+    // ALWAYS insert new row - never update existing rows
+    // This ensures complete location history tracking
     try {
+      // Properly handle accuracy - 0 is a valid value, only use null if undefined
+      const accuracyValue = accuracy !== undefined && accuracy !== null ? accuracy : null;
+      
       const { error } = await supabase
         .from('location_history')
         .insert({
           user_id: this.userId,
           latitude: location.latitude,
           longitude: location.longitude,
-          address: addressToSave || null,
+          address: addressToSave || null, // Keep null if no address (don't update to empty)
+          accuracy: accuracyValue, // Include accuracy (0 is valid, only null if undefined)
         });
 
       if (error) {
@@ -1572,6 +1846,73 @@ class LocationService {
   }
 
   /**
+   * Validate GPS coordinates - filters invalid coordinates
+   * Nigeria bounds: ~4°N to 14°N, ~3°E to 15°E
+   * @param latitude - Latitude coordinate
+   * @param longitude - Longitude coordinate
+   * @returns true if coordinates are valid
+   */
+  private isValidCoordinate(latitude: number, longitude: number): boolean {
+    // Basic range validation
+    if (typeof latitude !== 'number' || typeof longitude !== 'number') {
+      return false;
+    }
+
+    // Valid latitude range: -90 to 90
+    if (latitude < -90 || latitude > 90) {
+      return false;
+    }
+
+    // Valid longitude range: -180 to 180
+    if (longitude < -180 || longitude > 180) {
+      return false;
+    }
+
+    // Filter out common invalid GPS readings (0,0 or near 0,0)
+    if (Math.abs(latitude) < 0.0001 && Math.abs(longitude) < 0.0001) {
+      return false;
+    }
+
+    // Filter out coordinates that are clearly wrong (outside reasonable bounds)
+    // This helps filter bad GPS readings especially in Nigeria
+    // Nigeria is roughly 4°N-14°N, 3°E-15°E, but we allow wider range for edge cases
+    // We're more lenient here as users might be near borders or traveling
+    return true;
+  }
+
+  /**
+   * Check battery optimization status and provide instructions
+   * @returns Object with status and message
+   */
+  async checkBatteryOptimization(): Promise<{ isOptimized: boolean; message?: string }> {
+    try {
+      if (Platform.OS === 'android') {
+        // Note: expo-location doesn't directly check battery optimization
+        // But we can provide instructions to users
+        // For better GPS accuracy, users should disable battery optimization for the app
+        return {
+          isOptimized: false, // We can't detect this directly, so assume not optimized
+          message: 'For best GPS accuracy, please disable battery optimization for this app in Android Settings > Apps > FamGuards > Battery > Unrestricted',
+        };
+      } else if (Platform.OS === 'ios') {
+        // iOS has background app refresh and location services settings
+        // For better GPS accuracy on iOS, users should:
+        // 1. Enable Background App Refresh
+        // 2. Set location permission to "Always" or "While Using App"
+        // 3. Ensure location services are enabled
+        return {
+          isOptimized: false, // We can't detect this directly, so assume not optimized
+          message: 'For best GPS accuracy on iOS:\n1. Settings > General > Background App Refresh > Enable for FamGuards\n2. Settings > Privacy & Security > Location Services > Enable\n3. Settings > Privacy & Security > Location Services > FamGuards > Select "Always" or "While Using App"',
+        };
+      }
+      return { isOptimized: false };
+    } catch (error) {
+      console.error('Error checking battery optimization:', error);
+      return { isOptimized: false };
+    }
+  }
+
+  /**
    * Update location sharing status
    * When disabled, also sets user as offline (unless user is admin)
    */
@@ -1812,8 +2153,22 @@ class LocationService {
     this.isEmergencyTracking = true;
 
     // Get initial location with address and save it to history (permission already requested)
-    const initialLocation = await this.getHighAccuracyLocation(true);
-    if (initialLocation) {
+    const initialLocationWithAccuracy = await Location.getCurrentPositionAsync({
+      accuracy: Platform.OS === 'ios' ? Location.Accuracy.BestForNavigation : Location.Accuracy.Highest,
+      maximumAge: 0,
+      timeout: 20000,
+    });
+    
+    if (initialLocationWithAccuracy) {
+      const initialLocation: LocationType = {
+        latitude: initialLocationWithAccuracy.coords.latitude,
+        longitude: initialLocationWithAccuracy.coords.longitude,
+      };
+      // 0 is a valid accuracy value, only use null if undefined
+      const initialAccuracy = initialLocationWithAccuracy.coords?.accuracy !== undefined && initialLocationWithAccuracy.coords?.accuracy !== null
+        ? initialLocationWithAccuracy.coords.accuracy
+        : null;
+      
       // Try to get address if not already available
       if (!initialLocation.address) {
         const address = await this.reverseGeocode(
@@ -1826,7 +2181,7 @@ class LocationService {
           initialLocation.address = address;
         }
       }
-      await this.saveLocationHistory(initialLocation);
+      await this.saveLocationHistory(initialLocation, initialAccuracy);
       this.lastLocation = initialLocation;
       console.log('Emergency tracking: Initial location saved', initialLocation.address || 'no address');
     }
@@ -1862,8 +2217,13 @@ class LocationService {
           latitude: position.coords.latitude,
           longitude: position.coords.longitude,
         };
+        // 0 is a valid accuracy value, only use null if undefined
+        const locationAccuracy = position.coords?.accuracy !== undefined && position.coords?.accuracy !== null
+          ? position.coords.accuracy
+          : null;
 
         // Try to get address for each update (since we're only updating hourly, we can geocode each time)
+        // But don't update to empty - keep existing address if geocoding fails
         try {
           const address = await this.reverseGeocode(
             location.latitude,
@@ -1887,7 +2247,7 @@ class LocationService {
         }
 
         // Save to location history every 1 hour during emergency
-        await this.saveLocationHistory(location);
+        await this.saveLocationHistory(location, locationAccuracy);
         this.lastLocation = location;
         
         if (location.address) {
@@ -1926,93 +2286,56 @@ class LocationService {
 
   /**
    * Save location to history (public method)
-   * Uses upsert to prevent duplicates - updates if user_id exists, inserts if not
-   * Database unique constraint on user_id ensures no duplicates can be created
+   * ALWAYS inserts new rows - never updates existing rows
+   * This creates a complete history of location updates
    */
-  async saveLocationToHistory(userId: string, location: LocationType, forceInsert: boolean = false): Promise<void> {
+  async saveLocationToHistory(userId: string, location: LocationType, forceInsert: boolean = false, accuracy?: number | null): Promise<void> {
     if (!userId) {
       return;
     }
 
+    // Get accuracy from location if not provided - try to get it from GPS
+    let locationAccuracy = accuracy;
+    if (locationAccuracy === undefined) {
+      // Try to get fresh location with accuracy
+      try {
+        const locationWithAccuracy = await Location.getCurrentPositionAsync({
+          accuracy: Platform.OS === 'ios' ? Location.Accuracy.BestForNavigation : Location.Accuracy.Highest,
+          maximumAge: 5000, // Allow 5 second old data
+          timeout: 5000, // Quick timeout
+        });
+        locationAccuracy = locationWithAccuracy?.coords?.accuracy !== undefined && locationWithAccuracy?.coords?.accuracy !== null
+          ? locationWithAccuracy.coords.accuracy
+          : null;
+      } catch (error) {
+        // If we can't get accuracy, use null
+        locationAccuracy = null;
+      }
+    }
+
+    // Properly handle accuracy - 0 is a valid value, only use null if undefined
+    const accuracyValue = locationAccuracy !== undefined && locationAccuracy !== null ? locationAccuracy : null;
+
     try {
-      // Check if user_id exists first
-      const { data: existingEntry } = await supabase
+      // ALWAYS insert new row - never update existing rows
+      // This creates a complete history of location updates
+      const { error: insertError } = await supabase
         .from('location_history')
-        .select('id, created_at')
-        .eq('user_id', userId)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
+        .insert({
+          user_id: userId,
+          latitude: location.latitude,
+          longitude: location.longitude,
+          address: location.address || null,
+          accuracy: accuracyValue, // Include accuracy in insert
+        });
 
-      const userExists = existingEntry !== null;
-
-      if (userExists) {
-        // User_id exists - ALWAYS update, NEVER insert
-        const { error: updateError } = await supabase
-          .from('location_history')
-          .update({
-            latitude: location.latitude,
-            longitude: location.longitude,
-            address: location.address || null,
-            // created_at is automatically preserved on UPDATE
-          })
-          .eq('user_id', userId); // Update by user_id (unique constraint ensures only one row)
-
-        if (updateError) {
-          if (__DEV__) {
-            console.warn('Error updating location history:', updateError);
-          }
-        } else {
-          if (__DEV__) {
-            console.log('Location history updated successfully - user_id exists');
-          }
+      if (insertError) {
+        if (__DEV__) {
+          console.warn('Error inserting location history:', insertError);
         }
       } else {
-        // User_id does NOT exist - insert new record
-        const { error: insertError } = await supabase
-          .from('location_history')
-          .insert({
-            user_id: userId,
-            latitude: location.latitude,
-            longitude: location.longitude,
-            address: location.address || null,
-          });
-
-        if (insertError) {
-          // If insert fails due to unique constraint (race condition), update instead
-          if (insertError.code === '23505' || insertError.message?.includes('duplicate') || insertError.message?.includes('unique')) {
-            if (__DEV__) {
-              console.log('Duplicate detected during insert (race condition), updating instead');
-            }
-            
-            // Update existing entry (created by another concurrent request)
-            const { error: updateError } = await supabase
-              .from('location_history')
-              .update({
-                latitude: location.latitude,
-                longitude: location.longitude,
-                address: location.address || null,
-              })
-              .eq('user_id', userId);
-
-            if (updateError) {
-              if (__DEV__) {
-                console.warn('Error updating after duplicate insert error:', updateError);
-              }
-            } else {
-              if (__DEV__) {
-                console.log('Location history updated successfully (after race condition)');
-              }
-            }
-          } else {
-            if (__DEV__) {
-              console.warn('Error inserting location history:', insertError);
-            }
-          }
-        } else {
-          if (__DEV__) {
-            console.log('Location history inserted successfully - new user_id');
-          }
+        if (__DEV__) {
+          console.log('Location history inserted successfully (new row)');
         }
       }
     } catch (error) {
@@ -2282,6 +2605,152 @@ class LocationService {
    */
   isSOSLocationTrackingActive(): boolean {
     return this.isSosLocationTracking;
+  }
+
+  /**
+   * Start emergency high-accuracy GPS tracking - inserts location every 15 minutes
+   * Continues until user account is unlocked (is_locked becomes false)
+   * Uses highest accuracy GPS for precise location tracking
+   */
+  async startEmergencyHighAccuracyTracking(userId: string): Promise<void> {
+    if (this.isEmergencyHighAccuracyTracking) {
+      console.log('Emergency high-accuracy tracking already started');
+      return;
+    }
+
+    const permissionResult = await this.requestPermissions();
+    if (!permissionResult.granted) {
+      throw new Error(permissionResult.message || 'Location permissions not granted');
+    }
+
+    this.userId = userId;
+    this.isEmergencyHighAccuracyTracking = true;
+
+    // Get initial location with high-accuracy GPS and save it immediately
+    const initialLocation = await this.getHighAccuracyLocation(true);
+    if (initialLocation) {
+      // Get accuracy from GPS for initial location
+      let initialAccuracy: number | null = null;
+      try {
+        const locationWithAccuracy = await Location.getCurrentPositionAsync({
+          accuracy: Platform.OS === 'ios' ? Location.Accuracy.BestForNavigation : Location.Accuracy.Highest,
+          maximumAge: 0, // Force fresh location
+          timeout: 20000,
+        });
+        initialAccuracy = locationWithAccuracy?.coords?.accuracy !== undefined && locationWithAccuracy?.coords?.accuracy !== null
+          ? locationWithAccuracy.coords.accuracy
+          : null;
+      } catch (error) {
+        console.warn('Could not get accuracy for initial emergency location:', error);
+      }
+
+      // Save initial location to history
+      await this.saveLocationToHistory(userId, initialLocation, true, initialAccuracy);
+      this.lastLocation = initialLocation;
+      console.log('Emergency high-accuracy tracking: Initial location saved with accuracy:', initialAccuracy);
+    }
+
+    // Start tracking every 15 minutes (900000 ms)
+    this.emergencyHighAccuracyTrackingInterval = setInterval(async () => {
+      try {
+        // Check if user is still locked - stop tracking if unlocked
+        const { data: userData, error: userError } = await supabase
+          .from('users')
+          .select('is_locked')
+          .eq('id', userId)
+          .single();
+
+        if (userError) {
+          console.error('Error checking user lock status:', userError);
+          // Continue tracking if we can't check status
+        } else if (userData && !userData.is_locked) {
+          // User is unlocked - stop tracking
+          console.log('User unlocked - stopping emergency high-accuracy tracking');
+          this.stopEmergencyHighAccuracyTracking();
+          return;
+        }
+
+        // Get location with high-accuracy GPS
+        const hasPermission = await this.checkPermissions();
+        if (!hasPermission) {
+          return;
+        }
+
+        // Use high-accuracy GPS settings
+        const locationWithAccuracy = await Location.getCurrentPositionAsync({
+          accuracy: Platform.OS === 'ios' ? Location.Accuracy.BestForNavigation : Location.Accuracy.Highest,
+          maximumAge: 0, // Force fresh location
+          timeout: 20000, // Wait up to 20 seconds for accurate GPS
+        });
+
+        if (!locationWithAccuracy) {
+          console.warn('Could not get location for emergency high-accuracy tracking');
+          return;
+        }
+
+        const location: LocationType = {
+          latitude: locationWithAccuracy.coords.latitude,
+          longitude: locationWithAccuracy.coords.longitude,
+        };
+
+        // Get accuracy from GPS
+        const locationAccuracy = locationWithAccuracy.coords?.accuracy !== undefined && locationWithAccuracy.coords?.accuracy !== null
+          ? locationWithAccuracy.coords.accuracy
+          : null;
+
+        // Try to get address (with emergency mode for more frequent geocoding)
+        try {
+          const address = await this.reverseGeocode(
+            location.latitude,
+            location.longitude,
+            false, // Don't force
+            true // Emergency mode - allows more frequent geocoding
+          );
+          if (address) {
+            location.address = address;
+          }
+        } catch (error) {
+          // If geocoding fails, continue without address
+          console.warn('Geocoding failed for emergency location:', error);
+        }
+
+        // Insert new row to location_history with high-accuracy GPS data
+        await this.saveLocationToHistory(userId, location, true, locationAccuracy);
+        this.lastLocation = location;
+
+        if (__DEV__) {
+          console.log('Emergency high-accuracy location saved (15min):', {
+            lat: location.latitude.toFixed(6),
+            lng: location.longitude.toFixed(6),
+            accuracy: locationAccuracy,
+            hasAddress: !!location.address,
+          });
+        }
+      } catch (error) {
+        console.error('Error in emergency high-accuracy tracking:', error);
+      }
+    }, 900000); // 15 minutes = 900000 milliseconds
+
+    console.log('Emergency high-accuracy GPS tracking started - inserting location every 15 minutes until user is unlocked');
+  }
+
+  /**
+   * Stop emergency high-accuracy GPS tracking
+   */
+  stopEmergencyHighAccuracyTracking(): void {
+    if (this.emergencyHighAccuracyTrackingInterval) {
+      clearInterval(this.emergencyHighAccuracyTrackingInterval);
+      this.emergencyHighAccuracyTrackingInterval = null;
+    }
+    this.isEmergencyHighAccuracyTracking = false;
+    console.log('Emergency high-accuracy GPS tracking stopped');
+  }
+
+  /**
+   * Check if emergency high-accuracy tracking is active
+   */
+  isEmergencyHighAccuracyTrackingActive(): boolean {
+    return this.isEmergencyHighAccuracyTracking;
   }
 }
 

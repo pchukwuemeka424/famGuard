@@ -84,6 +84,7 @@ export interface AppSetting {
   hide_incident: boolean;
   sos_lock: boolean;
   force_update_required: boolean;
+  app_update_notification_enabled: boolean;
   created_at: string;
   updated_at: string;
 }

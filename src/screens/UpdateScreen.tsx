@@ -21,7 +21,7 @@ export default function UpdateScreen({ onUpdate }: UpdateScreenProps) {
   
   const handleUpdatePress = async () => {
     const appStoreUrl = Platform.select({
-      ios: 'https://apps.apple.com/app/idYOUR_APP_ID', // Replace with actual App Store ID
+      ios: 'https://apps.apple.com/gb/app/famsguard/id6757821633', // Replace with actual App Store ID
       android: 'https://play.google.com/store/apps/details?id=com.famguardacehubtech',
     });
 

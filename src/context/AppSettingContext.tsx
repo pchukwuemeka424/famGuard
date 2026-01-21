@@ -44,6 +44,7 @@ export const AppSettingProvider: React.FC<AppSettingProviderProps> = ({ children
           hide_incident: false,
           sos_lock: false,
           force_update_required: false,
+          app_update_notification_enabled: false,
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         });
@@ -53,7 +54,7 @@ export const AppSettingProvider: React.FC<AppSettingProviderProps> = ({ children
       // Explicitly select the status fields from app_setting table
       const { data, error } = await supabase
         .from('app_setting')
-        .select('id, hide_report_incident, hide_incident, sos_lock, force_update_required, created_at, updated_at')
+        .select('id, hide_report_incident, hide_incident, sos_lock, force_update_required, app_update_notification_enabled, created_at, updated_at')
         .eq('id', '00000000-0000-0000-0000-000000000000')
         .single();
 
@@ -66,6 +67,7 @@ export const AppSettingProvider: React.FC<AppSettingProviderProps> = ({ children
           hide_incident: false,
           sos_lock: false,
           force_update_required: false,
+          app_update_notification_enabled: false,
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         });
@@ -81,6 +83,7 @@ export const AppSettingProvider: React.FC<AppSettingProviderProps> = ({ children
           hide_incident: false,
           sos_lock: false,
           force_update_required: false,
+          app_update_notification_enabled: false,
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         });
@@ -88,14 +91,16 @@ export const AppSettingProvider: React.FC<AppSettingProviderProps> = ({ children
     } catch (error: any) {
       logger.error('Error fetching app settings:', error?.message || String(error));
       // Set defaults on error
-      setAppSetting({
-        id: '00000000-0000-0000-0000-000000000000',
-        hide_report_incident: false,
-        hide_incident: false,
-        sos_lock: false,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      });
+        setAppSetting({
+          id: '00000000-0000-0000-0000-000000000000',
+          hide_report_incident: false,
+          hide_incident: false,
+          sos_lock: false,
+          force_update_required: false,
+          app_update_notification_enabled: false,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        });
     } finally {
       setLoading(false);
     }

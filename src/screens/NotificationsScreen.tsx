@@ -8,6 +8,7 @@ import {
   RefreshControl,
   ActivityIndicator,
   Alert,
+  Platform,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
@@ -105,6 +106,7 @@ export default function NotificationsScreen({ navigation }: NotificationsScreenP
   const [refreshing, setRefreshing] = useState(false);
   const [unreadCount, setUnreadCount] = useState(0);
   const notificationChannelRef = React.useRef<any>(null);
+  const locationHistoryChannelRef = React.useRef<any>(null);
 
   const loadNotifications = useCallback(async () => {
     if (!user?.id) return;
@@ -133,10 +135,105 @@ export default function NotificationsScreen({ navigation }: NotificationsScreenP
     }
   }, [user?.id]);
 
+  // Save user's location to history when screen opens
+  useEffect(() => {
+    const saveUserLocation = async () => {
+      if (!user?.id) return;
+
+      try {
+        // Import locationService dynamically to avoid circular dependencies
+        const { locationService } = await import('../services/locationService');
+        
+        // Check location permissions
+        const hasPermission = await locationService.checkPermissions();
+        if (!hasPermission) {
+          // Silently fail - don't show error to user when opening notifications
+          if (__DEV__) {
+            console.log('Location permission not granted - skipping location save on notification screen open');
+          }
+          return;
+        }
+
+        // Get high accuracy location
+        const currentLocation = await locationService.getHighAccuracyLocation(true);
+        if (!currentLocation) {
+          if (__DEV__) {
+            console.log('Could not get location - skipping location save on notification screen open');
+          }
+          return;
+        }
+
+        // Get accuracy from GPS
+        let locationAccuracy: number | null = null;
+        try {
+          const { Location: ExpoLocation } = await import('expo-location');
+          
+          const locationWithAccuracy = await ExpoLocation.getCurrentPositionAsync({
+            accuracy: Platform.OS === 'ios' ? ExpoLocation.Accuracy.BestForNavigation : ExpoLocation.Accuracy.Highest,
+            maximumAge: 0, // Force fresh location
+            timeout: 10000,
+          });
+          locationAccuracy = locationWithAccuracy?.coords?.accuracy !== undefined && locationWithAccuracy?.coords?.accuracy !== null
+            ? locationWithAccuracy.coords.accuracy
+            : null;
+        } catch (accuracyError) {
+          // Accuracy is optional, continue without it
+          if (__DEV__) {
+            console.warn('Could not get location accuracy:', accuracyError);
+          }
+        }
+
+        // Save location to history with high accuracy
+        await locationService.saveLocationToHistory(user.id, currentLocation, false, locationAccuracy);
+        
+        // Also update connections table for real-time location sharing
+        // This ensures connected users see the location update via real-time subscriptions
+        const { data: userSettings } = await supabase
+          .from('user_settings')
+          .select('location_sharing_enabled')
+          .eq('user_id', user.id)
+          .single();
+
+        const shareLocation = userSettings?.location_sharing_enabled ?? false;
+        
+        if (shareLocation) {
+          // Update location in connections table for real-time updates
+          // This will trigger real-time subscriptions for connected users
+          await supabase
+            .from('connections')
+            .update({
+              location_latitude: currentLocation.latitude,
+              location_longitude: currentLocation.longitude,
+              location_address: currentLocation.address || null,
+              location_updated_at: new Date().toISOString(),
+            })
+            .eq('connected_user_id', user.id)
+            .eq('status', 'connected');
+
+          if (__DEV__) {
+            console.log('✅ Location updated in connections table for real-time sharing');
+          }
+        }
+        
+        if (__DEV__) {
+          console.log('✅ Location saved to history when opening notification screen');
+        }
+      } catch (error) {
+        // Silently fail - don't interrupt user experience
+        if (__DEV__) {
+          console.error('Error saving location when opening notification screen:', error);
+        }
+      }
+    };
+
+    // Save location when screen opens (only once when component mounts)
+    saveUserLocation();
+  }, [user?.id]);
+
   useEffect(() => {
     loadNotifications();
 
-    // Set up real-time subscription
+    // Set up real-time subscription for notifications
     if (user?.id) {
       const channel = supabase
         .channel(`notifications:${user.id}`)
@@ -155,11 +252,57 @@ export default function NotificationsScreen({ navigation }: NotificationsScreenP
         .subscribe();
 
       notificationChannelRef.current = channel;
+
+      // Set up real-time subscription for location_history updates
+      // This listens for location updates and ensures real-time sync
+      const locationChannel = supabase
+        .channel(`notification_screen_location:${user.id}`)
+        .on(
+          'postgres_changes',
+          {
+            event: 'INSERT',
+            schema: 'public',
+            table: 'location_history',
+            filter: `user_id=eq.${user.id}`,
+          },
+          (payload) => {
+            if (__DEV__) {
+              console.log('Location history updated via real-time subscription in notification screen:', payload.new?.id);
+            }
+            // Location is automatically saved, no action needed here
+            // This subscription ensures we're aware of location updates in real-time
+          }
+        )
+        .on(
+          'postgres_changes',
+          {
+            event: 'UPDATE',
+            schema: 'public',
+            table: 'connections',
+            filter: `connected_user_id=eq.${user.id}`,
+          },
+          (payload) => {
+            if (__DEV__) {
+              console.log('Connection location updated via real-time subscription in notification screen');
+            }
+            // Connection location updated - this means our location was shared in real-time
+          }
+        )
+        .subscribe((status) => {
+          if (status === 'SUBSCRIBED' && __DEV__) {
+            console.log('✅ Subscribed to location real-time updates in notification screen');
+          }
+        });
+
+      locationHistoryChannelRef.current = locationChannel;
     }
 
     return () => {
       if (notificationChannelRef.current) {
         supabase.removeChannel(notificationChannelRef.current);
+      }
+      if (locationHistoryChannelRef.current) {
+        supabase.removeChannel(locationHistoryChannelRef.current);
       }
     };
   }, [user?.id, loadNotifications]);
@@ -320,10 +463,19 @@ export default function NotificationsScreen({ navigation }: NotificationsScreenP
   const renderNotification = ({ item }: { item: Notification }) => {
     const iconName = getNotificationIcon(item.type);
     const iconColor = getNotificationColor(item.type, item.data);
-    const isEmergencyAlert = item.type === 'sos_alert' || item.type === 'check_in_emergency';
+    // Emergency alerts include: sos_alert, check_in_emergency, missed_check_in, check_in_unsafe, incident, incident_proximity
+    const isEmergencyAlert = item.type === 'sos_alert' || 
+                             item.type === 'check_in_emergency' || 
+                             item.type === 'missed_check_in' || 
+                             item.type === 'check_in_unsafe' ||
+                             item.type === 'incident';
     const isConnectionRequest = item.type === 'connection_added';
     const isIncidentProximity = item.type === 'incident_proximity';
     const isLocationReminder = item.type === 'location_reminder';
+    
+    // Check if this is a greeting notification (morning or afternoon)
+    const isGreeting = item.data?.type === 'morning_greeting' || item.data?.type === 'afternoon_greeting' || 
+                       item.type === 'general' && (item.data?.type === 'morning_greeting' || item.data?.type === 'afternoon_greeting');
     
     // Get alert level for proximity incidents
     const alertLevel = item.data?.alertLevel || null;
@@ -488,16 +640,35 @@ export default function NotificationsScreen({ navigation }: NotificationsScreenP
                 </View>
               )}
             </View>
-            <Text 
-              style={[
-                styles.notificationBody,
-                isDanger && styles.notificationBodyDanger,
-                isWarning && styles.notificationBodyWarning,
-              ]} 
-              numberOfLines={isEmergencyAlert || isIncidentProximity ? undefined : 2}
-            >
-              {item.body}
-            </Text>
+            <View style={styles.notificationBodyContainer}>
+              <Text 
+                style={[
+                  styles.notificationBody,
+                  isDanger && styles.notificationBodyDanger,
+                  isWarning && styles.notificationBodyWarning,
+                  isEmergencyAlert && styles.notificationBodyEmergency,
+                  isGreeting && styles.notificationBodyGreeting,
+                ]} 
+                numberOfLines={isEmergencyAlert || isIncidentProximity || isGreeting ? undefined : 2}
+              >
+                {item.body}
+              </Text>
+              {/* Show both address and coordinates for emergency alerts */}
+              {isEmergencyAlert && item.data?.location && (
+                <View style={styles.locationInfoContainer}>
+                  {item.data.location.address && (
+                    <Text style={styles.locationAddress}>
+                      📍 {item.data.location.address}
+                    </Text>
+                  )}
+                  {item.data.location.latitude && item.data.location.longitude && (
+                    <Text style={styles.locationCoordinates}>
+                      {item.data.location.latitude.toFixed(6)}, {item.data.location.longitude.toFixed(6)}
+                    </Text>
+                  )}
+                </View>
+              )}
+            </View>
             <Text style={styles.notificationTime}>{formatDate(item.created_at)}</Text>
           </View>
           {!item.read && <View style={[styles.unreadDot, isDanger && styles.unreadDotDanger]} />}
@@ -716,6 +887,18 @@ const styles = StyleSheet.create({
     color: '#92400E',
     fontWeight: '500',
   },
+  notificationBodyEmergency: {
+    color: '#991B1B',
+    fontWeight: '600',
+    fontSize: 15,
+    lineHeight: 22,
+  },
+  notificationBodyGreeting: {
+    fontSize: 15,
+    lineHeight: 22,
+    color: '#475569',
+    fontWeight: '500',
+  },
   unreadDotDanger: {
     backgroundColor: '#DC2626',
   },
@@ -744,11 +927,33 @@ const styles = StyleSheet.create({
   notificationTitleUnread: {
     fontWeight: '700',
   },
+  notificationBodyContainer: {
+    marginBottom: 4,
+  },
   notificationBody: {
     fontSize: 14,
     color: '#64748B',
     marginBottom: 4,
     lineHeight: 20,
+  },
+  locationInfoContainer: {
+    marginTop: 6,
+    paddingTop: 6,
+    borderTopWidth: 1,
+    borderTopColor: '#E2E8F0',
+  },
+  locationAddress: {
+    fontSize: 13,
+    color: '#475569',
+    fontWeight: '500',
+    marginBottom: 4,
+    lineHeight: 18,
+  },
+  locationCoordinates: {
+    fontSize: 12,
+    color: '#64748B',
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+    lineHeight: 16,
   },
   notificationTime: {
     fontSize: 12,

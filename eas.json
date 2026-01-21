@@ -91,7 +91,8 @@
         "ascApiKeyPath": "./.credentials/AuthKey_G74VZC986D.p8",
         "ascApiKeyId": "G74VZC986D",
         "ascApiKeyIssuerId": "dc7cd118-2e47-4513-be15-6f7716379cae",
-        "companyName": "ACEHUB TECHNOLOGIES LTD"
+        "companyName": "ACEHUB TECHNOLOGIES LTD",
+        "ascAppId": "6757821633"
       }
     }
   }

@@ -1,4 +1,5 @@
 import React, { createContext, useState, useContext, useEffect, useRef, ReactNode } from 'react';
+import { Platform } from 'react-native';
 import { supabase } from '../lib/supabase';
 import { useAuth } from './AuthContext';
 import { locationService } from '../services/locationService';
@@ -41,17 +42,39 @@ export const ConnectionProvider: React.FC<ConnectionProviderProps> = ({ children
 
   // Load initial connections, settings, and set up real-time subscriptions
   useEffect(() => {
-    if (user?.id) {
-      loadSettings().then(() => {
-        loadConnections().then(() => {
-          // Set up real-time subscription after data is loaded
-          setupRealtimeSubscription();
+    if (!user?.id) return;
+
+    // Add a small delay to ensure app is fully initialized before setting up subscriptions
+    // This prevents crashes from race conditions when app reopens
+    const initTimeout = setTimeout(() => {
+      // Check if user still exists (component might have unmounted)
+      if (!user?.id) return;
+
+      try {
+        loadSettings().then(() => {
+          if (!user?.id) return; // Check again after async operation
+          loadConnections().then(() => {
+            if (!user?.id) return; // Check again after async operation
+            // Set up real-time subscription after data is loaded
+            setupRealtimeSubscription();
+          }).catch((error) => {
+            console.error('Error loading connections:', error);
+            // Don't crash - just log the error
+          });
+        }).catch((error) => {
+          console.error('Error loading settings:', error);
+          // Don't crash - just log the error
         });
-      });
-      setupSettingsRealtimeSubscription();
-    }
+        
+        setupSettingsRealtimeSubscription();
+      } catch (error) {
+        console.error('Error initializing ConnectionContext:', error);
+        // Don't crash - just log the error
+      }
+    }, 500); // 500ms delay to ensure app is ready
 
     return () => {
+      clearTimeout(initTimeout);
       // Cleanup realtime subscriptions
       isIntentionallyClosingRef.current = true;
       subscriptionSetupInProgressRef.current = false;
@@ -195,13 +218,36 @@ export const ConnectionProvider: React.FC<ConnectionProviderProps> = ({ children
 
     let locationWatchSubscription: any = null;
     let locationUpdateInterval: NodeJS.Timeout | null = null;
+    let isMounted = true;
+    let initDelayTimeout: NodeJS.Timeout | null = null;
 
     const updateConnectionsLocation = async (): Promise<void> => {
-      if (!user?.id || !locationSharingEnabled) return;
+      if (!user?.id || !locationSharingEnabled || !isMounted) return;
 
       try {
-        const currentLocation = await locationService.getCurrentLocation();
-        if (!currentLocation) return;
+        // iOS-specific: Check if location services are enabled
+        if (Platform.OS === 'ios') {
+          try {
+            const { hasServicesEnabledAsync } = await import('expo-location');
+            const servicesEnabled = await hasServicesEnabledAsync();
+            if (!servicesEnabled) {
+              console.warn('iOS: Location services disabled, skipping connection location update');
+              return;
+            }
+          } catch (error) {
+            console.warn('iOS: Error checking location services:', error);
+            // Continue anyway
+          }
+        }
+
+        let currentLocation = null;
+        try {
+          currentLocation = await locationService.getCurrentLocation();
+        } catch (error) {
+          console.error('Error getting current location:', error);
+          return;
+        }
+        if (!currentLocation || !isMounted) return;
 
         // Check if location update should be blocked (user stationary for 1+ hour within 30m)
         if (locationService.shouldBlockLocationUpdate(currentLocation)) {
@@ -242,14 +288,30 @@ export const ConnectionProvider: React.FC<ConnectionProviderProps> = ({ children
     };
 
     if (locationSharingEnabled) {
-      // Get initial location
-      updateConnectionsLocation();
-
-      // Set up periodic location updates based on user settings
-      const updateIntervalMs = locationUpdateFrequencyMinutes * 60 * 1000; // Convert minutes to milliseconds
-      locationUpdateInterval = setInterval(() => {
+      // iOS-specific: Add a delay before getting initial location
+      // This prevents race conditions when the app reopens and multiple components
+      // try to access location simultaneously
+      const startLocationUpdates = () => {
+        if (!isMounted) return;
+        
+        // Get initial location
         updateConnectionsLocation();
-      }, updateIntervalMs);
+
+        // Set up periodic location updates based on user settings
+        const updateIntervalMs = locationUpdateFrequencyMinutes * 60 * 1000; // Convert minutes to milliseconds
+        locationUpdateInterval = setInterval(() => {
+          if (isMounted) {
+            updateConnectionsLocation();
+          }
+        }, updateIntervalMs);
+      };
+
+      if (Platform.OS === 'ios') {
+        // 2 second delay on iOS to allow HomeScreen to initialize first
+        initDelayTimeout = setTimeout(startLocationUpdates, 2000);
+      } else {
+        startLocationUpdates();
+      }
     } else {
       // Clear location when sharing is disabled
       supabase
@@ -263,11 +325,17 @@ export const ConnectionProvider: React.FC<ConnectionProviderProps> = ({ children
         .eq('connected_user_id', user.id)
         .eq('status', 'connected')
         .then(() => {
-          refreshConnections();
+          if (isMounted) {
+            refreshConnections();
+          }
         });
     }
 
     return () => {
+      isMounted = false;
+      if (initDelayTimeout) {
+        clearTimeout(initDelayTimeout);
+      }
       if (locationUpdateInterval) {
         clearInterval(locationUpdateInterval);
       }

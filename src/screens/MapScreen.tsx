@@ -8,9 +8,11 @@ import {
   ScrollView,
   Dimensions,
   Platform,
+  AppState,
+  AppStateStatus,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import MapView, { Marker, Polyline, PROVIDER_GOOGLE, Region } from 'react-native-maps';
+import MapView, { Marker, PROVIDER_GOOGLE, Region } from 'react-native-maps';
 import { Ionicons } from '@expo/vector-icons';
 import type { RouteProp } from '@react-navigation/native';
 import type { StackNavigationProp } from '@react-navigation/stack';
@@ -39,9 +41,23 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
   const { user } = useAuth();
   const mapRef = useRef<MapView>(null);
   
+  // targetUserId is the user whose location we're viewing
+  // If userId is provided (viewing someone else), use that
+  // Otherwise, use current user's ID (viewing own location)
   const targetUserId = userId || user?.id;
   
+  if (__DEV__) {
+    console.log('MapScreen initialized:', {
+      targetUserId,
+      userId,
+      currentUserId: user?.id,
+      showUserLocation,
+      hasLocation: !!location,
+    });
+  }
+  
   const [userLocation, setUserLocation] = useState<Location | null>(null);
+  const [destinationLocation, setDestinationLocation] = useState<Location>(location); // Live location of the connected user (or current user if viewing own location)
   const [locationHistory, setLocationHistory] = useState<Array<Location & { timestamp: string }>>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [historyLoading, setHistoryLoading] = useState<boolean>(false);
@@ -53,15 +69,39 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
   const [pendingUpdatesCount, setPendingUpdatesCount] = useState<number>(0);
   const [mapError, setMapError] = useState<string | null>(null);
   const [tracksViewChanges, setTracksViewChanges] = useState<boolean>(true);
+  const [hasLocationHistory, setHasLocationHistory] = useState<boolean>(true); // Track if location_history exists for target user
   const realtimeChannelRef = useRef<any>(null);
+  const connectionsRealtimeChannelRef = useRef<any>(null);
   const pendingUpdatesRef = useRef<Array<Location & { timestamp: string }>>([]);
   const locationWatchSubscriptionRef = useRef<ExpoLocation.LocationSubscription | null>(null);
+  const appStateRef = useRef<AppStateStatus>(AppState.currentState);
+  const hasRequestedBackgroundPermissionRef = useRef<boolean>(false);
+  const lastDestinationLocationRef = useRef<Location | null>(null);
+  const lastUserLocationRef = useRef<Location | null>(null);
+  const locationHistoryIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const lastLocationHistorySaveRef = useRef<number>(0);
+  const hasInitializedLocationRef = useRef<boolean>(false);
+  const hasInitializedSubscriptionsRef = useRef<boolean>(false);
+  const isFetchingLocationRef = useRef<boolean>(false);
   
-  const [mapRegion, setMapRegion] = useState<Region>({
-    latitude: location.latitude,
-    longitude: location.longitude,
-    latitudeDelta: 0.002,
-    longitudeDelta: 0.002,
+  const [mapRegion, setMapRegion] = useState<Region>(() => {
+    // Initialize map region to destination location (connected user's location)
+    // Use tight zoom to show exact location
+    if (location && location.latitude && location.longitude) {
+      return {
+        latitude: location.latitude,
+        longitude: location.longitude,
+        latitudeDelta: Platform.OS === 'ios' ? 0.0006 : 0.001, // Zoomed in for exact location
+        longitudeDelta: Platform.OS === 'ios' ? 0.0006 : 0.001, // Zoomed in for exact location
+      };
+    }
+    // Fallback to default region
+    return {
+      latitude: 0,
+      longitude: 0,
+      latitudeDelta: 0.0006,
+      longitudeDelta: 0.0006,
+    };
   });
 
   useEffect(() => {
@@ -77,142 +117,515 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
     checkOfflineMap();
   }, [location]);
 
-  useEffect(() => {
-    if (showUserLocation) {
-      const fetchUserLocation = async () => {
-        try {
-          // Check if location services are enabled (especially important on iOS)
-          const servicesEnabled = await ExpoLocation.hasServicesEnabledAsync();
-          if (!servicesEnabled) {
-            console.warn('Location services are disabled. Please enable them in Settings.');
-            setLoading(false);
-            return;
-          }
+  // Calculate distance between two coordinates (Haversine formula)
+  const calculateDistance = React.useCallback((lat1: number, lon1: number, lat2: number, lon2: number): number => {
+    const R = 6371000; // Earth's radius in meters
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLon = (lon2 - lon1) * Math.PI / 180;
+    const a =
+      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos(lat1 * Math.PI / 180) *
+        Math.cos(lat2 * Math.PI / 180) *
+        Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c;
+  }, []);
 
-          // Request permissions first
-          const permissionResult = await locationService.requestPermissions();
-          if (!permissionResult.granted) {
-            console.warn('Location permission not granted:', permissionResult.message);
-            setLoading(false);
-            return;
-          }
+  // Function to fetch user location (can be called from multiple places)
+  const fetchUserLocation = React.useCallback(async (forceRefresh: boolean = false) => {
+    // Don't show current user location if viewing another user and they have no location_history
+    if (!showUserLocation || (userId && userId !== user?.id && !hasLocationHistory)) return;
 
-          if (location && location.latitude && location.longitude) {
-            setUserLocation(location);
-            const initialRegion = {
-              latitude: location.latitude,
-              longitude: location.longitude,
-              latitudeDelta: Platform.OS === 'ios' ? 0.0005 : 0.001,
-              longitudeDelta: Platform.OS === 'ios' ? 0.0005 : 0.001,
-            };
-            setMapRegion(initialRegion);
-            setTimeout(() => {
-              if (mapRef.current) {
-                mapRef.current.animateToRegion(initialRegion, 1000);
-              }
-            }, 500);
-          }
-          
-          // Use high accuracy location for exact positioning
-          // On iOS, request location with best accuracy
-          const currentLocation = await locationService.getHighAccuracyLocation(true);
-          if (currentLocation) {
-            setUserLocation(currentLocation);
-            
-            // Log location accuracy for debugging
-            if (__DEV__) {
-              console.log('Initial location fetched:', {
-                lat: currentLocation.latitude.toFixed(6),
-                lng: currentLocation.longitude.toFixed(6),
-                platform: Platform.OS,
-              });
-            }
-            
-            if (!location || (!location.latitude && !location.longitude)) {
-              const currentRegion = {
-                latitude: currentLocation.latitude,
-                longitude: currentLocation.longitude,
-                latitudeDelta: Platform.OS === 'ios' ? 0.002 : 0.005, // Tighter zoom on iOS
-                longitudeDelta: Platform.OS === 'ios' ? 0.002 : 0.005,
-              };
-              setMapRegion(currentRegion);
-              setTimeout(() => {
-                if (mapRef.current) {
-                  mapRef.current.animateToRegion(currentRegion, 1000);
-                }
-              }, 500);
-            }
-          } else if (incidentUserLocation && (!location || (!location.latitude && !location.longitude))) {
-            setUserLocation(incidentUserLocation);
-          }
-
-          // Start watching location changes for real-time updates
-          // Use iOS-specific settings for better accuracy
-          if (locationWatchSubscriptionRef.current) {
-            locationWatchSubscriptionRef.current.remove();
-          }
-
-          // iOS needs more frequent updates and better accuracy settings
-          // Use maximumAge: 0 to prevent cached location data on iOS
-          const watchOptions = Platform.OS === 'ios' 
-            ? {
-                accuracy: ExpoLocation.Accuracy.BestForNavigation, // Best accuracy for iOS
-                timeInterval: 2000, // Update every 2 seconds on iOS for real-time tracking
-                distanceInterval: 1, // Update every 1 meter on iOS for precise tracking
-                mayShowUserSettings: false, // Don't show settings dialog
-              }
-            : {
-                accuracy: ExpoLocation.Accuracy.Highest,
-                timeInterval: 5000, // Update every 5 seconds on Android
-                distanceInterval: 5, // Update every 5 meters on Android
-              };
-
-          locationWatchSubscriptionRef.current = await ExpoLocation.watchPositionAsync(
-            watchOptions,
-            (newLocation) => {
-              const updatedLocation: Location = {
-                latitude: newLocation.coords.latitude,
-                longitude: newLocation.coords.longitude,
-                address: userLocation?.address, // Preserve address
-              };
-              setUserLocation(updatedLocation);
-              
-              // Log accuracy for debugging
-              if (__DEV__) {
-                console.log('Location updated:', {
-                  lat: updatedLocation.latitude.toFixed(6),
-                  lng: updatedLocation.longitude.toFixed(6),
-                  accuracy: newLocation.coords.accuracy,
-                  platform: Platform.OS,
-                });
-              }
-            }
-          );
-        } catch (error) {
-          console.error('Error fetching user location:', error);
-        } finally {
-          setLoading(false);
-        }
-      };
-      fetchUserLocation();
-
-      // Cleanup location watch on unmount
-      return () => {
-        if (locationWatchSubscriptionRef.current) {
-          locationWatchSubscriptionRef.current.remove();
-          locationWatchSubscriptionRef.current = null;
-        }
-      };
-    } else {
-      setLoading(false);
+    // Prevent concurrent fetches
+    if (isFetchingLocationRef.current && !forceRefresh) {
+      if (__DEV__) {
+        console.log('Location fetch already in progress, skipping...');
+      }
+      return;
     }
-  }, [showUserLocation, incidentUserLocation, location]);
+
+    isFetchingLocationRef.current = true;
+
+    try {
+      // Check if location services are enabled (especially important on iOS)
+      const servicesEnabled = await ExpoLocation.hasServicesEnabledAsync();
+      if (!servicesEnabled) {
+        console.warn('Location services are disabled. Please enable them in Settings.');
+        setLoading(false);
+        return;
+      }
+
+      // Request permissions first (foreground and background)
+      const permissionResult = await locationService.requestPermissions();
+      if (!permissionResult.granted) {
+        console.warn('Location permission not granted:', permissionResult.message);
+        setLoading(false);
+        return;
+      }
+
+      // Request background permissions if not already requested (for getting location in background)
+      if (!hasRequestedBackgroundPermissionRef.current && Platform.OS === 'android') {
+        try {
+          const { status: backgroundStatus } = await ExpoLocation.requestBackgroundPermissionsAsync();
+          if (backgroundStatus === 'granted') {
+            console.log('Background location permission granted');
+          } else {
+            console.warn('Background location permission denied - location will still work in foreground');
+          }
+          hasRequestedBackgroundPermissionRef.current = true;
+        } catch (bgError) {
+          console.warn('Background permission request failed:', bgError);
+        }
+      } else if (!hasRequestedBackgroundPermissionRef.current && Platform.OS === 'ios') {
+        try {
+          const { status: backgroundStatus } = await ExpoLocation.requestBackgroundPermissionsAsync();
+          if (backgroundStatus === 'granted') {
+            console.log('Background location permission granted on iOS');
+          } else {
+            console.warn('Background location permission denied on iOS - location will still work in foreground');
+          }
+          hasRequestedBackgroundPermissionRef.current = true;
+        } catch (bgError) {
+          console.warn('Background permission request failed on iOS:', bgError);
+        }
+      }
+
+      // Use high accuracy location for exact positioning (works in both foreground and background)
+      // On iOS, request location with best accuracy
+      const currentLocation = await locationService.getHighAccuracyLocation(true);
+      if (currentLocation) {
+        setUserLocation(currentLocation);
+        lastUserLocationRef.current = currentLocation; // Initialize last location
+        
+        // Log location accuracy for debugging
+        if (__DEV__) {
+          console.log('Current user location fetched (foreground/background):', {
+            lat: currentLocation.latitude.toFixed(6),
+            lng: currentLocation.longitude.toFixed(6),
+            platform: Platform.OS,
+            appState: appStateRef.current,
+          });
+        }
+        
+        // Update map region to show both current user and destination locations
+        // If both locations are close, zoom in to show exact location
+        if (destinationLocation && destinationLocation.latitude && destinationLocation.longitude) {
+          const minLat = Math.min(currentLocation.latitude, destinationLocation.latitude);
+          const maxLat = Math.max(currentLocation.latitude, destinationLocation.latitude);
+          const minLng = Math.min(currentLocation.longitude, destinationLocation.longitude);
+          const maxLng = Math.max(currentLocation.longitude, destinationLocation.longitude);
+          const latDelta = (maxLat - minLat) * 1.5;
+          const lngDelta = (maxLng - minLng) * 1.5;
+          
+          // If locations are very close, use tight zoom for exact location
+          // Otherwise, show both locations but still zoomed in
+          const isClose = latDelta < 0.001 && lngDelta < 0.001;
+          const currentRegion = {
+            latitude: (minLat + maxLat) / 2,
+            longitude: (minLng + maxLng) / 2,
+            latitudeDelta: isClose 
+              ? (Platform.OS === 'ios' ? 0.0006 : 0.001) // Zoomed in for exact location
+              : Math.max(latDelta, Platform.OS === 'ios' ? 0.0006 : 0.001), // Still zoomed in
+            longitudeDelta: isClose
+              ? (Platform.OS === 'ios' ? 0.0006 : 0.001) // Zoomed in for exact location
+              : Math.max(lngDelta, Platform.OS === 'ios' ? 0.0006 : 0.001), // Still zoomed in
+          };
+          setMapRegion(currentRegion);
+          setTimeout(() => {
+            if (mapRef.current) {
+              mapRef.current.animateToRegion(currentRegion, 1000);
+            }
+          }, 500);
+        } else {
+          // Only current user location available
+          const currentRegion = {
+            latitude: currentLocation.latitude,
+            longitude: currentLocation.longitude,
+            latitudeDelta: Platform.OS === 'ios' ? 0.004 : 0.01,
+            longitudeDelta: Platform.OS === 'ios' ? 0.004 : 0.01,
+          };
+          setMapRegion(currentRegion);
+          setTimeout(() => {
+            if (mapRef.current) {
+              mapRef.current.animateToRegion(currentRegion, 1000);
+            }
+          }, 500);
+        }
+      } else if (incidentUserLocation) {
+        setUserLocation(incidentUserLocation);
+      }
+
+      // Start watching location changes for real-time updates (works in both foreground and background)
+      // Use iOS-specific settings for better accuracy
+      if (locationWatchSubscriptionRef.current) {
+        locationWatchSubscriptionRef.current.remove();
+      }
+
+      // High-accuracy GPS settings optimized for Nigeria and regions with GPS challenges
+      // Use maximumAge: 0 to prevent cached location data
+      const watchOptions = Platform.OS === 'ios' 
+        ? {
+            accuracy: ExpoLocation.Accuracy.BestForNavigation, // Best accuracy for iOS
+            timeInterval: 2000, // Update every 2 seconds on iOS for real-time tracking
+            distanceInterval: 1, // Update every 1 meter on iOS for precise tracking
+            mayShowUserSettings: false, // Don't show settings dialog
+          }
+        : {
+            accuracy: ExpoLocation.Accuracy.Highest, // Highest accuracy for Android
+            timeInterval: 3000, // Update every 3 seconds on Android (reduced from 5s for better accuracy)
+            distanceInterval: 1, // Update every 1 meter on Android (reduced from 5m for better accuracy)
+            mayShowUserSettings: false, // Don't show settings dialog
+          };
+
+      locationWatchSubscriptionRef.current = await ExpoLocation.watchPositionAsync(
+        watchOptions,
+        (newLocation) => {
+          // Use ref to get current userLocation to avoid closure issues
+          const currentUserLocation = lastUserLocationRef.current;
+          const updatedLocation: Location = {
+            latitude: newLocation.coords.latitude,
+            longitude: newLocation.coords.longitude,
+            address: currentUserLocation?.address, // Preserve address from ref
+          };
+
+          // Check if user has moved significantly (more than 10 meters) to avoid unnecessary updates
+          const MIN_DISTANCE_THRESHOLD = 10; // 10 meters for current user
+          const lastLocation = lastUserLocationRef.current;
+          
+          if (lastLocation) {
+            const distance = calculateDistance(
+              lastLocation.latitude,
+              lastLocation.longitude,
+              updatedLocation.latitude,
+              updatedLocation.longitude
+            );
+
+            // Only update if user has moved significantly
+            if (distance < MIN_DISTANCE_THRESHOLD) {
+              // User hasn't moved significantly, skip update and logging
+              return;
+            }
+          }
+
+          // Update state and ref
+          setUserLocation(updatedLocation);
+          lastUserLocationRef.current = updatedLocation;
+          
+          // Log accuracy for debugging (only when user moves, and less frequently)
+          if (__DEV__) {
+            const distanceMoved = lastLocation 
+              ? calculateDistance(
+                  lastLocation.latitude,
+                  lastLocation.longitude,
+                  updatedLocation.latitude,
+                  updatedLocation.longitude
+                ).toFixed(1)
+              : 'initial';
+            // Only log if moved more than 50 meters to reduce console spam
+            if (!lastLocation || parseFloat(distanceMoved) > 50) {
+            console.log('Location updated (foreground/background):', {
+              lat: updatedLocation.latitude.toFixed(6),
+              lng: updatedLocation.longitude.toFixed(6),
+              accuracy: newLocation.coords.accuracy,
+              distanceMoved: `${distanceMoved}m`,
+              platform: Platform.OS,
+              appState: appStateRef.current,
+            });
+            }
+          }
+        }
+      );
+    } catch (error) {
+      console.error('Error fetching user location:', error);
+    } finally {
+      setLoading(false);
+      isFetchingLocationRef.current = false;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showUserLocation, incidentUserLocation, location, destinationLocation, calculateDistance]);
+
+  // Initial fetch on mount (only once)
+  useEffect(() => {
+    // Don't fetch user location if viewing another user without location_history
+    if (showUserLocation && !hasInitializedLocationRef.current && !(userId && userId !== user?.id && !hasLocationHistory)) {
+      hasInitializedLocationRef.current = true;
+      fetchUserLocation();
+    } else if (!showUserLocation || (userId && userId !== user?.id && !hasLocationHistory)) {
+      // When viewing someone else's location, don't fetch current user's location
+      // Also don't fetch if viewing another user without location_history
+      setLoading(false);
+      hasInitializedLocationRef.current = false; // Reset when showUserLocation changes
+      // Center map on destination location only - zoomed in for exact location
+      // But only if location_history exists
+      if (hasLocationHistory && destinationLocation && destinationLocation.latitude && destinationLocation.longitude) {
+        const region: Region = {
+          latitude: destinationLocation.latitude,
+          longitude: destinationLocation.longitude,
+          latitudeDelta: Platform.OS === 'ios' ? 0.0006 : 0.001, // Zoomed in for exact location
+          longitudeDelta: Platform.OS === 'ios' ? 0.0006 : 0.001, // Zoomed in for exact location
+        };
+        setMapRegion(region);
+        setTimeout(() => {
+          if (mapRef.current) {
+            mapRef.current.animateToRegion(region, 1000);
+          }
+        }, 500);
+      } else if (userId && userId !== user?.id && !hasLocationHistory) {
+        // Set default region when no location_history
+        setMapRegion({
+          latitude: 0,
+          longitude: 0,
+          latitudeDelta: 180,
+          longitudeDelta: 360,
+        });
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showUserLocation, destinationLocation, hasLocationHistory, userId, user?.id]);
+
+  // Handle app state changes (foreground/background) - refresh location when app comes to foreground
+  useEffect(() => {
+    if (!showUserLocation) return;
+
+    const subscription = AppState.addEventListener('change', (nextAppState) => {
+      if (
+        appStateRef.current.match(/inactive|background/) &&
+        nextAppState === 'active'
+      ) {
+        // App has come to the foreground - refresh location
+        console.log('App came to foreground, refreshing location...');
+        fetchUserLocation(true); // Force refresh
+      }
+      appStateRef.current = nextAppState;
+    });
+
+    return () => {
+      subscription.remove();
+    };
+  }, [showUserLocation, fetchUserLocation]);
+
+  // Refresh location when screen comes into focus (e.g., after device unlock or navigation)
+  useFocusEffect(
+    React.useCallback(() => {
+      if (showUserLocation) {
+        // Only fetch if not already initialized or if explicitly needed
+        if (!hasInitializedLocationRef.current) {
+          console.log('MapScreen focused, initializing location...');
+          hasInitializedLocationRef.current = true;
+        fetchUserLocation(true); // Force refresh
+        } else {
+          // Just refresh location without re-initializing subscriptions
+          if (__DEV__) {
+            console.log('MapScreen focused, location already initialized');
+          }
+        }
+      }
+      
+      // Cleanup when screen loses focus
+      return () => {
+        if (locationHistoryIntervalRef.current) {
+          clearInterval(locationHistoryIntervalRef.current);
+          locationHistoryIntervalRef.current = null;
+        }
+        // Don't reset hasInitializedLocationRef here - keep it for the session
+      };
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [showUserLocation])
+  );
+
+  // Save location to history every 10 minutes while on MapScreen
+  const saveLocationToHistory = React.useCallback(async (): Promise<void> => {
+    if (!user?.id || !showUserLocation) return;
+
+    try {
+      // Check if enough time has passed (prevent constant updates)
+      const now = Date.now();
+      const TEN_MINUTES_MS = 10 * 60 * 1000; // 10 minutes
+      if (lastLocationHistorySaveRef.current > 0 && (now - lastLocationHistorySaveRef.current) < TEN_MINUTES_MS) {
+        // Silently skip - don't log to reduce console spam
+        return;
+      }
+
+      // Request permissions if needed
+      const hasPermission = await locationService.checkPermissions();
+      if (!hasPermission) {
+        const permissionResult = await locationService.requestPermissions();
+        if (!permissionResult.granted) {
+          console.warn('Location permission not granted, cannot save to history');
+          return;
+        }
+      }
+
+      // Get current location with high accuracy
+      const currentLocation = await locationService.getHighAccuracyLocation(true);
+      if (!currentLocation || !currentLocation.latitude || !currentLocation.longitude) {
+        console.warn('Could not get location for history save');
+        return;
+      }
+
+      // Get accuracy from location if available
+      let locationAccuracy: number | null = null;
+      try {
+        const locationWithAccuracy = await ExpoLocation.getCurrentPositionAsync({
+          accuracy: Platform.OS === 'ios' ? ExpoLocation.Accuracy.BestForNavigation : ExpoLocation.Accuracy.Highest,
+          maximumAge: 5000, // Allow 5 second old data
+          timeout: 10000,
+        });
+        locationAccuracy = locationWithAccuracy?.coords?.accuracy !== undefined && locationWithAccuracy?.coords?.accuracy !== null
+          ? locationWithAccuracy.coords.accuracy
+          : null;
+      } catch (accuracyError) {
+        // Accuracy is optional, continue without it
+        if (__DEV__) {
+          console.warn('Could not get location accuracy:', accuracyError);
+        }
+      }
+
+      // Get address - try to get it if not already available
+      // Since we're only saving once per 10 minutes, we can try harder to get the address
+      let addressToSave = currentLocation.address;
+      if (!addressToSave) {
+        try {
+          // Try to get address from geocoding (force: true since we only do this once per 10 minutes)
+          addressToSave = await locationService.getAddressFromCoordinates(
+            currentLocation.latitude,
+            currentLocation.longitude,
+            true // Force geocoding since we only save once per 10 minutes
+          );
+          if (__DEV__ && addressToSave) {
+            console.log('Address geocoded for location history:', addressToSave);
+          }
+        } catch (geocodeError) {
+          // Address is optional, continue without it
+          if (__DEV__) {
+            console.warn('Could not geocode address for location history:', geocodeError);
+          }
+        }
+      }
+
+      // Insert into location_history table
+      const { error } = await supabase
+        .from('location_history')
+        .insert({
+          user_id: user.id,
+          latitude: currentLocation.latitude,
+          longitude: currentLocation.longitude,
+          address: addressToSave || null,
+          accuracy: locationAccuracy,
+        });
+
+      if (error) {
+        console.error('Error saving location to history:', error);
+      } else {
+        lastLocationHistorySaveRef.current = Date.now();
+        if (__DEV__) {
+          console.log('✅ Location saved to history from MapScreen:', {
+            lat: currentLocation.latitude.toFixed(6),
+            lng: currentLocation.longitude.toFixed(6),
+            hasAddress: !!addressToSave,
+            address: addressToSave || 'No address',
+            accuracy: locationAccuracy,
+          });
+        }
+      }
+    } catch (error) {
+      console.error('Error in saveLocationToHistory:', error);
+    }
+  }, [user?.id, showUserLocation]);
+
+  // Set up 10-minute interval for location history updates while on MapScreen
+  useEffect(() => {
+    if (!user?.id || !showUserLocation) {
+      // Clear interval if conditions not met
+      if (locationHistoryIntervalRef.current) {
+        clearInterval(locationHistoryIntervalRef.current);
+        locationHistoryIntervalRef.current = null;
+      }
+      return;
+    }
+
+    // Prevent setting up multiple intervals
+    if (locationHistoryIntervalRef.current) {
+      if (__DEV__) {
+        console.log('Location history interval already set up, skipping...');
+      }
+      return;
+    }
+
+    // Save location immediately when screen is focused (only if enough time has passed)
+    const now = Date.now();
+    const TEN_MINUTES_MS = 10 * 60 * 1000; // 10 minutes
+    if (lastLocationHistorySaveRef.current === 0 || (now - lastLocationHistorySaveRef.current) >= TEN_MINUTES_MS) {
+      // Call after a small delay to ensure everything is initialized
+      setTimeout(() => {
+        saveLocationToHistory();
+      }, 1000);
+    }
+
+    // Set up interval to save location every 10 minutes (600000 ms)
+    locationHistoryIntervalRef.current = setInterval(() => {
+      saveLocationToHistory();
+    }, 600000); // 10 minutes
+
+    if (__DEV__) {
+      console.log('✅ Location history interval set up (10 minutes)');
+    }
+
+    // Cleanup on unmount or when conditions change
+    return () => {
+      if (locationHistoryIntervalRef.current) {
+        clearInterval(locationHistoryIntervalRef.current);
+        locationHistoryIntervalRef.current = null;
+        if (__DEV__) {
+          console.log('Location history interval cleared');
+        }
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id, showUserLocation]);
+
+  // Cleanup location watch and real-time subscriptions on unmount
+  useEffect(() => {
+    return () => {
+      if (locationWatchSubscriptionRef.current) {
+        locationWatchSubscriptionRef.current.remove();
+        locationWatchSubscriptionRef.current = null;
+      }
+      if (realtimeChannelRef.current) {
+        supabase.removeChannel(realtimeChannelRef.current);
+        realtimeChannelRef.current = null;
+      }
+      if (connectionsRealtimeChannelRef.current) {
+        supabase.removeChannel(connectionsRealtimeChannelRef.current);
+        connectionsRealtimeChannelRef.current = null;
+      }
+      if (locationHistoryIntervalRef.current) {
+        clearInterval(locationHistoryIntervalRef.current);
+        locationHistoryIntervalRef.current = null;
+      }
+      // Reset initialization flags on unmount
+      hasInitializedLocationRef.current = false;
+      hasInitializedSubscriptionsRef.current = false;
+      isFetchingLocationRef.current = false;
+    };
+  }, []);
 
   const fetchLocationHistory = async (date: Date) => {
-    if (!targetUserId) return;
+    if (!targetUserId) {
+      if (__DEV__) {
+        console.warn('Cannot fetch location history: targetUserId is not set');
+      }
+      setLocationHistory([]);
+      setHistoryLoading(false);
+      return;
+    }
 
     setHistoryLoading(true);
     try {
+      if (__DEV__) {
+        console.log('Fetching location history for user:', targetUserId, 'date:', date.toISOString());
+      }
+
       const startOfDay = new Date(date);
       startOfDay.setHours(0, 0, 0, 0);
       const endOfDay = new Date(date);
@@ -222,10 +635,41 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
       const hoursToFetch = Math.max(hoursSinceStartOfDay, 168);
 
       const allHistory = await locationService.getLocationHistory(targetUserId, hoursToFetch);
+      
+      if (__DEV__) {
+        console.log(`Found ${allHistory.length} total location history entries for user ${targetUserId}`);
+      }
+
+      // Check if any location_history exists at all (not just for selected date)
+      // This is important when viewing another user
+      if (userId && userId !== user?.id) {
+        // Check if location_history exists for this user
+        const lastLocation = await locationService.getLastLocationFromHistory(targetUserId);
+        if (!lastLocation || !lastLocation.latitude || !lastLocation.longitude) {
+          setHasLocationHistory(false);
+          setLocationHistory([]);
+          setHistoryLoading(false);
+          // Also clear destination location since there's no valid location
+          setDestinationLocation({ latitude: 0, longitude: 0 });
+          if (__DEV__) {
+            console.log('No location_history found for connected user');
+          }
+          return;
+        } else {
+          setHasLocationHistory(true);
+          // Update destination location with the last location from history
+          setDestinationLocation(lastLocation);
+        }
+      }
+
       let filteredHistory = allHistory.filter(item => {
         const itemDate = new Date(item.timestamp);
         return itemDate >= startOfDay && itemDate <= endOfDay;
       });
+
+      if (__DEV__) {
+        console.log(`Filtered to ${filteredHistory.length} entries for selected date`);
+      }
 
       filteredHistory.sort((a, b) => 
         new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
@@ -259,20 +703,75 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
       }
 
       setLocationHistory(filteredHistory);
+      
+      if (__DEV__) {
+        if (filteredHistory.length === 0) {
+          console.log('No location history found for selected date. Total entries fetched:', allHistory.length);
+        } else {
+          console.log(`✅ Location history loaded: ${filteredHistory.length} entries`);
+        }
+      }
     } catch (error) {
       console.error('Error fetching location history:', error);
       setLocationHistory([]);
+      // If viewing another user and error occurs, assume no location_history
+      if (userId && userId !== user?.id) {
+        setHasLocationHistory(false);
+        setDestinationLocation({ latitude: 0, longitude: 0 });
+      }
     } finally {
       setHistoryLoading(false);
     }
   };
 
   useEffect(() => {
-    fetchLocationHistory(selectedDate);
-    pendingUpdatesRef.current = [];
-    setPendingUpdatesCount(0);
-  }, [targetUserId, selectedDate]);
+    if (targetUserId) {
+      if (__DEV__) {
+        console.log('Loading location history for targetUserId:', targetUserId);
+      }
+      // Check if viewing another user - if so, check location_history first
+      if (userId && userId !== user?.id) {
+        // Check for location_history before fetching
+        locationService.getLastLocationFromHistory(targetUserId).then((lastLocation) => {
+          if (!lastLocation || !lastLocation.latitude || !lastLocation.longitude) {
+            setHasLocationHistory(false);
+            setDestinationLocation({ latitude: 0, longitude: 0 });
+            setLocationHistory([]);
+            setHistoryLoading(false);
+            setLoading(false); // Set main loading to false
+            if (__DEV__) {
+              console.log('No location_history found for connected user on initial load');
+            }
+          } else {
+            setHasLocationHistory(true);
+            setDestinationLocation(lastLocation);
+            fetchLocationHistory(selectedDate);
+          }
+        }).catch((error) => {
+          console.error('Error checking location_history:', error);
+          setHasLocationHistory(false);
+          setDestinationLocation({ latitude: 0, longitude: 0 });
+          setLocationHistory([]);
+          setHistoryLoading(false);
+          setLoading(false); // Set main loading to false
+        });
+      } else {
+        // Viewing own location or no userId specified
+        setHasLocationHistory(true);
+        fetchLocationHistory(selectedDate);
+      }
+      pendingUpdatesRef.current = [];
+      setPendingUpdatesCount(0);
+    } else {
+      if (__DEV__) {
+        console.warn('targetUserId is not set, cannot fetch location history');
+      }
+      setLocationHistory([]);
+      setHasLocationHistory(true); // Default to true if no targetUserId
+    }
+  }, [targetUserId, selectedDate, userId, user?.id]);
 
+  // Real-time subscription for location_history (for timeline)
   useEffect(() => {
     if (!targetUserId) return;
 
@@ -352,6 +851,194 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
     };
   }, [targetUserId, selectedDate, autoRefreshEnabled]);
 
+  // Real-time subscription for connections table to get live location updates
+  // This watches for location updates from the connected user (works in both foreground and background)
+  useEffect(() => {
+    if (!targetUserId || !user?.id || targetUserId === user.id) {
+      // Clean up if conditions not met
+      if (connectionsRealtimeChannelRef.current) {
+        supabase.removeChannel(connectionsRealtimeChannelRef.current);
+        connectionsRealtimeChannelRef.current = null;
+        hasInitializedSubscriptionsRef.current = false;
+      }
+      return;
+    }
+
+    // Prevent duplicate subscriptions
+    if (hasInitializedSubscriptionsRef.current && connectionsRealtimeChannelRef.current) {
+      if (__DEV__) {
+        console.log('Connections subscription already initialized, skipping...');
+      }
+      return;
+    }
+
+    // Clean up existing subscription
+    if (connectionsRealtimeChannelRef.current) {
+      supabase.removeChannel(connectionsRealtimeChannelRef.current);
+      connectionsRealtimeChannelRef.current = null;
+    }
+
+    // Subscribe to connections table updates for the target user's location
+    // This watches where connected_user_id = targetUserId (location updates from the connected user)
+    const connectionsChannel = supabase
+      .channel(`map_connections_${targetUserId}_${user.id}`)
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'connections',
+          filter: `connected_user_id=eq.${targetUserId}`,
+        },
+        (payload) => {
+          const updatedConnection = payload.new;
+          if (updatedConnection && 
+              updatedConnection.location_latitude && 
+              updatedConnection.location_longitude) {
+            
+            const newLocation: Location = {
+              latitude: updatedConnection.location_latitude,
+              longitude: updatedConnection.location_longitude,
+              address: updatedConnection.location_address || undefined,
+            };
+
+            // Check if user has moved significantly (more than 20 meters) to avoid unnecessary updates
+            const MIN_DISTANCE_THRESHOLD = 20; // 20 meters
+            const lastLocation = lastDestinationLocationRef.current;
+            
+            if (lastLocation) {
+              const distance = calculateDistance(
+                lastLocation.latitude,
+                lastLocation.longitude,
+                newLocation.latitude,
+                newLocation.longitude
+              );
+
+              // Only update if user has moved significantly
+              if (distance < MIN_DISTANCE_THRESHOLD) {
+                // User hasn't moved significantly, skip update and logging
+                return;
+              }
+            }
+
+            // Update destination location in real-time
+            setDestinationLocation(newLocation);
+            lastDestinationLocationRef.current = newLocation;
+
+            // Update map region to show both locations if user location is also available
+            if (userLocation) {
+              const minLat = Math.min(userLocation.latitude, newLocation.latitude);
+              const maxLat = Math.max(userLocation.latitude, newLocation.latitude);
+              const minLng = Math.min(userLocation.longitude, newLocation.longitude);
+              const maxLng = Math.max(userLocation.longitude, newLocation.longitude);
+              const latDelta = (maxLat - minLat) * 1.5;
+              const lngDelta = (maxLng - minLng) * 1.5;
+              setMapRegion({
+                latitude: (minLat + maxLat) / 2,
+                longitude: (minLng + maxLng) / 2,
+                latitudeDelta: Math.max(latDelta, Platform.OS === 'ios' ? 0.001 : 0.002),
+                longitudeDelta: Math.max(lngDelta, Platform.OS === 'ios' ? 0.001 : 0.002),
+              });
+            } else {
+              // Just center on the updated location - zoomed in for exact location
+              const region: Region = {
+                latitude: newLocation.latitude,
+                longitude: newLocation.longitude,
+                latitudeDelta: Platform.OS === 'ios' ? 0.0006 : 0.001, // Zoomed in for exact location
+                longitudeDelta: Platform.OS === 'ios' ? 0.0006 : 0.001, // Zoomed in for exact location
+              };
+              setMapRegion(region);
+            }
+
+            // Animate map to new location only if user moved significantly - zoomed in for exact location
+            if (mapRef.current) {
+              mapRef.current.animateToRegion({
+                latitude: newLocation.latitude,
+                longitude: newLocation.longitude,
+                latitudeDelta: Platform.OS === 'ios' ? 0.0006 : 0.001, // Zoomed in for exact location
+                longitudeDelta: Platform.OS === 'ios' ? 0.0006 : 0.001, // Zoomed in for exact location
+              }, 1000);
+            }
+
+            if (__DEV__) {
+              const distanceMoved = lastLocation 
+                ? calculateDistance(
+                    lastLocation.latitude,
+                    lastLocation.longitude,
+                    newLocation.latitude,
+                    newLocation.longitude
+                  ).toFixed(1)
+                : 'initial';
+              console.log('Live location updated for connected user:', {
+                userId: targetUserId,
+                lat: newLocation.latitude.toFixed(6),
+                lng: newLocation.longitude.toFixed(6),
+                address: newLocation.address || 'no address',
+                distanceMoved: `${distanceMoved}m`,
+                timestamp: updatedConnection.location_updated_at,
+              });
+            }
+          }
+        }
+      )
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') {
+          hasInitializedSubscriptionsRef.current = true;
+          console.log(`✅ Subscribed to live location updates for user: ${targetUserId}`);
+        } else if (status === 'CHANNEL_ERROR') {
+          hasInitializedSubscriptionsRef.current = false;
+          console.error('❌ Error subscribing to connections real-time updates');
+        }
+      });
+
+    connectionsRealtimeChannelRef.current = connectionsChannel;
+
+    // Also fetch initial location from connections table
+    const fetchInitialConnectionLocation = async () => {
+      try {
+        const { data: connectionData } = await supabase
+          .from('connections')
+          .select('location_latitude, location_longitude, location_address, location_updated_at')
+          .eq('user_id', user.id)
+          .eq('connected_user_id', targetUserId)
+          .eq('status', 'connected')
+          .single();
+
+        if (connectionData && 
+            connectionData.location_latitude && 
+            connectionData.location_longitude) {
+          const initialLocation: Location = {
+            latitude: connectionData.location_latitude,
+            longitude: connectionData.location_longitude,
+            address: connectionData.location_address || undefined,
+          };
+          setDestinationLocation(initialLocation);
+          lastDestinationLocationRef.current = initialLocation; // Initialize last location
+          
+          if (__DEV__) {
+            console.log('Initial connection location fetched:', {
+              lat: initialLocation.latitude.toFixed(6),
+              lng: initialLocation.longitude.toFixed(6),
+            });
+          }
+        }
+      } catch (error) {
+        console.warn('Error fetching initial connection location:', error);
+      }
+    };
+
+    fetchInitialConnectionLocation();
+
+      return () => {
+        if (connectionsRealtimeChannelRef.current) {
+          supabase.removeChannel(connectionsRealtimeChannelRef.current);
+          connectionsRealtimeChannelRef.current = null;
+          hasInitializedSubscriptionsRef.current = false;
+        }
+      };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [targetUserId, user?.id]);
+
   const handleManualRefresh = React.useCallback(async () => {
     if (!targetUserId) return;
 
@@ -387,21 +1074,49 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
   );
 
   useEffect(() => {
-    if (userLocation && showUserLocation) {
-      const minLat = Math.min(location.latitude, userLocation.latitude);
-      const maxLat = Math.max(location.latitude, userLocation.latitude);
-      const minLng = Math.min(location.longitude, userLocation.longitude);
-      const maxLng = Math.max(location.longitude, userLocation.longitude);
+    // Don't update map region if viewing another user without location_history
+    if (userId && userId !== user?.id && !hasLocationHistory) {
+      // Set a default region (world view) when no location_history
+      setMapRegion({
+        latitude: 0,
+        longitude: 0,
+        latitudeDelta: 180,
+        longitudeDelta: 360,
+      });
+      return;
+    }
+
+    if (showUserLocation && userLocation) {
+      // Show both current user and destination locations
+      const minLat = Math.min(destinationLocation.latitude, userLocation.latitude);
+      const maxLat = Math.max(destinationLocation.latitude, userLocation.latitude);
+      const minLng = Math.min(destinationLocation.longitude, userLocation.longitude);
+      const maxLng = Math.max(destinationLocation.longitude, userLocation.longitude);
       const latDelta = (maxLat - minLat) * 1.5;
       const lngDelta = (maxLng - minLng) * 1.5;
       setMapRegion({
         latitude: (minLat + maxLat) / 2,
         longitude: (minLng + maxLng) / 2,
-        latitudeDelta: Math.max(latDelta, Platform.OS === 'ios' ? 0.0005 : 0.001),
-        longitudeDelta: Math.max(lngDelta, Platform.OS === 'ios' ? 0.0005 : 0.001),
+        latitudeDelta: Math.max(latDelta, Platform.OS === 'ios' ? 0.001 : 0.002),
+        longitudeDelta: Math.max(lngDelta, Platform.OS === 'ios' ? 0.001 : 0.002),
       });
+    } else if (!showUserLocation && destinationLocation && hasLocationHistory) {
+      // Only show destination location (connected user's location) - zoomed in for exact location
+      const region: Region = {
+        latitude: destinationLocation.latitude,
+        longitude: destinationLocation.longitude,
+        latitudeDelta: Platform.OS === 'ios' ? 0.0006 : 0.001, // Zoomed in for exact location
+        longitudeDelta: Platform.OS === 'ios' ? 0.0006 : 0.001, // Zoomed in for exact location
+      };
+      setMapRegion(region);
+      // Animate map to destination location
+      if (mapRef.current) {
+        setTimeout(() => {
+          mapRef.current?.animateToRegion(region, 1000);
+        }, 500);
+      }
     }
-  }, [userLocation, location, showUserLocation]);
+  }, [userLocation, destinationLocation, showUserLocation, hasLocationHistory, userId, user?.id]);
 
   const polylineCoordinates = useMemo(() => {
     const coordinates = locationHistory.length > 0
@@ -486,18 +1201,6 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
     });
   };
 
-  const calculateDistance = (lat1: number, lon1: number, lat2: number, lon2: number): number => {
-    const R = 6371;
-    const dLat = (lat2 - lat1) * Math.PI / 180;
-    const dLon = (lon2 - lon1) * Math.PI / 180;
-    const a =
-      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-      Math.cos(lat1 * Math.PI / 180) *
-        Math.cos(lat2 * Math.PI / 180) *
-        Math.sin(dLon / 2) * Math.sin(dLon / 2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    return R * c;
-  };
 
   const calculateTimeDiff = (timestamp1: string, timestamp2: string): number => {
     const date1 = new Date(timestamp1);
@@ -549,11 +1252,12 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
   };
 
   const focusOnLocation = React.useCallback((lat: number, lng: number) => {
+    // Zoom in 1x when address/location is pressed to view
     const newRegion: Region = {
       latitude: lat,
       longitude: lng,
-      latitudeDelta: Platform.OS === 'ios' ? 0.0003 : 0.0005,
-      longitudeDelta: Platform.OS === 'ios' ? 0.0003 : 0.0005,
+      latitudeDelta: Platform.OS === 'ios' ? 0.0006 : 0.001, // Zoomed in 1x
+      longitudeDelta: Platform.OS === 'ios' ? 0.0006 : 0.001, // Zoomed in 1x
     };
     mapRef.current?.animateToRegion(newRegion, 500);
     setMapRegion(newRegion);
@@ -562,15 +1266,28 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
   const handleRefreshLocation = async (): Promise<void> => {
     try {
       setLoading(true);
-      // Request permission if needed
+      // Request permission if needed (foreground and background)
       const permissionResult = await locationService.requestPermissions();
       if (!permissionResult.granted) {
         console.warn('Location permission not granted:', permissionResult.message);
         setLoading(false);
         return;
       }
+
+      // Request background permissions if not already requested
+      if (!hasRequestedBackgroundPermissionRef.current) {
+        try {
+          const { status: backgroundStatus } = await ExpoLocation.requestBackgroundPermissionsAsync();
+          if (backgroundStatus === 'granted') {
+            console.log('Background location permission granted');
+          }
+          hasRequestedBackgroundPermissionRef.current = true;
+        } catch (bgError) {
+          console.warn('Background permission request failed:', bgError);
+        }
+      }
       
-      // Get the actual current location with high accuracy
+      // Get the actual current location with high accuracy (works in both foreground and background)
       const exactLocation = await locationService.getHighAccuracyLocation(true);
       
       if (exactLocation) {
@@ -586,8 +1303,8 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
         const exactRegion: Region = {
           latitude: exactLocation.latitude,
           longitude: exactLocation.longitude,
-          latitudeDelta: Platform.OS === 'ios' ? 0.0003 : 0.0005, // Very tight zoom for exact location
-          longitudeDelta: Platform.OS === 'ios' ? 0.0003 : 0.0005,
+          latitudeDelta: Platform.OS === 'ios' ? 0.0006 : 0.001, // Very tight zoom for exact location
+          longitudeDelta: Platform.OS === 'ios' ? 0.0006 : 0.001,
         };
         setMapRegion(exactRegion);
         if (mapRef.current) {
@@ -690,7 +1407,7 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
           showsMyLocationButton={false}
           showsCompass={true}
           showsScale={true}
-          mapType="hybrid"
+          mapType="standard"
           zoomEnabled={true}
           scrollEnabled={true}
           rotateEnabled={true}
@@ -732,59 +1449,28 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
             if (region) setMapRegion(region);
           }}
         >
-          {polylineCoordinates.length > 1 && (
-            <Polyline
-              coordinates={polylineCoordinates}
-              strokeColor="#007AFF"
-              strokeWidth={5}
-              lineCap="round"
-              lineJoin="round"
-            />
-          )}
-          {historyMarkers}
-          {userLocation && (
+          {/* Only show destination marker if location_history exists and location is valid */}
+          {hasLocationHistory && destinationLocation && destinationLocation.latitude !== 0 && destinationLocation.longitude !== 0 && (
             <Marker
-              key={`user-location-${userLocation.latitude}-${userLocation.longitude}`}
-              coordinate={{
-                latitude: userLocation.latitude,
-                longitude: userLocation.longitude,
-              }}
-              title="Your Location"
-              description={userLocation.address || `Your exact location: ${userLocation.latitude.toFixed(6)}, ${userLocation.longitude.toFixed(6)}`}
+              key={`destination-${destinationLocation.latitude}-${destinationLocation.longitude}`}
+              coordinate={destinationLocation}
+              title={title || 'Location'}
+              description={destinationLocation.address || `${destinationLocation.latitude.toFixed(6)}, ${destinationLocation.longitude.toFixed(6)}`}
               anchor={{ x: 0.5, y: 0.5 }}
               tracksViewChanges={tracksViewChanges}
               flat={false}
-              zIndex={1000}
+              zIndex={999}
               onPress={() => {
-                focusOnLocation(userLocation.latitude, userLocation.longitude);
+                focusOnLocation(destinationLocation.latitude, destinationLocation.longitude);
               }}
             >
-              <View style={styles.userLocationPin} pointerEvents="none" collapsable={false}>
-                <View style={styles.userLocationPinHead} collapsable={false}>
+              <View style={styles.destinationPin} pointerEvents="none" collapsable={false}>
+                <View style={styles.destinationPinHead} collapsable={false}>
                   <Ionicons name="location" size={20} color="#FFFFFF" />
                 </View>
               </View>
             </Marker>
           )}
-          <Marker
-            key={`destination-${location.latitude}-${location.longitude}`}
-            coordinate={location}
-            title={title || 'Location'}
-            description={location.address || `${location.latitude.toFixed(6)}, ${location.longitude.toFixed(6)}`}
-            anchor={{ x: 0.5, y: 0.5 }}
-            tracksViewChanges={tracksViewChanges}
-            flat={false}
-            zIndex={999}
-            onPress={() => {
-              focusOnLocation(location.latitude, location.longitude);
-            }}
-          >
-            <View style={styles.destinationPin} pointerEvents="none" collapsable={false}>
-              <View style={styles.destinationPinHead} collapsable={false}>
-                <Ionicons name="location" size={20} color="#FFFFFF" />
-              </View>
-            </View>
-          </Marker>
         </MapView>
         
         <TouchableOpacity
@@ -820,10 +1506,21 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
             </Text>
           </View>
         )}
+        
+        {/* Show error message when viewing another user and they have no location_history */}
+        {userId && userId !== user?.id && !hasLocationHistory && !historyLoading && (
+          <View style={styles.mapErrorContainer}>
+            <Ionicons name="location-off" size={32} color="#FF3B30" />
+            <Text style={styles.mapErrorText}>Location Not Available</Text>
+            <Text style={styles.mapErrorSubtext}>
+              {title || 'User'}'s location is not available. Location sharing might be turned off.
+            </Text>
+          </View>
+        )}
       </View>
 
-      {/* Date Selector Card */}
-      {targetUserId && (
+      {/* Date Selector Card - Only show if location_history exists */}
+      {targetUserId && hasLocationHistory && (
         <View style={styles.dateCard}>
           <TouchableOpacity
             style={styles.dateNavButton}
@@ -853,8 +1550,8 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
         </View>
       )}
 
-      {/* Timeline List */}
-      {targetUserId && (
+      {/* Timeline List - Only show if location_history exists */}
+      {targetUserId && hasLocationHistory && (
         <ScrollView 
           style={styles.timelineContainer}
           showsVerticalScrollIndicator={true}
@@ -895,7 +1592,7 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
                   ? calculateTimeDiff(prevItem.timestamp, item.timestamp)
                   : 0;
 
-                const isActivity = prevItem && distance > 0.01;
+                const isActivity = prevItem && distance > 10; // 10 meters in meters (was 0.01 km)
                 const isSelected = selectedHistoryItem === index;
                 
                 return (
@@ -943,11 +1640,11 @@ export default function MapScreen({ route, navigation }: MapScreenProps) {
                               <View style={styles.statItem}>
                                 <Ionicons name="resize" size={14} color="#8E8E93" />
                                 <Text style={styles.statText}>
-                                  {distance < 0.001 
+                                  {distance < 1 
                                     ? '< 1 m' 
-                                    : distance < 1 
-                                      ? `${(distance * 1000).toFixed(0)} m`
-                                      : `${distance.toFixed(2)} km`}
+                                    : distance < 1000 
+                                      ? `${distance.toFixed(0)} m`
+                                      : `${(distance / 1000).toFixed(2)} km`}
                                 </Text>
                               </View>
                               <View style={styles.statItem}>

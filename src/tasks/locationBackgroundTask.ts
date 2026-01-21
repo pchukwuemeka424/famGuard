@@ -48,6 +48,24 @@ TaskManager.defineTask(LOCATION_TASK_NAME, async ({ data, error }) => {
         console.warn('Background geocoding failed:', geocodeError);
       }
 
+      // Validate coordinates before processing (backend filtering)
+      const isValidCoordinate = (lat: number, lng: number): boolean => {
+        if (typeof lat !== 'number' || typeof lng !== 'number') return false;
+        if (lat < -90 || lat > 90) return false;
+        if (lng < -180 || lng > 180) return false;
+        // Filter out common invalid GPS readings (0,0 or near 0,0)
+        if (Math.abs(lat) < 0.0001 && Math.abs(lng) < 0.0001) return false;
+        return true;
+      };
+
+      if (!isValidCoordinate(locationData.latitude, locationData.longitude)) {
+        console.warn('Background location: Invalid coordinates detected, skipping:', {
+          lat: locationData.latitude,
+          lng: locationData.longitude,
+        });
+        return; // Don't process invalid coordinates
+      }
+
       // Get user ID and family group ID from AsyncStorage
       try {
         const userId = await AsyncStorage.getItem('location_tracking_userId');
@@ -80,56 +98,87 @@ TaskManager.defineTask(LOCATION_TASK_NAME, async ({ data, error }) => {
 
         const member = members && members.length > 0 ? members[0] : null;
 
-        // Save to location_history based on user's frequency setting
-        // This ensures we have complete location tracking even if family_members update fails
+        // Save to location_history every 30 minutes (fixed interval for background/closed app)
+        // This ensures consistent location tracking when app is closed or in background
         try {
-          // Load user's location update frequency setting
-          let locationUpdateFrequencyMinutes = 60; // Default 60 minutes
-          const { data: settingsData, error: settingsError } = await supabase
-            .from('user_settings')
-            .select('location_update_frequency_minutes')
-            .eq('user_id', userId)
-            .single();
-
-          if (!settingsError && settingsData) {
-            locationUpdateFrequencyMinutes = settingsData.location_update_frequency_minutes || 60;
-          }
+          // Fixed 30-minute interval for background/closed app location tracking
+          const LOCATION_UPDATE_INTERVAL_MINUTES = 30;
+          const frequencyMs = LOCATION_UPDATE_INTERVAL_MINUTES * 60 * 1000; // 30 minutes in milliseconds
 
           // Check if enough time has passed since last insert
           const lastInsertKey = `location_history_last_insert_${userId}`;
           const lastInsertTimeStr = await AsyncStorage.getItem(lastInsertKey);
           const lastInsertTime = lastInsertTimeStr ? parseInt(lastInsertTimeStr, 10) : 0;
           const now = Date.now();
-          const frequencyMs = locationUpdateFrequencyMinutes * 60 * 1000; // Convert minutes to milliseconds
           const timeSinceLastInsert = now - lastInsertTime;
 
           if (lastInsertTime > 0 && timeSinceLastInsert < frequencyMs) {
             // Not enough time has passed, skip insert
             const minutesRemaining = Math.ceil((frequencyMs - timeSinceLastInsert) / (60 * 1000));
             if (__DEV__) {
-              console.log(`Skipping background location history insert - ${minutesRemaining} minutes remaining (frequency: ${locationUpdateFrequencyMinutes} minutes)`);
+              console.log(`Skipping background location history insert - ${minutesRemaining} minutes remaining (30-minute interval)`);
             }
           } else {
-            // Insert into location_history
+            // ALWAYS insert new row into location_history - NEVER update existing rows
+            // This creates a complete history of location updates
+            // Get accuracy from location object - 0 is a valid value, only use null if undefined
+            const locationAccuracy = location.coords?.accuracy !== undefined && location.coords?.accuracy !== null 
+              ? location.coords.accuracy 
+              : null;
+            
+            // IMPORTANT: Always use .insert() - never use .update() for location_history
+            // Each location update creates a new row with a new timestamp
             const { error: historyError } = await supabase
               .from('location_history')
               .insert({
                 user_id: userId,
                 latitude: locationData.latitude,
                 longitude: locationData.longitude,
-                address: locationData.address || null,
+                address: locationData.address || null, // Keep null if no address (don't update to empty)
+                accuracy: locationAccuracy, // Include accuracy (0 is valid, only null if undefined)
               });
 
             if (historyError) {
-              console.warn('Error saving location history in background:', historyError);
+              console.warn('Error inserting location history in background (insert only, never update):', historyError);
             } else {
-              // Update last insert timestamp
+              // Update last insert timestamp in AsyncStorage (this is just for tracking, not database update)
               await AsyncStorage.setItem(lastInsertKey, now.toString());
-              console.log(`Background location saved to history (frequency: ${locationUpdateFrequencyMinutes} minutes)`);
+              if (__DEV__) {
+                console.log(`Background location inserted into history (new row created, 30-minute interval)`);
+              }
             }
           }
         } catch (historyErr) {
           console.warn('Error in saveLocationHistory (background):', historyErr);
+        }
+
+        // Update connections table for real-time location sharing (if location sharing is enabled)
+        if (shareLocation) {
+          try {
+            const { error: connectionsError } = await supabase
+              .from('connections')
+              .update({
+                location_latitude: locationData.latitude,
+                location_longitude: locationData.longitude,
+                location_address: locationData.address || null,
+                location_updated_at: new Date().toISOString(),
+              })
+              .eq('connected_user_id', userId)
+              .eq('status', 'connected');
+
+            if (connectionsError) {
+              console.warn('Error updating connections table in background:', connectionsError);
+            } else {
+              if (__DEV__) {
+                console.log('Background location updated in connections table:', {
+                  lat: locationData.latitude.toFixed(6),
+                  lng: locationData.longitude.toFixed(6),
+                });
+              }
+            }
+          } catch (connectionsErr) {
+            console.warn('Error updating connections in background:', connectionsErr);
+          }
         }
 
         // Update family_members table (if member exists)
@@ -151,10 +200,12 @@ TaskManager.defineTask(LOCATION_TASK_NAME, async ({ data, error }) => {
           if (updateError) {
             console.error('Error updating location in background:', updateError);
           } else {
-            console.log('Background location updated:', {
-              lat: locationData.latitude.toFixed(6),
-              lng: locationData.longitude.toFixed(6),
-            });
+            if (__DEV__) {
+              console.log('Background location updated in family_members:', {
+                lat: locationData.latitude.toFixed(6),
+                lng: locationData.longitude.toFixed(6),
+              });
+            }
           }
         } else {
           console.warn('Background location update: Family member not found (but history was saved)');

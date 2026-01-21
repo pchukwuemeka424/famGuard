@@ -6,7 +6,7 @@ import './src/utils/warningSuppression';
 import './src/tasks/locationBackgroundTask';
 
 import React, { useEffect, useRef, useState } from 'react';
-import { View, Text, ActivityIndicator, LogBox } from 'react-native';
+import { View, Text, ActivityIndicator, LogBox, AppState, AppStateStatus } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
 import { createStackNavigator } from '@react-navigation/stack';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
@@ -285,12 +285,44 @@ export default function App() {
 
 function AppContent({ onReady }: { onReady: () => void }) {
   const { loading } = useAuth();
+  const appStateRef = useRef<AppStateStatus>(AppState.currentState);
 
   useEffect(() => {
     if (!loading) {
       onReady();
     }
   }, [loading, onReady]);
+
+  // Handle app state changes (foreground/background/closed)
+  // NOTE: Location reinitialization is handled by HomeScreen and ConnectionContext
+  // We only log the state change here to avoid duplicate location access that causes iOS crashes
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (nextAppState) => {
+      const previousState = appStateRef.current;
+      appStateRef.current = nextAppState;
+
+      // App is going to background or inactive
+      if (nextAppState.match(/inactive|background/)) {
+        console.log('App going to background/inactive');
+        // Background location task should continue running
+        // Real-time subscriptions will pause but reconnect when app comes back
+      }
+
+      // App is coming to foreground (from background or after being closed)
+      if (
+        previousState.match(/inactive|background/) &&
+        nextAppState === 'active'
+      ) {
+        console.log('App coming to foreground');
+        // Location updates are handled by HomeScreen and ConnectionContext
+        // to avoid duplicate location access that crashes iOS
+      }
+    });
+
+    return () => {
+      subscription.remove();
+    };
+  }, []);
 
   // Show loading screen while checking auth state
   if (loading) {

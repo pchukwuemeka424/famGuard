@@ -117,23 +117,71 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
 
     let isMounted = true;
     let locationUpdateInterval: NodeJS.Timeout | null = null;
+    let initDelayTimeout: NodeJS.Timeout | null = null;
     const ONE_HOUR_MS = 3600000; // 1 hour in milliseconds
 
     // Start real-time location tracking
     const startLocationTracking = async () => {
       try {
+        // iOS-specific: Check if location services are enabled first
+        if (Platform.OS === 'ios') {
+          try {
+            const servicesEnabled = await ExpoLocation.hasServicesEnabledAsync();
+            if (!servicesEnabled) {
+              console.warn('iOS: Location services are disabled');
+              return;
+            }
+          } catch (error) {
+            console.warn('iOS: Error checking location services:', error);
+            // Continue anyway
+          }
+        }
+
         const hasPermission = await locationService.checkPermissions();
         if (!hasPermission) {
           console.warn('Location permission not granted for real-time tracking');
           return;
         }
 
-        // Get initial location and save to history (inserts if first time, updates if exists)
+        // Check if component is still mounted before proceeding
+        if (!isMounted) return;
+
+        // Get initial location with high-accuracy GPS and save to history
         // Permission already checked above, so pass true to allow location access
-        const initialLocation = await locationService.getHighAccuracyLocation(true);
+        let initialLocation = null;
+        try {
+          initialLocation = await locationService.getHighAccuracyLocation(true);
+        } catch (error) {
+          console.error('Error getting initial location:', error);
+          return;
+        }
+
         if (initialLocation && isMounted) {
-          // Will insert if no entry exists, or update if entry already exists
-          await locationService.saveLocationToHistory(user.id, initialLocation);
+          // Get accuracy from GPS for initial location
+          let initialAccuracy: number | null = null;
+          try {
+            const locationWithAccuracy = await ExpoLocation.getCurrentPositionAsync({
+              accuracy: Platform.OS === 'ios' ? ExpoLocation.Accuracy.BestForNavigation : ExpoLocation.Accuracy.Highest,
+              maximumAge: 0, // Force fresh location
+              timeout: 20000,
+            });
+            initialAccuracy = locationWithAccuracy?.coords?.accuracy !== undefined && locationWithAccuracy?.coords?.accuracy !== null
+              ? locationWithAccuracy.coords.accuracy
+              : null;
+          } catch (error) {
+            console.warn('Could not get accuracy for initial location:', error);
+          }
+
+          // Check if component is still mounted
+          if (!isMounted) return;
+          
+          // Will insert if no entry exists, or update if entry already exists, with accuracy
+          try {
+            await locationService.saveLocationToHistory(user.id, initialLocation, false, initialAccuracy);
+          } catch (error) {
+            console.error('Error saving initial location to history:', error);
+          }
+
           updateUserLocationDebounced(initialLocation);
           
           // Trigger incident proximity check after initial location is saved
@@ -142,11 +190,11 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
           });
           
           if (__DEV__) {
-            console.log('Initial location saved to history');
+            console.log('Initial location saved to history with accuracy:', initialAccuracy);
           }
         }
 
-        // Set up periodic update every 1 hour - always UPDATE the existing row
+        // Set up periodic update every 1 hour - use high-accuracy GPS
         locationUpdateInterval = setInterval(async () => {
           if (!isMounted || !locationSharingEnabled) {
             return;
@@ -154,10 +202,27 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
 
           try {
             // Permission already granted when location sharing was enabled
-            const currentLocation = await locationService.getCurrentLocation(true);
+            // Use high-accuracy GPS for periodic updates
+            const currentLocation = await locationService.getHighAccuracyLocation(true);
             if (currentLocation) {
-              // Will update existing row or insert if doesn't exist
-              await locationService.saveLocationToHistory(user.id, currentLocation);
+              // Get accuracy from GPS for better tracking
+              let locationAccuracy: number | null = null;
+              try {
+                const locationWithAccuracy = await ExpoLocation.getCurrentPositionAsync({
+                  accuracy: Platform.OS === 'ios' ? ExpoLocation.Accuracy.BestForNavigation : ExpoLocation.Accuracy.Highest,
+                  maximumAge: 5000,
+                  timeout: 10000,
+                });
+                locationAccuracy = locationWithAccuracy?.coords?.accuracy !== undefined && locationWithAccuracy?.coords?.accuracy !== null
+                  ? locationWithAccuracy.coords.accuracy
+                  : null;
+              } catch (error) {
+                // If we can't get accuracy, continue without it
+                console.warn('Could not get accuracy for periodic update:', error);
+              }
+              
+              // Will update existing row or insert if doesn't exist, with accuracy
+              await locationService.saveLocationToHistory(user.id, currentLocation, false, locationAccuracy);
               updateUserLocationDebounced(currentLocation);
               
               // Trigger incident proximity check after location update
@@ -166,7 +231,7 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
               });
               
               if (__DEV__) {
-                console.log('Location history updated (hourly update)');
+                console.log('Location history updated (hourly update) with accuracy:', locationAccuracy);
               }
             }
           } catch (error) {
@@ -174,12 +239,15 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
           }
         }, ONE_HOUR_MS);
 
-        // Start watching location changes for UI updates (but don't save to history)
+        // Start watching location changes for UI updates with high-accuracy GPS
+        // Use best accuracy settings for real-time tracking
         const subscription = await ExpoLocation.watchPositionAsync(
           {
-            accuracy: ExpoLocation.Accuracy.High,
-            timeInterval: 60000, // Check every minute for UI updates
-            distanceInterval: 10, // Update UI if moved 10 meters
+            accuracy: Platform.OS === 'ios' 
+              ? ExpoLocation.Accuracy.BestForNavigation 
+              : ExpoLocation.Accuracy.Highest, // High-accuracy GPS for real-time updates
+            timeInterval: 30000, // Check every 30 seconds for UI updates (reduced from 60s)
+            distanceInterval: 5, // Update UI if moved 5 meters (reduced from 10m for better accuracy)
           },
           async (location) => {
             if (!isMounted) return;
@@ -189,8 +257,17 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
               longitude: location.coords.longitude,
             };
 
-            // Update UI location only (not saving to history here)
+            // Update UI location only (not saving to history here - that's handled by locationService)
+            // Real-time subscription will update UI when location_history is updated
             updateUserLocationDebounced(newLocation);
+            
+            if (__DEV__) {
+              console.log('Real-time location update:', {
+                lat: newLocation.latitude.toFixed(6),
+                lng: newLocation.longitude.toFixed(6),
+                accuracy: location.coords.accuracy,
+              });
+            }
           }
         );
 
@@ -237,14 +314,15 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
                 address: updatedLocation.address || undefined,
               };
 
-              // Update UI with the new location from database
+              // Update UI with the new location from database (real-time subscription)
               updateUserLocationDebounced(newLocation);
 
               if (__DEV__) {
-                console.log('Location history updated via real-time:', {
+                console.log('Location history updated via real-time (UPDATE):', {
                   latitude: newLocation.latitude,
                   longitude: newLocation.longitude,
                   address: newLocation.address,
+                  accuracy: updatedLocation.accuracy,
                 });
               }
             }
@@ -269,14 +347,15 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
                 address: newEntry.address || undefined,
               };
 
-              // Update UI with the new location from database
+              // Update UI with the new location from database (real-time subscription)
               updateUserLocationDebounced(newLocation);
 
               if (__DEV__) {
-                console.log('Location history inserted via real-time:', {
+                console.log('Location history inserted via real-time (INSERT):', {
                   latitude: newLocation.latitude,
                   longitude: newLocation.longitude,
                   address: newLocation.address,
+                  accuracy: newEntry.accuracy,
                 });
               }
             }
@@ -299,7 +378,19 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
       locationHistoryChannelRef.current = channel;
     };
 
-    startLocationTracking();
+    // iOS-specific: Add a small delay before starting location tracking
+    // This prevents race conditions when the app reopens and multiple components
+    // try to access location simultaneously
+    if (Platform.OS === 'ios') {
+      initDelayTimeout = setTimeout(() => {
+        if (isMounted) {
+          startLocationTracking();
+        }
+      }, 1500); // 1.5 second delay on iOS to prevent crashes
+    } else {
+      startLocationTracking();
+    }
+    
     setupLocationHistorySubscription();
     
     // Start periodic incident proximity checking
@@ -307,6 +398,13 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
 
     return () => {
       isMounted = false;
+      
+      // Clear the init delay timeout if still pending
+      if (initDelayTimeout) {
+        clearTimeout(initDelayTimeout);
+        initDelayTimeout = null;
+      }
+      
       // Stop periodic incident proximity checking
       incidentProximityService.stopPeriodicChecking();
       if (locationWatchSubscriptionRef.current) {
@@ -415,7 +513,7 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
           }
         }
 
-        // Get initial location only after permission is granted
+        // Get initial location with high-accuracy GPS only after permission is granted
         setLocationLoading(true);
         const initialLocation = await locationService.getHighAccuracyLocation(true); // Request permission if needed
         if (!initialLocation) {
@@ -429,17 +527,32 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
           return;
         }
 
+        // Get accuracy from GPS for high-accuracy tracking
+        let locationAccuracy: number | null = null;
+        try {
+          const locationWithAccuracy = await ExpoLocation.getCurrentPositionAsync({
+            accuracy: Platform.OS === 'ios' ? ExpoLocation.Accuracy.BestForNavigation : ExpoLocation.Accuracy.Highest,
+            maximumAge: 0, // Force fresh location
+            timeout: 20000, // Wait up to 20 seconds for accurate GPS
+          });
+          locationAccuracy = locationWithAccuracy?.coords?.accuracy !== undefined && locationWithAccuracy?.coords?.accuracy !== null
+            ? locationWithAccuracy.coords.accuracy
+            : null;
+        } catch (error) {
+          console.warn('Could not get accuracy when toggling location:', error);
+        }
+
         // Update UI with initial location
         updateUserLocationDebounced(initialLocation);
         lastLocationRef.current = initialLocation;
         setLocationLoading(false);
 
-        // Save location to location_history table (inserts if first time, updates if exists)
+        // Save location to location_history table with high-accuracy GPS data
         if (user?.id && initialLocation) {
           try {
-            // Will insert if no entry exists, or update if entry already exists
-            await locationService.saveLocationToHistory(user.id, initialLocation);
-            console.log('Location saved to history table');
+            // Will insert if no entry exists, or update if entry already exists, with accuracy
+            await locationService.saveLocationToHistory(user.id, initialLocation, false, locationAccuracy);
+            console.log('Location saved to history table with accuracy:', locationAccuracy);
           } catch (error) {
             console.error('Error saving location to history:', error);
             // Don't block the toggle if history save fails
@@ -500,18 +613,22 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
         return;
       }
 
-      // Get the last known location
+      // Get the last known location as fallback
       let locationToUse = lastLocationRef.current || userLocation;
       
-      // Try to get current location if available, otherwise use last known
-      // Don't request permission here - use last known location if permission not granted
+      // For emergency SMS, use HIGH-ACCURACY GPS to ensure precise location
+      // Request permission if needed - this is an emergency situation
       try {
-        const currentLocation = await locationService.getCurrentLocation(false);
+        // Use high-accuracy GPS for emergency SMS - most precise location possible
+        const currentLocation = await locationService.getHighAccuracyLocation(true);
         if (currentLocation) {
           locationToUse = currentLocation;
+          console.log('Emergency SMS: High-accuracy location retrieved');
+        } else {
+          console.log('Emergency SMS: Using last known location (high-accuracy unavailable)');
         }
       } catch (error) {
-        console.log('Using last known location for offline emergency');
+        console.log('Emergency SMS: Using last known location (error getting high-accuracy GPS):', error);
       }
 
       // Format location message
@@ -686,8 +803,9 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
             style: 'destructive',
             onPress: async () => {
               try {
-                // Request permission for emergency - this is user-initiated
-                const currentLocation = await locationService.getCurrentLocation(true);
+                // Request permission for emergency - use HIGH-ACCURACY GPS for emergency situations
+                // This ensures the most precise location is sent during emergencies
+                const currentLocation = await locationService.getHighAccuracyLocation(true);
                 if (!currentLocation) {
                   Alert.alert(
                     'Location Error',
@@ -907,6 +1025,17 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
                 const failed = 0;
 
                 if (successful > 0) {
+                  // Start emergency high-accuracy GPS tracking (every 15 minutes, stops when unlocked)
+                  if (user?.id) {
+                    try {
+                      await locationService.startEmergencyHighAccuracyTracking(user.id);
+                      console.log('Emergency high-accuracy GPS tracking started (every 15 minutes)');
+                    } catch (error) {
+                      console.error('Error starting emergency high-accuracy GPS tracking:', error);
+                      // Don't fail the alert if tracking fails to start
+                    }
+                  }
+
                   // Start SOS location tracking (every 3 seconds, circular buffer of 5 rows)
                   if (user?.id) {
                     try {

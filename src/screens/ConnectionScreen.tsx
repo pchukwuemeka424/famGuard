@@ -29,7 +29,6 @@ import { useAuth } from '../context/AuthContext';
 import { useConnection } from '../context/ConnectionContext';
 import { supabase } from '../lib/supabase';
 import { locationService } from '../services/locationService';
-import { formatLastSeen, getStatusColor, getStatusIcon, type LastSeenInfo } from '../utils/lastSeenFormatter';
 import type { MainTabParamList, RootStackParamList, Connection, ConnectionInvitation } from '../types';
 
 type ConnectionScreenNavigationProp = CompositeNavigationProp<
@@ -1524,105 +1523,7 @@ export default function ConnectionScreen({ navigation }: ConnectionScreenProps) 
     };
   };
 
-  const getLastSeenInfo = (connection: Connection) => {
-    const lastSeenTimestamp = connection.locationUpdatedAt || connection.updatedAt || connection.createdAt;
-    const lastSeenInfo: LastSeenInfo = {
-      timestamp: lastSeenTimestamp,
-      location: connection.location ? {
-        latitude: connection.location.latitude,
-        longitude: connection.location.longitude,
-        address: connection.location.address,
-      } : undefined,
-      isOnline: getConnectionStatus(connection).isOnline,
-      batteryLevel: undefined, // Battery level not available in Connection type
-    };
-    return formatLastSeen(lastSeenInfo);
-  };
 
-  const isOfflineMoreThan3Days = (connection: Connection): boolean => {
-    const lastSeenTimestamp = connection.locationUpdatedAt || connection.updatedAt || connection.createdAt;
-    const lastSeenTime = new Date(lastSeenTimestamp).getTime();
-    const now = Date.now();
-    const threeDaysInMs = 3 * 24 * 60 * 60 * 1000; // 3 days in milliseconds
-    return (now - lastSeenTime) > threeDaysInMs;
-  };
-
-  const sendQuickMessage = async (connection: Connection): Promise<void> => {
-    if (!user?.id) return;
-
-    try {
-      const senderName = user.name || 'Someone';
-      const recipientName = connection.connectedUserName || 'Friend';
-      const message = `Hi ${recipientName}, I haven't seen you online in a while. Are you okay? Please update your location when you see this.`;
-
-      // Create notification
-      const { data: notification, error: notificationError } = await supabase
-        .from('notifications')
-        .insert({
-          user_id: connection.connectedUserId,
-          title: `💬 Quick Message from ${senderName}`,
-          body: message,
-          type: 'general',
-          data: {
-            type: 'quick_message',
-            senderId: user.id,
-            senderName: senderName,
-            connectionId: connection.id,
-            requiresLocationUpdate: true, // Flag to trigger location update when read
-          },
-          read: false,
-        })
-        .select()
-        .single();
-
-      if (notificationError) {
-        console.error('Error creating notification:', notificationError);
-        Alert.alert('Error', 'Failed to send message. Please try again.');
-        return;
-      }
-
-      // Send push notification
-      try {
-        const { data: pushResult, error: pushError } = await supabase.functions.invoke(
-          'send-push-notification',
-          {
-            body: {
-              user_ids: [connection.connectedUserId],
-              title: `💬 Quick Message from ${senderName}`,
-              body: message,
-              data: {
-                type: 'quick_message',
-                notificationId: notification.id,
-                senderId: user.id,
-                senderName: senderName,
-                connectionId: connection.id,
-                requiresLocationUpdate: true,
-              },
-            },
-          }
-        );
-
-        if (pushError) {
-          console.error('Error sending push notification:', pushError);
-          // Still show success since notification was created
-        } else {
-          console.log('Push notification sent:', pushResult);
-        }
-      } catch (pushError) {
-        console.error('Exception sending push notification:', pushError);
-        // Still show success since notification was created
-      }
-
-      Alert.alert(
-        'Message Sent',
-        `Your message has been sent to ${recipientName}. They will receive a notification and their location will be updated when they read it.`,
-        [{ text: 'OK' }]
-      );
-    } catch (error) {
-      console.error('Error sending quick message:', error);
-      Alert.alert('Error', 'Failed to send message. Please try again.');
-    }
-  };
 
   const toggleLocationSharing = async (connectionId: string, connectedUserId: string, connectedUserName: string, currentValue: boolean): Promise<void> => {
     if (!user?.id) return;
@@ -1936,7 +1837,6 @@ export default function ConnectionScreen({ navigation }: ConnectionScreenProps) 
                 }
                 
                 const displayName = connection.connectedUserName || 'Unknown User';
-                const lastSeenData = getLastSeenInfo(connection);
                 
                 return (
                   <View
@@ -2000,53 +1900,48 @@ export default function ConnectionScreen({ navigation }: ConnectionScreenProps) 
                             </Text>
                           </View>
                         )}
-                        
-                        {/* Last Seen Information - Below Name */}
-                        <View style={styles.lastSeenContainer}>
-                          <View style={styles.lastSeenRow}>
-                            <View style={[styles.lastSeenStatusIndicator, { backgroundColor: getStatusColor(lastSeenData.status) }]} />
-                            <Text style={[
-                              styles.lastSeenText,
-                              lastSeenData.isUrgent && styles.lastSeenTextUrgent
-                            ]}>
-                              {lastSeenData.primaryText}
-                            </Text>
-                          </View>
-                          {lastSeenData.secondaryText && (
-                            <Text style={styles.lastSeenSecondary} numberOfLines={1}>
-                              {lastSeenData.secondaryText}
-                            </Text>
-                          )}
-                          <TouchableOpacity
-                            onPress={() => {
-                              Alert.alert(
-                                'Last Seen Details',
-                                `${lastSeenData.fullDateTime}\n\n${lastSeenData.exactTime}\n${lastSeenData.relativeTime}`,
-                                [{ text: 'OK' }]
-                              );
-                            }}
-                            activeOpacity={0.7}
-                          >
-                            <Text style={styles.lastSeenDetailLink}>
-                              {lastSeenData.exactTime}
-                            </Text>
-                          </TouchableOpacity>
-                        </View>
                       </View>
                     </View>
 
                     {/* Action Buttons - Full Width */}
                     <View style={styles.actionButtonsContainer}>
-                      {connection.locationSharingEnabled && connection.location && (
+                      {connection.locationSharingEnabled && (
                         <TouchableOpacity
                           style={styles.mapButtonFullWidth}
-                          onPress={() => {
-                            if (connection.location) {
+                          onPress={async () => {
+                            try {
+                              // Priority 1: Get the last inserted location from location_history
+                              // This is the most recent location that was actually saved
+                              const locationFromHistory = await locationService.getLastLocationFromHistory(connection.connectedUserId);
+                              
+                              // If no location_history exists, navigate to MapScreen with null location
+                              // MapScreen will show error message and hide current user location
+                              if (!locationFromHistory || !locationFromHistory.latitude || !locationFromHistory.longitude) {
+                                // Navigate with a default location (will be handled by MapScreen to show error)
+                                navigation.navigate('MapView', {
+                                  location: { latitude: 0, longitude: 0 }, // Dummy location, will be ignored
+                                  title: connection.connectedUserName,
+                                  showUserLocation: false, // Don't show current user's location when viewing connected user
+                                  userId: connection.connectedUserId, // This is the target user we want to view
+                                });
+                                return;
+                              }
+                              
+                              // If location_history exists, navigate with that location
                               navigation.navigate('MapView', {
-                                location: connection.location,
+                                location: locationFromHistory,
                                 title: connection.connectedUserName,
-                                showUserLocation: true,
-                                userId: connection.connectedUserId,
+                                showUserLocation: false, // Don't show current user's location when viewing connected user
+                                userId: connection.connectedUserId, // This is the target user we want to view
+                              });
+                            } catch (error) {
+                              console.error('Error getting location:', error);
+                              // Navigate anyway - MapScreen will check and show error if needed
+                              navigation.navigate('MapView', {
+                                location: { latitude: 0, longitude: 0 }, // Dummy location, will be ignored
+                                title: connection.connectedUserName,
+                                showUserLocation: false, // Don't show current user's location when viewing connected user
+                                userId: connection.connectedUserId, // This is the target user we want to view
                               });
                             }
                           }}
@@ -2054,31 +1949,6 @@ export default function ConnectionScreen({ navigation }: ConnectionScreenProps) 
                         >
                           <Ionicons name="map" size={18} color="#FFFFFF" />
                           <Text style={styles.mapButtonFullWidthText}>View on Map</Text>
-                        </TouchableOpacity>
-                      )}
-                      
-                      {/* Quick Message Button for 3+ days offline - Full Width */}
-                      {isOfflineMoreThan3Days(connection) && (
-                        <TouchableOpacity
-                          style={styles.quickMessageButtonFullWidth}
-                          onPress={() => {
-                            Alert.alert(
-                              'Send Quick Message?',
-                              `Send a message to ${connection.connectedUserName}? They haven't been seen in over 3 days. When they read the message, their location will be updated.`,
-                              [
-                                { text: 'Cancel', style: 'cancel' },
-                                {
-                                  text: 'Send Message',
-                                  onPress: () => sendQuickMessage(connection),
-                                  style: 'default',
-                                },
-                              ]
-                            );
-                          }}
-                          activeOpacity={0.7}
-                        >
-                          <Ionicons name="chatbubble-ellipses" size={18} color="#FFFFFF" />
-                          <Text style={styles.quickMessageButtonFullWidthText}>Send Quick Message</Text>
                         </TouchableOpacity>
                       )}
                       
@@ -3133,42 +3003,6 @@ const styles = StyleSheet.create({
     color: '#64748B',
     fontWeight: '500',
   },
-  lastSeenContainer: {
-    marginTop: 12,
-  },
-  lastSeenRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    marginBottom: 6,
-  },
-  lastSeenStatusIndicator: {
-    width: 10,
-    height: 10,
-    borderRadius: 5,
-  },
-  lastSeenText: {
-    fontSize: 14,
-    fontWeight: '500',
-    color: '#64748B',
-    flex: 1,
-  },
-  lastSeenTextUrgent: {
-    color: '#DC2626',
-    fontWeight: '600',
-  },
-  lastSeenSecondary: {
-    fontSize: 12,
-    color: '#94A3B8',
-    marginTop: 2,
-    marginBottom: 4,
-  },
-  lastSeenDetailLink: {
-    fontSize: 11,
-    color: '#6366F1',
-    fontWeight: '500',
-    textDecorationLine: 'underline',
-  },
   actionButtonsContainer: {
     flexDirection: 'column',
     gap: 10,
@@ -3187,22 +3021,6 @@ const styles = StyleSheet.create({
     width: '100%',
   },
   mapButtonFullWidthText: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#FFFFFF',
-  },
-  quickMessageButtonFullWidth: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingVertical: 14,
-    paddingHorizontal: 20,
-    borderRadius: 12,
-    backgroundColor: '#DC2626',
-    gap: 8,
-    width: '100%',
-  },
-  quickMessageButtonFullWidthText: {
     fontSize: 16,
     fontWeight: '600',
     color: '#FFFFFF',
@@ -3268,6 +3086,8 @@ const styles = StyleSheet.create({
   modalOverlay: {
     flex: 1,
     backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    justifyContent: 'center',
+    alignItems: 'center',
   },
   modalOverlayPressable: {
     flex: 1,

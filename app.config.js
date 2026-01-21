@@ -39,7 +39,7 @@ module.exports = ({ config }) => {
     ...config,
     name: "FamGuards",
     slug: "famguard",
-    version: "1.0.1",
+    version: "1.0.5",
     sdkVersion: "54.0.0",
     orientation: "portrait",
     userInterfaceStyle: "light",

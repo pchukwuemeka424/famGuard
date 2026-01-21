@@ -45,14 +45,33 @@ export const CheckInProvider: React.FC<CheckInProviderProps> = ({ children }) =>
 
   // Initialize check-in service when user is available
   useEffect(() => {
-    if (user?.id) {
-      checkInService.initialize(user.id);
-      loadSettings();
-      refreshCheckIns();
-      setupRealtimeSubscription();
-    }
+    if (!user?.id) return;
+
+    // Add a small delay to ensure app is fully initialized before setting up services
+    // This prevents crashes from race conditions when app reopens
+    const initTimeout = setTimeout(() => {
+      // Check if user still exists (component might have unmounted)
+      if (!user?.id) return;
+
+      try {
+        checkInService.initialize(user.id);
+        loadSettings().catch((error) => {
+          console.error('Error loading check-in settings:', error);
+          // Don't crash - just log the error
+        });
+        refreshCheckIns().catch((error) => {
+          console.error('Error refreshing check-ins:', error);
+          // Don't crash - just log the error
+        });
+        setupRealtimeSubscription();
+      } catch (error) {
+        console.error('Error initializing CheckInContext:', error);
+        // Don't crash - just log the error
+      }
+    }, 600); // 600ms delay (slightly after ConnectionContext)
 
     return () => {
+      clearTimeout(initTimeout);
       checkInService.stop();
       cleanupRealtimeSubscription();
     };
